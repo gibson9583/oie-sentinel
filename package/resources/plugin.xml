@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<pluginMetaData path="sentinel">
+    <name>OIE Sentinel</name>
+    <author>Chris Gibson</author>
+    <pluginVersion>${project.version}</pluginVersion>
+    <mirthVersion>${plugin.supported.mc.versions}</mirthVersion>
+    <url>https://openintegrationengine.org</url>
+    <description>Zabbix-inspired monitoring and alerting for channel activity: inactivity, low-volume, anomaly-detection and connection-status monitors, with email, channel and SNS alert delivery.</description>
+
+    <serverClasses>
+        <string>org.openintegrationengine.plugins.sentinel.server.SentinelServicePlugin</string>
+    </serverClasses>
+
+    <migratorClass>org.openintegrationengine.plugins.sentinel.server.db.SentinelMigrator</migratorClass>
+
+    <!-- Per-vendor MyBatis mappers (namespace "Sentinel"). Pagination on /problems and the
+         activity tables needs vendor-specific LIMIT/OFFSET syntax (see sqlmap file comments),
+         so — unlike a single-file plugin — each real vendor gets its own file. "all" falls back
+         to the derby mapper, matching oie-totp-mfa's convention (derby is the engine's embedded
+         dev-mode database). The engine merges the mapper matching the running database into its
+         shared MyBatis config; paths are relative to this plugin's installed directory. -->
+    <sqlMapConfigs>
+        <entry>
+            <string>derby</string>
+            <string>mapper/derby-sqlmap.xml</string>
+        </entry>
+        <entry>
+            <string>mysql</string>
+            <string>mapper/mysql-sqlmap.xml</string>
+        </entry>
+        <entry>
+            <string>postgres</string>
+            <string>mapper/postgres-sqlmap.xml</string>
+        </entry>
+        <entry>
+            <string>sqlserver</string>
+            <string>mapper/sqlserver-sqlmap.xml</string>
+        </entry>
+        <entry>
+            <string>oracle</string>
+            <string>mapper/oracle-sqlmap.xml</string>
+        </entry>
+        <entry>
+            <string>all</string>
+            <string>mapper/derby-sqlmap.xml</string>
+        </entry>
+    </sqlMapConfigs>
+
+    <library type="SERVER" path="sentinel-server-${project.version}.jar" />
+    <library type="SHARED" path="sentinel-shared-${project.version}.jar" />
+
+    <!-- AWS SDK v2 for the SNS alert sender, plus its transitive closure — the engine does not
+         bundle any of these (sqs-source-connector precedent: each staged jar must be hand-listed
+         here or the extension classloader never sees it). This list mirrors exactly what
+         maven-dependency-plugin stages into package/target/to-be-packed; regenerate after an
+         aws-sdk.version bump with:
+           ls package/target/to-be-packed/*.jar | grep -v sentinel- -->
+    <library type="SERVER" path="annotations-2.15.28.jar" />
+    <library type="SERVER" path="apache-client-2.15.28.jar" />
+    <library type="SERVER" path="auth-2.15.28.jar" />
+    <library type="SERVER" path="aws-core-2.15.28.jar" />
+    <library type="SERVER" path="aws-query-protocol-2.15.28.jar" />
+    <library type="SERVER" path="commons-codec-1.11.jar" />
+    <library type="SERVER" path="commons-logging-1.2.jar" />
+    <library type="SERVER" path="eventstream-1.0.1.jar" />
+    <library type="SERVER" path="httpclient-4.5.13.jar" />
+    <library type="SERVER" path="http-client-spi-2.15.28.jar" />
+    <library type="SERVER" path="httpcore-4.4.11.jar" />
+    <library type="SERVER" path="jackson-annotations-2.14.3.jar" />
+    <library type="SERVER" path="jackson-core-2.14.3.jar" />
+    <library type="SERVER" path="metrics-spi-2.15.28.jar" />
+    <library type="SERVER" path="netty-buffer-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-codec-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-codec-http2-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-codec-http-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-common-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-handler-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-nio-client-2.15.28.jar" />
+    <library type="SERVER" path="netty-reactive-streams-2.0.4.jar" />
+    <library type="SERVER" path="netty-reactive-streams-http-2.0.4.jar" />
+    <library type="SERVER" path="netty-resolver-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-transport-4.1.53.Final.jar" />
+    <library type="SERVER" path="netty-transport-native-epoll-4.1.53.Final-linux-x86_64.jar" />
+    <library type="SERVER" path="netty-transport-native-unix-common-4.1.53.Final.jar" />
+    <library type="SERVER" path="profiles-2.15.28.jar" />
+    <library type="SERVER" path="protocol-core-2.15.28.jar" />
+    <library type="SERVER" path="reactive-streams-1.0.2.jar" />
+    <library type="SERVER" path="regions-2.15.28.jar" />
+    <library type="SERVER" path="sdk-core-2.15.28.jar" />
+    <library type="SERVER" path="sns-2.15.28.jar" />
+    <library type="SERVER" path="sts-2.15.28.jar" />
+    <library type="SERVER" path="utils-2.15.28.jar" />
+
+    <apiProvider type="SERVLET_INTERFACE" name="org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface" />
+    <apiProvider type="SERVER_CLASS" name="org.openintegrationengine.plugins.sentinel.server.servlet.SentinelServlet" />
+</pluginMetaData>

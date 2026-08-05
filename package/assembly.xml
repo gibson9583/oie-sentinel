@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.0.0 http://maven.apache.org/xsd/assembly-2.0.0.xsd">
+    <id>pack-signed-jars</id>
+    <formats>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+    <fileSets>
+        <fileSet>
+            <directory>${project.build.directory}/to-be-packed</directory>
+            <outputDirectory>${packageName}</outputDirectory>
+            <!-- *.jar (not sentinel-*.jar): copy-dependencies stages the AWS SDK jars for the
+                 SNS alert sender here too, and each one must ship in the zip — every jar in the
+                 staging dir has a matching <library> entry in plugin.xml. Engine-provided
+                 dependencies are declared provided-scope, so they never reach this directory. -->
+            <includes>
+                <include>*.jar</include>
+                <include>plugin.xml</include>
+            </includes>
+        </fileSet>
+        <fileSet>
+            <directory>resources/mapper</directory>
+            <outputDirectory>${packageName}/mapper</outputDirectory>
+        </fileSet>
+    </fileSets>
+    <!-- The entire dashboard UI: discovered by the OIE web admin at
+         <extensions>/sentinel/webadmin/plugin.json (built by the frontend-maven-plugin into
+         ../webadmin/web/plugin.js). Embedded directly in the main OIE Web Administrator via the
+         oie-web-client plugin contract — no separate WAR/SPA/login. -->
+    <files>
+        <file>
+            <source>../webadmin/plugin.json</source>
+            <outputDirectory>${packageName}/webadmin</outputDirectory>
+        </file>
+        <file>
+            <source>../webadmin/web/plugin.js</source>
+            <outputDirectory>${packageName}/webadmin/web</outputDirectory>
+        </file>
+    </files>
+</assembly>

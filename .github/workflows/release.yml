@@ -1,0 +1,122 @@
+# Stages a DRAFT GitHub Release in the shape the OIE Community Store expects
+# (extension zip + .sha256 sidecar), on a semver tag:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# CI stages the release; a human reviews the assets and notes and clicks
+# Publish. The draft also protects against a re-pushed tag silently
+# overwriting a published release's assets. Publishing fires
+# catalog-pr.yml (see that workflow) for the optional community-catalog PR.
+#
+# The tag drives the Maven version via -Drevision, so plugin.xml's pluginVersion
+# (what the engine reports as "installed") matches oie.json, keeping store
+# update detection accurate. oie.json at the repo root is verified against the
+# tag before anything builds.
+#
+# Store discovery needs no registry step at all: any OIE Community Store that
+# lists this repository (or its owning account with the `oie-plugin` topic)
+# reads oie.json and these release assets directly once published.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # required to create the GitHub Release
+
+env:
+  OIE_TAG: v4.6.0-rc1
+  OIE_TARBALL: oie_unix_4_6_0-rc1.tar.gz
+  MC_VERSION: '4.6.0'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21: the 4.6.0 engine jars are Java 21 bytecode (the plugin itself
+      # still targets --release 17); build.sh enforces this.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Resolve and verify version
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(jq -r .version oie.json)"; MANIFEST_VERSION="${MANIFEST_VERSION#v}"
+          if [ "$VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} implies version $VERSION but oie.json says $MANIFEST_VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OIE distribution
+        id: oie-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OIE_TARBALL }}
+          key: oie-dist-${{ env.OIE_TAG }}
+
+      - name: Download OIE distribution
+        if: steps.oie-cache.outputs.cache-hit != 'true'
+        run: curl -fSL -o "$OIE_TARBALL" "https://github.com/OpenIntegrationEngine/engine/releases/download/${OIE_TAG}/${OIE_TARBALL}"
+
+      # The same four jars scripts/install-engine-jars.sh installs from a local
+      # engine checkout, taken from the published distribution instead.
+      - name: Install engine jars into the local Maven repo
+        run: |
+          tar xzf "$OIE_TARBALL" \
+            oie/server-lib/mirth-server.jar \
+            oie/server-lib/mirth-crypto.jar \
+            oie/server-lib/mirth-client-core.jar \
+            oie/server-lib/donkey/donkey-server.jar
+          for pair in \
+            "mirth-server:oie/server-lib/mirth-server.jar" \
+            "mirth-crypto:oie/server-lib/mirth-crypto.jar" \
+            "mirth-client-core:oie/server-lib/mirth-client-core.jar" \
+            "donkey-server:oie/server-lib/donkey/donkey-server.jar"; do
+            a="${pair%%:*}"; p="${pair#*:}"
+            mvn -q install:install-file -Dfile="$p" -DgroupId=com.mirth.connect -DartifactId="$a" -Dversion="$MC_VERSION" -Dpackaging=jar
+          done
+
+      # Keep the (cosmetic) web plugin.json version in step with the release too.
+      - name: Stamp web plugin version
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          sed -i "s|\"version\":[[:space:]]*\"[^\"]*\"|\"version\": \"${VERSION}\"|" webadmin/plugin.json
+
+      - name: Build plugin bundle
+        run: ./build.sh -Drevision="${{ steps.ver.outputs.version }}"
+
+      - name: Stage the release asset and checksum
+        id: pkg
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          SRC="$(find package/target -maxdepth 1 -name 'sentinel-*.zip' | head -n1)"
+          if [ -z "$SRC" ]; then
+            echo "::error::No plugin zip found in package/target"; ls -l package/target || true; exit 1
+          fi
+          ASSET="sentinel-${VERSION}.zip"
+          mkdir -p out
+          cp "$SRC" "out/${ASSET}"
+          ( cd out && sha256sum "${ASSET}" > "${ASSET}.sha256" )
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      # Draft: CI stages the release; a human reviews and publishes it.
+      - name: Create draft GitHub Release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            out/${{ steps.pkg.outputs.asset }}
+            out/${{ steps.pkg.outputs.asset }}.sha256
+          # Tags like v0.2.0-rc1 publish as pre-releases (store beta channel only).
+          prerelease: ${{ contains(github.ref_name, '-') }}

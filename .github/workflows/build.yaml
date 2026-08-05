@@ -1,0 +1,71 @@
+# CI build: compiles shared/server, builds the webadmin bundle, and packs the
+# extension zip on every push/PR. The engine jars the plugin builds against are
+# not on public Maven mirrors, so they are installed from the published OIE
+# distribution tarball (cached between runs) — the CI twin of
+# scripts/install-engine-jars.sh's local-checkout flow.
+
+name: Build plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  OIE_TAG: v4.6.0-rc1
+  OIE_TARBALL: oie_unix_4_6_0-rc1.tar.gz
+  MC_VERSION: '4.6.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21: the 4.6.0 engine jars are Java 21 bytecode (the plugin itself
+      # still targets --release 17); build.sh enforces this.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Cache OIE distribution
+        id: oie-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OIE_TARBALL }}
+          key: oie-dist-${{ env.OIE_TAG }}
+
+      - name: Download OIE distribution
+        if: steps.oie-cache.outputs.cache-hit != 'true'
+        run: curl -fSL -o "$OIE_TARBALL" "https://github.com/OpenIntegrationEngine/engine/releases/download/${OIE_TAG}/${OIE_TARBALL}"
+
+      # The same four jars scripts/install-engine-jars.sh installs from a local
+      # engine checkout, taken from the published distribution instead.
+      - name: Install engine jars into the local Maven repo
+        run: |
+          tar xzf "$OIE_TARBALL" \
+            oie/server-lib/mirth-server.jar \
+            oie/server-lib/mirth-crypto.jar \
+            oie/server-lib/mirth-client-core.jar \
+            oie/server-lib/donkey/donkey-server.jar
+          for pair in \
+            "mirth-server:oie/server-lib/mirth-server.jar" \
+            "mirth-crypto:oie/server-lib/mirth-crypto.jar" \
+            "mirth-client-core:oie/server-lib/mirth-client-core.jar" \
+            "donkey-server:oie/server-lib/donkey/donkey-server.jar"; do
+            a="${pair%%:*}"; p="${pair#*:}"
+            mvn -q install:install-file -Dfile="$p" -DgroupId=com.mirth.connect -DartifactId="$a" -Dversion="$MC_VERSION" -Dpackaging=jar
+          done
+
+      - name: Build plugin
+        run: ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-plugin
+          path: package/target/sentinel-*.zip

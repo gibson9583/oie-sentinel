@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <artifactId>sentinel</artifactId>
+        <groupId>org.openintegrationengine</groupId>
+        <version>${revision}</version>
+    </parent>
+
+    <artifactId>sentinel-shared</artifactId>
+    <name>OIE Sentinel Shared</name>
+
+    <properties>
+        <!-- Match the version the engine ships at runtime (matches role-based-access-control's
+             pinning rationale: compiling against a newer line risks referencing annotations
+             absent at runtime). -->
+        <swagger-annotations.version>2.0.10</swagger-annotations.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.swagger.core.v3</groupId>
+            <artifactId>swagger-annotations</artifactId>
+            <version>${swagger-annotations.version}</version>
+            <!-- Provided by the engine at runtime; do not stage into to-be-packed. -->
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+</project>

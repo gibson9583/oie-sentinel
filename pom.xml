@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.openintegrationengine</groupId>
+    <artifactId>sentinel</artifactId>
+    <version>${revision}</version>
+
+    <name>OIE Sentinel</name>
+    <packaging>pom</packaging>
+
+    <properties>
+        <revision>0.1.0</revision>
+
+        <plugin.supported.mc.versions>${mc.version}</plugin.supported.mc.versions>
+
+        <mc.version>4.6.0</mc.version>
+        <javax-servlet.version>4.0.1</javax-servlet.version>
+        <javax-rs-api.version>2.0.1</javax-rs-api.version>
+        <log4j.version>2.17.2</log4j.version>
+        <slf4j.version>1.7.32</slf4j.version>
+        <!-- Pinned to the version the engine actually ships (server-lib/mybatis-3.1.1.jar).
+             Compiling against a newer line would let code use APIs absent at runtime,
+             surfacing as NoSuchMethodError in production. -->
+        <mybatis.version>3.1.1</mybatis.version>
+        <!-- Pinned to the version the engine ships (server-lib/jackson/jackson-databind-2.14.3.jar). -->
+        <jackson.version>2.14.3</jackson.version>
+        <!-- Quartz is bundled by the engine itself (used by the built-in DataPruner plugin) —
+             declared provided here, not shaded into the plugin jar. -->
+        <quartz.version>2.3.2</quartz.version>
+        <!-- Pinned to the version the engine ships (server-lib/commons/commons-email-1.6.0.jar).
+             Needed at compile time only because ServerSMTPConnection.send declares the checked
+             org.apache.commons.mail.EmailException. -->
+        <commons-email.version>1.6.0</commons-email.version>
+        <!-- Not engine-provided; sqs-source-connector (this workspace) establishes the AWS SDK v2
+             + BOM convention this plugin follows for its SNS alert action. -->
+        <aws-sdk.version>2.15.28</aws-sdk.version>
+        <junit5.version>5.10.2</junit5.version>
+        <mockito.version>5.11.0</mockito.version>
+
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Signing disabled by default. Use -Psigning to enable. -->
+        <signing.skip>true</signing.skip>
+    </properties>
+
+    <profiles>
+        <profile>
+            <id>signing</id>
+            <properties>
+                <signing.skip>false</signing.skip>
+                <signing.keystore>NONE</signing.keystore>
+                <signing.storetype>PKCS11</signing.storetype>
+                <signing.providerClass>sun.security.pkcs11.SunPKCS11</signing.providerClass>
+                <signing.providerArg>${user.dir}/yubikey-pkcs11.cfg</signing.providerArg>
+                <signing.alias>Certificate for PIV Authentication</signing.alias>
+                <signing.storepass>${env.YUBIKEY_PIN}</signing.storepass>
+                <signing.certchain>${user.dir}/certchain.pem</signing.certchain>
+                <signing.tsa>http://timestamp.digicert.com</signing.tsa>
+            </properties>
+        </profile>
+    </profiles>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws-sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.mirth.connect</groupId>
+            <artifactId>mirth-server</artifactId>
+            <version>${mc.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- donkey-server: the collector/evaluator reference donkey model/event types
+             (ConnectionStatusEventType, DeployedState) that mirth-server does not
+             transitively supply. -->
+        <dependency>
+            <groupId>com.mirth.connect</groupId>
+            <artifactId>donkey-server</artifactId>
+            <version>${mc.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- mirth-crypto: load-bearing at TEST time — Mockito/ByteBuddy must load the
+             engine ConfigurationController type hierarchy (which references crypto types)
+             to generate mocks. Mirrors role-based-access-control's pom (same reason). -->
+        <dependency>
+            <groupId>com.mirth.connect</groupId>
+            <artifactId>mirth-crypto</artifactId>
+            <version>${mc.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.mirth.connect</groupId>
+            <artifactId>mirth-client-core</artifactId>
+            <version>${mc.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>${javax-servlet.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>javax.ws.rs</groupId>
+            <artifactId>javax.ws.rs-api</artifactId>
+            <version>${javax-rs-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+            <version>${log4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mybatis</groupId>
+            <artifactId>mybatis</artifactId>
+            <version>${mybatis.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Engine ships jackson-datatype-jsr310-2.14.3 alongside databind; needed so the REST
+             layer's ObjectMapper can serialize the shared DTOs' java.time.Instant fields. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+            <version>${jackson.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.quartz-scheduler</groupId>
+            <artifactId>quartz</artifactId>
+            <version>${quartz.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Engine-provided (server-lib/commons); EmailAlertSender calls
+             ServerSMTPConnection.send, whose signature throws EmailException. -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-email</artifactId>
+            <version>${commons-email.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit5.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <modules>
+        <module>shared</module>
+        <module>server</module>
+        <module>package</module>
+    </modules>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.7.0</version>
+                <configuration>
+                    <release>17</release>
+                </configuration>
+            </plugin>
+            <!-- Pin surefire: unpinned, Maven <= 3.8's super-POM binds a surefire old
+                 enough to lack the JUnit Platform provider, which silently SKIPS the
+                 entire JUnit 5 suite with a green build. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.0.2</version>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Application-Name>OIE Sentinel</Application-Name>
+                            <url>https://openintegrationengine.org</url>
+                            <authors>Chris Gibson</authors>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

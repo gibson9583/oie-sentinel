@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <artifactId>sentinel</artifactId>
+        <groupId>org.openintegrationengine</groupId>
+        <version>${revision}</version>
+    </parent>
+
+    <artifactId>sentinel-server</artifactId>
+    <name>OIE Sentinel Server</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.openintegrationengine</groupId>
+            <artifactId>sentinel-shared</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
+        <!-- SNS alert action. Not engine-provided (confirmed: sqs-source-connector in this
+             workspace bundles the AWS SDK v2 the same way) — default/compile scope so it is
+             staged into to-be-packed and shipped inside the plugin zip. Version resolved from
+             the aws-sdk BOM imported in the root pom. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sns</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sts</artifactId>
+        </dependency>
+    </dependencies>
+</project>

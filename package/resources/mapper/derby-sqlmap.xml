@@ -1,0 +1,591 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- OIE Sentinel — channel monitoring & alerting plugin. -->
+<!-- Published under the terms of the Mozilla Public License 2.0. -->
+
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "conf/dtd/mybatis-3-mapper.dtd">
+
+<!--
+     Derby MyBatis mapper for OIE Sentinel. Every statement here is part of a
+     cross-vendor contract shared with 4 sibling mapper files (mysql/postgres/
+     oracle/sqlserver) and the Java repository layer — statement ids, and the
+     map keys each statement reads, must match byte-for-byte across all of them.
+
+     Parameter map key convention (matches the contract, not chosen locally):
+       - INSERT/UPDATE row-payload maps key by the exact snake_case column name
+         (e.g. #{monitor_type}, #{resolved_time}).
+       - SELECT/DELETE filter and lookup parameters key by the camelCase name
+         the Java caller uses (e.g. #{scopeType}, #{channelId}, #{cutoff}).
+
+     Result rows use explicit <resultMap type="map"> (never bare resultType="map"
+     with SELECT *) so every returned map key is the exact lower-case snake_case
+     column name regardless of what case the JDBC driver hands back column
+     labels as — Derby folds unquoted identifiers/aliases to upper case, so an
+     unmapped resultType="map" would hand the repository layer keys like "ID"
+     instead of "id". MyBatis's <resultMap> column matching is case-insensitive
+     against the driver's actual column label, which is what makes this safe.
+-->
+
+<mapper namespace="Sentinel">
+
+    <!-- ========== Result Maps ========== -->
+
+    <resultMap id="monitorResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="description" column="description" />
+        <result property="monitor_type" column="monitor_type" />
+        <result property="scope_type" column="scope_type" />
+        <result property="scope_id" column="scope_id" />
+        <result property="enabled" column="enabled" />
+        <result property="severity" column="severity" />
+        <result property="config_json" column="config_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
+        <result property="min_consecutive_breaches" column="min_consecutive_breaches" />
+        <result property="suppressed_by_monitor_id" column="suppressed_by_monitor_id" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" />
+        <result property="updated_by" column="updated_by" />
+        <result property="updated_time" column="updated_time" />
+    </resultMap>
+
+    <resultMap id="alertEventResult" type="map">
+        <result property="id" column="id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="metadata_id" column="metadata_id" />
+        <result property="severity" column="severity" />
+        <result property="status" column="status" />
+        <result property="message" column="message" />
+        <result property="opened_time" column="opened_time" />
+        <result property="resolved_time" column="resolved_time" />
+        <result property="acknowledged_by" column="acknowledged_by" />
+        <result property="acknowledged_time" column="acknowledged_time" />
+        <result property="ack_comment" column="ack_comment" />
+        <result property="details_json" column="details_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
+        <result property="suppressed" column="suppressed" />
+    </resultMap>
+
+    <resultMap id="triggerStateResult" type="map">
+        <result property="id" column="id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="metadata_id" column="metadata_id" />
+        <result property="state" column="state" />
+        <result property="consecutive_breach_count" column="consecutive_breach_count" />
+        <result property="last_value_json" column="last_value_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
+        <result property="open_alert_event_id" column="open_alert_event_id" />
+        <result property="last_change_time" column="last_change_time" />
+        <result property="last_evaluated_time" column="last_evaluated_time" />
+    </resultMap>
+
+    <resultMap id="activitySampleResult" type="map">
+        <result property="id" column="id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="sample_time" column="sample_time" />
+        <result property="received_delta" column="received_delta" />
+        <result property="sent_delta" column="sent_delta" />
+        <result property="error_delta" column="error_delta" />
+        <result property="filtered_delta" column="filtered_delta" />
+        <result property="queued_snapshot" column="queued_snapshot" />
+    </resultMap>
+
+    <resultMap id="activitySampleSumResult" type="map">
+        <result property="received_sum" column="received_sum" />
+        <result property="sent_sum" column="sent_sum" />
+        <result property="error_sum" column="error_sum" />
+        <result property="avg_queued" column="avg_queued" />
+        <result property="min_queued" column="min_queued" />
+        <result property="max_queued" column="max_queued" />
+    </resultMap>
+
+    <resultMap id="activityTrendResult" type="map">
+        <result property="id" column="id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="hour_bucket" column="hour_bucket" />
+        <result property="received_sum" column="received_sum" />
+        <result property="sent_sum" column="sent_sum" />
+        <result property="error_sum" column="error_sum" />
+        <result property="avg_queued" column="avg_queued" />
+        <result property="min_queued" column="min_queued" />
+        <result property="max_queued" column="max_queued" />
+    </resultMap>
+
+    <resultMap id="connectorStatusEventResult" type="map">
+        <result property="id" column="id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="metadata_id" column="metadata_id" />
+        <result property="previous_state" column="previous_state" />
+        <result property="new_state" column="new_state" />
+        <result property="changed_time" column="changed_time" />
+    </resultMap>
+
+    <resultMap id="actionResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="description" column="description" />
+        <result property="enabled" column="enabled" />
+        <result property="action_type" column="action_type" />
+        <result property="condition_json" column="condition_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
+        <result property="operation_mode" column="operation_mode" />
+        <result property="repeat_interval_seconds" column="repeat_interval_seconds" />
+        <result property="max_repeats" column="max_repeats" />
+        <result property="config_json" column="config_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" />
+        <result property="updated_by" column="updated_by" />
+        <result property="updated_time" column="updated_time" />
+    </resultMap>
+
+    <resultMap id="actionDispatchLogResult" type="map">
+        <result property="id" column="id" />
+        <result property="alert_event_id" column="alert_event_id" />
+        <result property="action_id" column="action_id" />
+        <result property="dispatch_time" column="dispatch_time" />
+        <result property="success" column="success" />
+        <result property="error_message" column="error_message" />
+    </resultMap>
+
+    <resultMap id="maintenanceWindowResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="scope_type" column="scope_type" />
+        <result property="scope_id" column="scope_id" />
+        <result property="window_mode" column="window_mode" />
+        <result property="repeat_type" column="repeat_type" />
+        <result property="days_of_week" column="days_of_week" />
+        <result property="days_of_month" column="days_of_month" />
+        <result property="start_time" column="start_time" />
+        <result property="end_time" column="end_time" />
+        <result property="active_from" column="active_from" />
+        <result property="active_until" column="active_until" />
+        <result property="enabled" column="enabled" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" />
+    </resultMap>
+
+    <!-- ========== MONITOR (sentinel_monitor) ========== -->
+
+    <select id="getMonitor" parameterType="map" resultMap="monitorResult">
+        SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, created_by,
+               created_time, updated_by, updated_time
+        FROM sentinel_monitor
+        WHERE id = #{id}
+    </select>
+
+    <select id="listMonitors" parameterType="map" resultMap="monitorResult">
+        SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, created_by,
+               created_time, updated_by, updated_time
+        FROM sentinel_monitor
+        <where>
+            <if test="scopeType != null">AND scope_type = #{scopeType}</if>
+            <if test="monitorType != null">AND monitor_type = #{monitorType}</if>
+            <if test="enabled != null">AND enabled = #{enabled}</if>
+            <if test="scopeId != null">AND scope_id = #{scopeId}</if>
+        </where>
+        ORDER BY name
+    </select>
+
+    <!-- No keyColumn: passing keyColumn="id" makes MyBatis request a generated-keys column
+         named literally "id", which fails on databases that fold unquoted identifiers to
+         upper case (Derby, Oracle, SQL Server) with "table does not have an auto-generated
+         column named 'id'". Relying on keyProperty alone reads the generated key positionally
+         and works across all supported databases (id is the first/only auto-generated column). -->
+    <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sentinel_monitor (name, description, monitor_type, scope_type, scope_id,
+            enabled, severity, config_json, min_consecutive_breaches, suppressed_by_monitor_id,
+            created_by, created_time, updated_by, updated_time)
+        VALUES (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id},
+            #{enabled}, #{severity}, #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id},
+            #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+    </insert>
+
+    <update id="updateMonitor" parameterType="map">
+        UPDATE sentinel_monitor
+        SET name = #{name},
+            description = #{description},
+            monitor_type = #{monitor_type},
+            scope_type = #{scope_type},
+            scope_id = #{scope_id},
+            enabled = #{enabled},
+            severity = #{severity},
+            config_json = #{config_json},
+            min_consecutive_breaches = #{min_consecutive_breaches},
+            suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            created_by = #{created_by},
+            created_time = #{created_time},
+            updated_by = #{updated_by},
+            updated_time = #{updated_time}
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteMonitor" parameterType="map">
+        DELETE FROM sentinel_monitor WHERE id = #{id}
+    </delete>
+
+    <update id="setMonitorEnabled" parameterType="map">
+        UPDATE sentinel_monitor SET enabled = #{enabled} WHERE id = #{id}
+    </update>
+
+    <!-- ========== ALERT_EVENT (sentinel_alert_event) ========== -->
+
+    <insert id="insertAlertEvent" parameterType="map" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sentinel_alert_event (monitor_id, channel_id, metadata_id, severity, status,
+            message, opened_time, resolved_time, acknowledged_by, acknowledged_time, ack_comment,
+            details_json, suppressed)
+        VALUES (#{monitor_id}, #{channel_id}, #{metadata_id}, #{severity}, #{status},
+            #{message}, #{opened_time}, #{resolved_time}, #{acknowledged_by}, #{acknowledged_time}, #{ack_comment},
+            #{details_json}, #{suppressed})
+    </insert>
+
+    <update id="updateAlertEvent" parameterType="map">
+        UPDATE sentinel_alert_event
+        <set>
+            status = #{status},
+            <if test="resolved_time != null">resolved_time = #{resolved_time},</if>
+            <if test="acknowledged_by != null">acknowledged_by = #{acknowledged_by},</if>
+            <if test="acknowledged_time != null">acknowledged_time = #{acknowledged_time},</if>
+            <if test="ack_comment != null">ack_comment = #{ack_comment},</if>
+            <if test="details_json != null">details_json = #{details_json},</if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <select id="getAlertEvent" parameterType="map" resultMap="alertEventResult">
+        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+        FROM sentinel_alert_event
+        WHERE id = #{id}
+    </select>
+
+    <select id="listAlertEvents" parameterType="map" resultMap="alertEventResult">
+        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+        FROM sentinel_alert_event
+        <where>
+            <if test="status != null">AND status = #{status}</if>
+            <if test="severityIn != null and !severityIn.isEmpty()">
+                AND severity IN
+                <foreach collection="severityIn" item="s" open="(" separator="," close=")">#{s}</foreach>
+            </if>
+            <if test="channelIdIn != null and !channelIdIn.isEmpty()">
+                AND channel_id IN
+                <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+            </if>
+            <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <!-- sentinel_alert_event has no monitor_type column of its own; join back to the
+                 owning monitor row to filter by it. -->
+            <if test="monitorType != null">
+                AND EXISTS (SELECT 1 FROM sentinel_monitor m
+                            WHERE m.id = sentinel_alert_event.monitor_id AND m.monitor_type = #{monitorType})
+            </if>
+            <if test="acknowledged != null and acknowledged == true">AND acknowledged_by IS NOT NULL</if>
+            <if test="acknowledged != null and acknowledged == false">AND acknowledged_by IS NULL</if>
+            <if test="from != null">AND opened_time &gt;= #{from}</if>
+            <if test="to != null">AND opened_time &lt;= #{to}</if>
+            <!-- Substring semantics: the raw q text is bound as-is by the Java layer, so the
+                 wildcards must be added here (|| concat, verified against the engine's
+                 derby-10.10.2 jar — the bind parameter is typed VARCHAR, not CHAR(1), inside the
+                 concatenation). A bare LIKE would silently degrade the Problems free-text search
+                 to whole-message equality. -->
+            <if test="q != null">AND UPPER(message) LIKE UPPER('%' || #{q} || '%')</if>
+        </where>
+        <!-- sortColumn/sortDir are raw ${} substitution, not #{} bind parameters. This is safe
+             ONLY because the Java caller allow-lists sortColumn to one of
+             "opened_time"|"severity"|"channel_id" and sortDir to "ASC"|"DESC" before this
+             statement is ever invoked — never accept these values from user input unvalidated. -->
+        ORDER BY ${sortColumn} ${sortDir}
+        OFFSET #{offset} ROWS FETCH NEXT #{limit} ROWS ONLY
+    </select>
+
+    <select id="countAlertEvents" parameterType="map" resultType="Integer">
+        SELECT COUNT(*)
+        FROM sentinel_alert_event
+        <where>
+            <if test="status != null">AND status = #{status}</if>
+            <if test="severityIn != null and !severityIn.isEmpty()">
+                AND severity IN
+                <foreach collection="severityIn" item="s" open="(" separator="," close=")">#{s}</foreach>
+            </if>
+            <if test="channelIdIn != null and !channelIdIn.isEmpty()">
+                AND channel_id IN
+                <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+            </if>
+            <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <if test="monitorType != null">
+                AND EXISTS (SELECT 1 FROM sentinel_monitor m
+                            WHERE m.id = sentinel_alert_event.monitor_id AND m.monitor_type = #{monitorType})
+            </if>
+            <if test="acknowledged != null and acknowledged == true">AND acknowledged_by IS NOT NULL</if>
+            <if test="acknowledged != null and acknowledged == false">AND acknowledged_by IS NULL</if>
+            <if test="from != null">AND opened_time &gt;= #{from}</if>
+            <if test="to != null">AND opened_time &lt;= #{to}</if>
+            <!-- Substring semantics: the raw q text is bound as-is by the Java layer, so the
+                 wildcards must be added here (|| concat, verified against the engine's
+                 derby-10.10.2 jar — the bind parameter is typed VARCHAR, not CHAR(1), inside the
+                 concatenation). A bare LIKE would silently degrade the Problems free-text search
+                 to whole-message equality. -->
+            <if test="q != null">AND UPPER(message) LIKE UPPER('%' || #{q} || '%')</if>
+        </where>
+    </select>
+
+    <select id="listRecentAlertEvents" parameterType="map" resultMap="alertEventResult">
+        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+        FROM sentinel_alert_event
+        ORDER BY opened_time DESC
+        OFFSET 0 ROWS FETCH NEXT #{limit} ROWS ONLY
+    </select>
+
+    <delete id="deleteResolvedAlertEventsOlderThan" parameterType="map">
+        DELETE FROM sentinel_alert_event WHERE status = 'RESOLVED' AND resolved_time &lt; #{cutoff}
+    </delete>
+
+    <!-- ========== TRIGGER_STATE (sentinel_trigger_state) ========== -->
+
+    <select id="getTriggerState" parameterType="map" resultMap="triggerStateResult">
+        SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
+               last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
+        FROM sentinel_trigger_state
+        WHERE monitor_id = #{monitorId} AND channel_id = #{channelId}
+        <if test="metadataId != null">AND metadata_id = #{metadataId}</if>
+        <if test="metadataId == null">AND metadata_id IS NULL</if>
+    </select>
+
+    <insert id="insertTriggerState" parameterType="map" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sentinel_trigger_state (monitor_id, channel_id, metadata_id, state,
+            consecutive_breach_count, last_value_json, open_alert_event_id, last_change_time, last_evaluated_time)
+        VALUES (#{monitor_id}, #{channel_id}, #{metadata_id}, #{state},
+            #{consecutive_breach_count}, #{last_value_json}, #{open_alert_event_id}, #{last_change_time}, #{last_evaluated_time})
+    </insert>
+
+    <update id="updateTriggerState" parameterType="map">
+        UPDATE sentinel_trigger_state
+        <set>
+            state = #{state},
+            consecutive_breach_count = #{consecutive_breach_count},
+            <if test="last_value_json != null">last_value_json = #{last_value_json},</if>
+            <if test="open_alert_event_id != null">open_alert_event_id = #{open_alert_event_id},</if>
+            <if test="last_change_time != null">last_change_time = #{last_change_time},</if>
+            <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time},</if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <select id="listTriggerStatesByMonitor" parameterType="map" resultMap="triggerStateResult">
+        SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
+               last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
+        FROM sentinel_trigger_state
+        WHERE monitor_id = #{monitorId}
+        ORDER BY channel_id
+    </select>
+
+    <!-- ========== ACTIVITY_SAMPLE (sentinel_channel_activity_sample) ========== -->
+
+    <insert id="insertActivitySample" parameterType="map">
+        INSERT INTO sentinel_channel_activity_sample (channel_id, sample_time, received_delta,
+            sent_delta, error_delta, filtered_delta, queued_snapshot)
+        VALUES (#{channel_id}, #{sample_time}, #{received_delta},
+            #{sent_delta}, #{error_delta}, #{filtered_delta}, #{queued_snapshot})
+    </insert>
+
+    <select id="listActivitySamples" parameterType="map" resultMap="activitySampleResult">
+        SELECT id, channel_id, sample_time, received_delta, sent_delta, error_delta,
+               filtered_delta, queued_snapshot
+        FROM sentinel_channel_activity_sample
+        WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
+        ORDER BY sample_time
+    </select>
+
+    <select id="sumActivitySamplesForRange" parameterType="map" resultMap="activitySampleSumResult">
+        SELECT COALESCE(SUM(received_delta), 0) AS received_sum,
+               COALESCE(SUM(sent_delta), 0) AS sent_sum,
+               COALESCE(SUM(error_delta), 0) AS error_sum,
+               COALESCE(AVG(queued_snapshot), 0) AS avg_queued,
+               COALESCE(MIN(queued_snapshot), 0) AS min_queued,
+               COALESCE(MAX(queued_snapshot), 0) AS max_queued
+        FROM sentinel_channel_activity_sample
+        WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
+    </select>
+
+    <delete id="deleteActivitySamplesOlderThan" parameterType="map">
+        DELETE FROM sentinel_channel_activity_sample WHERE sample_time &lt; #{cutoff}
+    </delete>
+
+    <!-- ========== ACTIVITY_TREND (sentinel_channel_activity_trend) ========== -->
+
+    <delete id="deleteActivityTrendForHour" parameterType="map">
+        DELETE FROM sentinel_channel_activity_trend WHERE channel_id = #{channelId} AND hour_bucket = #{hourBucket}
+    </delete>
+
+    <insert id="insertActivityTrend" parameterType="map">
+        INSERT INTO sentinel_channel_activity_trend (channel_id, hour_bucket, received_sum,
+            sent_sum, error_sum, avg_queued, min_queued, max_queued)
+        VALUES (#{channel_id}, #{hour_bucket}, #{received_sum},
+            #{sent_sum}, #{error_sum}, #{avg_queued}, #{min_queued}, #{max_queued})
+    </insert>
+
+    <!-- Deliberately NOT filtered by hour-of-day/weekend here — that bucketing happens in
+         Java where date functions are portable across vendors. -->
+    <select id="listActivityTrendSince" parameterType="map" resultMap="activityTrendResult">
+        SELECT id, channel_id, hour_bucket, received_sum, sent_sum, error_sum, avg_queued,
+               min_queued, max_queued
+        FROM sentinel_channel_activity_trend
+        WHERE channel_id = #{channelId} AND hour_bucket &gt;= #{sinceHourBucket}
+        ORDER BY hour_bucket ASC
+    </select>
+
+    <delete id="deleteActivityTrendOlderThan" parameterType="map">
+        DELETE FROM sentinel_channel_activity_trend WHERE hour_bucket &lt; #{cutoff}
+    </delete>
+
+    <!-- ========== CONNECTOR_STATUS_EVENT (sentinel_connector_status_event) ========== -->
+
+    <insert id="insertConnectorStatusEvent" parameterType="map">
+        INSERT INTO sentinel_connector_status_event (channel_id, metadata_id, previous_state,
+            new_state, changed_time)
+        VALUES (#{channel_id}, #{metadata_id}, #{previous_state},
+            #{new_state}, #{changed_time})
+    </insert>
+
+    <select id="getLatestConnectorStatusEvent" parameterType="map" resultMap="connectorStatusEventResult">
+        SELECT id, channel_id, metadata_id, previous_state, new_state, changed_time
+        FROM sentinel_connector_status_event
+        WHERE channel_id = #{channelId} AND metadata_id = #{metadataId}
+        ORDER BY changed_time DESC
+        OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
+    </select>
+
+    <select id="listConnectorStatusEvents" parameterType="map" resultMap="connectorStatusEventResult">
+        SELECT id, channel_id, metadata_id, previous_state, new_state, changed_time
+        FROM sentinel_connector_status_event
+        WHERE channel_id = #{channelId} AND changed_time &gt;= #{from} AND changed_time &lt;= #{to}
+        ORDER BY changed_time
+    </select>
+
+    <!-- ========== ACTION (sentinel_action) ========== -->
+
+    <select id="getAction" parameterType="map" resultMap="actionResult">
+        SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
+               repeat_interval_seconds, max_repeats, config_json, created_by, created_time,
+               updated_by, updated_time
+        FROM sentinel_action
+        WHERE id = #{id}
+    </select>
+
+    <select id="listActions" parameterType="map" resultMap="actionResult">
+        SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
+               repeat_interval_seconds, max_repeats, config_json, created_by, created_time,
+               updated_by, updated_time
+        FROM sentinel_action
+        <where>
+            <if test="enabled != null">AND enabled = #{enabled}</if>
+        </where>
+        ORDER BY name
+    </select>
+
+    <insert id="insertAction" parameterType="map" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sentinel_action (name, description, enabled, action_type, condition_json,
+            operation_mode, repeat_interval_seconds, max_repeats, config_json, created_by,
+            created_time, updated_by, updated_time)
+        VALUES (#{name}, #{description}, #{enabled}, #{action_type}, #{condition_json},
+            #{operation_mode}, #{repeat_interval_seconds}, #{max_repeats}, #{config_json}, #{created_by},
+            #{created_time}, #{updated_by}, #{updated_time})
+    </insert>
+
+    <update id="updateAction" parameterType="map">
+        UPDATE sentinel_action
+        SET name = #{name},
+            description = #{description},
+            enabled = #{enabled},
+            action_type = #{action_type},
+            condition_json = #{condition_json},
+            operation_mode = #{operation_mode},
+            repeat_interval_seconds = #{repeat_interval_seconds},
+            max_repeats = #{max_repeats},
+            config_json = #{config_json},
+            created_by = #{created_by},
+            created_time = #{created_time},
+            updated_by = #{updated_by},
+            updated_time = #{updated_time}
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteAction" parameterType="map">
+        DELETE FROM sentinel_action WHERE id = #{id}
+    </delete>
+
+    <!-- ========== ACTION_DISPATCH_LOG (sentinel_action_dispatch_log) ========== -->
+
+    <insert id="insertActionDispatchLog" parameterType="map">
+        INSERT INTO sentinel_action_dispatch_log (alert_event_id, action_id, dispatch_time,
+            success, error_message)
+        VALUES (#{alert_event_id}, #{action_id}, #{dispatch_time},
+            #{success}, #{error_message})
+    </insert>
+
+    <select id="listActionDispatchLogsForEvent" parameterType="map" resultMap="actionDispatchLogResult">
+        SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
+        FROM sentinel_action_dispatch_log
+        WHERE alert_event_id = #{alertEventId}
+        ORDER BY dispatch_time
+    </select>
+
+    <!-- ========== MAINTENANCE_WINDOW (sentinel_maintenance_window) ========== -->
+
+    <select id="getMaintenanceWindow" parameterType="map" resultMap="maintenanceWindowResult">
+        SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
+            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+        FROM sentinel_maintenance_window
+        WHERE id = #{id}
+    </select>
+
+    <select id="listMaintenanceWindows" parameterType="map" resultMap="maintenanceWindowResult">
+        SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
+            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+        FROM sentinel_maintenance_window
+        ORDER BY active_from DESC
+    </select>
+
+    <!-- Java filters the returned rows by schedule (WindowSchedule) and by scope match (channel/group) against the specific
+         channel or monitor being checked — do not attempt scope matching in SQL. -->
+    <select id="listEnabledMaintenanceWindows" resultMap="maintenanceWindowResult">
+        SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
+            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+        FROM sentinel_maintenance_window
+        WHERE enabled = TRUE
+    </select>
+
+    <insert id="insertMaintenanceWindow" parameterType="map" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sentinel_maintenance_window (name, scope_type, scope_id, window_mode, repeat_type, days_of_week,
+            days_of_month, start_time, end_time, active_from, active_until,
+            enabled, created_by, created_time)
+        VALUES (#{name}, #{scope_type}, #{scope_id}, #{window_mode}, #{repeat_type}, #{days_of_week},
+            #{days_of_month}, #{start_time}, #{end_time}, #{active_from}, #{active_until},
+            #{enabled}, #{created_by}, #{created_time})
+    </insert>
+
+    <update id="updateMaintenanceWindow" parameterType="map">
+        UPDATE sentinel_maintenance_window
+        SET name = #{name},
+            scope_type = #{scope_type},
+            scope_id = #{scope_id},
+            window_mode = #{window_mode},
+            repeat_type = #{repeat_type},
+            days_of_week = #{days_of_week},
+            days_of_month = #{days_of_month},
+            start_time = #{start_time},
+            end_time = #{end_time},
+            active_from = #{active_from},
+            active_until = #{active_until},
+            enabled = #{enabled},
+            created_by = #{created_by},
+            created_time = #{created_time}
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteMaintenanceWindow" parameterType="map">
+        DELETE FROM sentinel_maintenance_window WHERE id = #{id}
+    </delete>
+
+</mapper>
