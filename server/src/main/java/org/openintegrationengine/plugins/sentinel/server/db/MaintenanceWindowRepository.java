@@ -192,6 +192,9 @@ public final class MaintenanceWindowRepository {
         params.put("days_of_month", window.getDaysOfMonth());
         params.put("start_time", window.getStartTime());
         params.put("end_time", window.getEndTime());
+        // Null is meaningful here (= evaluate on the server's zone) and is what
+        // every pre-v3 row carries; never substitute a concrete zone id.
+        params.put("timezone", window.getTimezone());
         params.put("active_from", toTimestamp(window.getActiveFrom()));
         params.put("active_until", toTimestamp(window.getActiveUntil()));
         params.put("enabled", window.isEnabled());
@@ -218,6 +221,7 @@ public final class MaintenanceWindowRepository {
         window.setDaysOfMonth((String) row.get("days_of_month"));
         window.setStartTime((String) row.get("start_time"));
         window.setEndTime((String) row.get("end_time"));
+        window.setTimezone((String) row.get("timezone"));
 
         window.setActiveFrom(toInstant(row.get("active_from")));
         window.setActiveUntil(toInstant(row.get("active_until")));

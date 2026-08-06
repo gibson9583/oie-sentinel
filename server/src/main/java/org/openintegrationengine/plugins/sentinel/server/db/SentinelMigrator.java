@@ -9,6 +9,9 @@ package org.openintegrationengine.plugins.sentinel.server.db;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -44,6 +47,32 @@ import org.slf4j.LoggerFactory;
  *       windows may be unbounded). The base DDL stays v1-shaped: a fresh
  *       install runs applyV1 then applyV2, so upgraded and fresh schemas are
  *       byte-for-byte the same.</li>
+ *   <li><b>3</b> — Window timezones: adds a nullable {@code timezone} to
+ *       {@code sentinel_maintenance_window}. Null means "the server's zone",
+ *       so every row written before v3 keeps exactly the behavior it had —
+ *       which is why the column is nullable rather than defaulted to a
+ *       concrete zone id: backfilling one would be a guess, and a wrong guess
+ *       silently shifts a live alerting schedule.</li>
+ *   <li><b>4</b> — Runbooks, storm control, escalation, and the node lease.
+ *       Four features ship in the same release, so they share one migration
+ *       rather than four: adds nullable {@code runbook_url} to
+ *       {@code sentinel_monitor}; adds nullable
+ *       {@code max_notifications_per_window}, {@code rollup_window_seconds},
+ *       {@code escalate_after_seconds} and {@code escalate_to_action_id} to
+ *       {@code sentinel_action}; and creates {@code sentinel_node_lease}.
+ *       Every added column is nullable with no default, so an existing row
+ *       reads back as "feature not configured" and keeps precisely the
+ *       behavior it had before the upgrade.
+ *
+ *       <p>{@code escalate_to_action_id} points at another
+ *       {@code sentinel_action} row but deliberately carries <b>no</b> foreign
+ *       key. A hard FK would make an escalation target undeletable (or, with
+ *       {@code ON DELETE SET NULL}, would silently rewrite the escalating
+ *       action's configuration behind the operator's back). Deleting an action
+ *       must never be blocked by an unrelated action that happens to point at
+ *       it, so the reference is resolved defensively in Java instead: the
+ *       chain-walking code looks the target up and treats a missing row as
+ *       "escalation ends here". See {@code Action#getEscalateToActionId()}.</p></li>
  * </ul>
  *
  * <h3>Backfill</h3>
@@ -60,7 +89,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 2;
+    public static final int LATEST_VERSION = 4;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -80,11 +109,14 @@ public class SentinelMigrator extends Migrator {
      * aligns the stored {@code schema_version} property before running the
      * version loop. Detecting on every call (rather than only when the
      * property is null) makes us robust to operational quirks: pre-versioning
-     * installs and manual edits to {@code CONFIGURATION}. (Note the
-     * uninstall-then-reinstall case is NOT one of these: on uninstall the engine
-     * drops the plugin's tables AND, on the next startup, clears its CONFIGURATION
-     * properties — including {@code schema_version} — so that path already starts
-     * clean.)</p>
+     * installs, manual edits to {@code CONFIGURATION}, and — since
+     * {@link #getUninstallStatements()} stopped dropping tables — reinstalling
+     * over a schema a previous uninstall left in place. On uninstall the engine
+     * clears every CONFIGURATION property under the plugin's group name,
+     * including {@code schema_version}, so after a reinstall the stored version
+     * is always null while the tables may be anywhere from absent (they were
+     * renamed aside) to fully at {@link #LATEST_VERSION} (the rename was not
+     * possible on this vendor). Detection is what tells those two apart.</p>
      */
     @Override
     public void migrate() throws MigrationException {
@@ -94,6 +126,12 @@ public class SentinelMigrator extends Migrator {
         }
         if (current < 2) {
             applyV2();
+        }
+        if (current < 3) {
+            applyV3();
+        }
+        if (current < 4) {
+            applyV4();
         }
         writeSchemaVersion(LATEST_VERSION);
         log.info("Sentinel schema at version {}", LATEST_VERSION);
@@ -105,7 +143,9 @@ public class SentinelMigrator extends Migrator {
      * differs from what's stored.
      *
      * @return the detected current version (0 = fresh install, 1 = all nine
-     *         tables present, 2 = window mode/recurrence columns present)
+     *         tables present, 2 = window mode/recurrence columns present,
+     *         3 = window timezone column present, 4 = monitor runbook column
+     *         present)
      */
     private int detectAndAlignSchemaVersion() throws MigrationException {
         int detected = detectFromState();
@@ -151,11 +191,25 @@ public class SentinelMigrator extends Migrator {
                 throw new MigrationException("Sentinel schema is partially applied: sentinel_monitor exists but "
                         + "table(s) " + missing + " are missing; manual repair required");
             }
-            // v2 is column-detected: window_mode is the version's first ALTER, so its
-            // presence means applyV2 at least started. A partial v2 (window_mode present,
-            // later columns missing) would mis-detect as complete — acceptable because
-            // every ALTER in the script is idempotent to re-run manually and the failed
-            // migrate() already surfaced loudly at startup.
+            // v2, v3 and v4 are column-detected, newest first: window_mode is v2's first
+            // ALTER, timezone is v3's only one, and runbook_url is v4's first, so each
+            // column's presence means that version's script at least started. A partial v2
+            // or v4 (the first ALTER landed, later ones did not) would mis-detect as
+            // complete — acceptable because every ALTER in those scripts is idempotent to
+            // re-run manually and the failed migrate() already surfaced loudly at startup.
+            // v3 cannot be partial: it is a single statement.
+            //
+            // Note v4 is probed on sentinel_monitor rather than on its own new table
+            // sentinel_node_lease: the CREATE TABLE is v4's LAST statement, so testing for
+            // it would report a v4 that stopped halfway as a v3 and re-run the ALTERs,
+            // which fail on the columns that already exist. Probing the first statement's
+            // column keeps "detected version" monotonic with script progress.
+            if (columnExists("sentinel_monitor", "runbook_url")) {
+                return 4;
+            }
+            if (columnExists("sentinel_maintenance_window", "timezone")) {
+                return 3;
+            }
             if (columnExists("sentinel_maintenance_window", "window_mode")) {
                 return 2;
             }
@@ -177,6 +231,21 @@ public class SentinelMigrator extends Migrator {
     private void applyV2() throws MigrationException {
         log.info("Applying Sentinel schema v2 (maintenance-window modes and recurrence)");
         executeScript("/" + getDatabaseType() + "-sentinel-v2.sql");
+    }
+
+    /** Adds the nullable maintenance-window {@code timezone} column (see class Javadoc). */
+    private void applyV3() throws MigrationException {
+        log.info("Applying Sentinel schema v3 (maintenance-window timezone)");
+        executeScript("/" + getDatabaseType() + "-sentinel-v3.sql");
+    }
+
+    /**
+     * Adds the monitor runbook URL, the action storm-control and escalation
+     * columns, and the {@code sentinel_node_lease} table (see class Javadoc).
+     */
+    private void applyV4() throws MigrationException {
+        log.info("Applying Sentinel schema v4 (runbook URL, storm control, escalation, node lease)");
+        executeScript("/" + getDatabaseType() + "-sentinel-v4.sql");
     }
 
     // ========== Schema version persistence ==========
@@ -227,8 +296,10 @@ public class SentinelMigrator extends Migrator {
 
     /**
      * Checks for a column on a table across the conventional identifier cases
-     * different JDBC drivers normalise to. v2's detection signal
-     * ({@code sentinel_maintenance_window.window_mode}).
+     * different JDBC drivers normalise to. The detection signal for the
+     * column-only versions: {@code sentinel_maintenance_window.window_mode}
+     * for v2, {@code sentinel_maintenance_window.timezone} for v3,
+     * {@code sentinel_monitor.runbook_url} for v4.
      */
     private boolean columnExists(String tableName, String columnName) throws Exception {
         Connection conn = getConnection();
@@ -265,36 +336,161 @@ public class SentinelMigrator extends Migrator {
         // No serialized data migration needed
     }
 
+    // ========== Uninstall ==========
+
+    /**
+     * The plugin's tables, child-first. Order is irrelevant to a rename (unlike
+     * the DROP TABLE list this replaced, where a parent had to go last), but is
+     * kept so the emitted script still reads in dependency order.
+     */
+    private static final String[] UNINSTALL_TABLES = {
+            "sentinel_action_dispatch_log",
+            "sentinel_alert_event",
+            "sentinel_trigger_state",
+            "sentinel_connector_status_event",
+            "sentinel_channel_activity_trend",
+            "sentinel_channel_activity_sample",
+            "sentinel_action",
+            "sentinel_maintenance_window",
+            "sentinel_monitor",
+            "sentinel_node_lease"};
+
+    /**
+     * How many same-day rename targets to offer per table: the bare
+     * {@code _uninstalled_<yyyyMMdd>} name plus {@code _2} and {@code _3}. See
+     * {@link #getUninstallStatements()} for why a counter has to be expressed
+     * as alternatives rather than computed by probing the database.
+     */
+    private static final int RENAME_ATTEMPTS = 3;
+
     /**
      * {@inheritDoc}
-     * @return DROP TABLE statements in child-first order: {@code sentinel_action_dispatch_log},
-     *         {@code sentinel_alert_event}, {@code sentinel_trigger_state},
-     *         {@code sentinel_connector_status_event}, {@code sentinel_channel_activity_trend},
-     *         {@code sentinel_channel_activity_sample}, {@code sentinel_action},
-     *         {@code sentinel_maintenance_window}, then {@code sentinel_monitor} last —
-     *         everything else FK-references it, directly or via {@code sentinel_alert_event}.
-     *         On uninstall the engine records the plugin name in
-     *         {@code extension_uninstall.properties} and, on the next startup,
-     *         {@code removePropertiesForUninstalledExtensions()} DELETES every CONFIGURATION
-     *         property under the plugin's group name — which includes our {@code schema_version}
-     *         (persisted under {@link #PLUGIN_NAME}). So an uninstall+restart already yields a
-     *         clean slate; it is the ONLY property the plugin writes.
-     *         {@link #detectAndAlignSchemaVersion()} still earns its keep for the other cases —
-     *         pre-versioning installs and manual CONFIGURATION edits — where the stored version
-     *         cannot be trusted.
+     *
+     * <p>Renames the plugin's tables to
+     * {@code sentinel_<table>_uninstalled_<yyyyMMdd>} instead of dropping them.
+     * Uninstall is a routine operator gesture with no undo, and alert history
+     * is exactly the kind of record an audit asks for six months later, so the
+     * data survives and cleanup becomes an explicit operator decision. The
+     * README carries the manual DROP statements.</p>
+     *
+     * <h3>Why this method branches on the vendor</h3>
+     *
+     * <p>{@code DROP TABLE} is portable across all five supported databases;
+     * renaming is not. The engine constructs a <em>fresh</em> migrator for the
+     * uninstall path and calls {@code setDatabaseType(...)} on it before
+     * calling this method (see
+     * {@code DefaultExtensionController.prepareExtensionForUninstallation}), so
+     * {@link #getDatabaseType()} is populated here and vendor branching is
+     * safe. {@link #getConnection()} is <b>not</b>: that path never calls
+     * {@code setConnection(...)}, so the field is null and the accessor
+     * dereferences it. Nothing in this method may touch the database — which is
+     * why the same-day counter below is expressed as a chain of alternative
+     * statements rather than a "does this name already exist?" probe.</p>
+     *
+     * <p>The engine executes the returned statements once, on the next startup,
+     * each in its own transaction and with errors ignored
+     * ({@code DatabaseUtil.executeScript(script, true)}). That is what makes
+     * the alternatives work: for each table this emits the plain dated name
+     * first, then {@code _2} and {@code _3}. On a first uninstall the first
+     * statement succeeds and the other two fail harmlessly because the source
+     * table no longer exists; on a repeat uninstall the same day the first
+     * fails because its target already exists and the next one takes over.
+     * Expect a handful of ignored errors in the startup log after any
+     * uninstall — they are the mechanism, not a fault.</p>
+     *
+     * <h3>Derby returns nothing at all</h3>
+     *
+     * <p>Derby cannot rename a table that another table's foreign key
+     * references (SQLSTATE X0Y25), and three of ours are referenced:
+     * {@code sentinel_monitor}, {@code sentinel_alert_event} and
+     * {@code sentinel_action}. The blocking constraints were created inline via
+     * {@code REFERENCES} and therefore carry system-generated names
+     * ({@code SQL240806...}) that a statically emitted script cannot drop.
+     * Renaming only the six that Derby permits would be actively harmful: the
+     * next install would find {@code sentinel_monitor} present but its siblings
+     * missing and {@link #detectFromState()} would — correctly — refuse to
+     * start with "schema is partially applied". So on Derby this returns an
+     * empty list: every table keeps its name and its data, which satisfies the
+     * non-destructive goal completely. The visible difference is that a
+     * reinstall on Derby adopts the existing tables (detection reports
+     * {@link #LATEST_VERSION} and the version loop does nothing) rather than
+     * building fresh ones.</p>
+     *
+     * <p>Independently of what this returns, the engine records the plugin name
+     * in {@code extension_uninstall.properties} and, on the next startup,
+     * {@code removePropertiesForUninstalledExtensions()} DELETES every
+     * CONFIGURATION property under the plugin's group name — which includes
+     * {@code schema_version} (persisted under {@link #PLUGIN_NAME}), the ONLY
+     * property the plugin writes. The stored version is therefore always absent
+     * after a reinstall, and {@link #detectAndAlignSchemaVersion()} is what
+     * establishes the truth.</p>
+     *
+     * @return rename statements in the current vendor's dialect, or an empty
+     *         list on Derby and for an unrecognized vendor — never DROP
      */
     @Override
     public List<String> getUninstallStatements() {
+        String databaseType = getDatabaseType();
+        String suffix = "_uninstalled_" + LocalDate.now(ZoneId.systemDefault()).format(DateTimeFormatter.BASIC_ISO_DATE);
+
         List<String> statements = new ArrayList<>();
-        statements.add("DROP TABLE sentinel_action_dispatch_log");
-        statements.add("DROP TABLE sentinel_alert_event");
-        statements.add("DROP TABLE sentinel_trigger_state");
-        statements.add("DROP TABLE sentinel_connector_status_event");
-        statements.add("DROP TABLE sentinel_channel_activity_trend");
-        statements.add("DROP TABLE sentinel_channel_activity_sample");
-        statements.add("DROP TABLE sentinel_action");
-        statements.add("DROP TABLE sentinel_maintenance_window");
-        statements.add("DROP TABLE sentinel_monitor");
+        for (String table : UNINSTALL_TABLES) {
+            for (int attempt = 1; attempt <= RENAME_ATTEMPTS; attempt++) {
+                String target = table + suffix + (attempt == 1 ? "" : "_" + attempt);
+                String statement = renameStatement(databaseType, table, target);
+                if (statement != null) {
+                    statements.add(statement);
+                }
+            }
+        }
+
+        if (statements.isEmpty()) {
+            log.info("Sentinel uninstall: leaving all tables in place under their current names "
+                    + "(database type '{}' cannot rename them safely); drop them manually if the data is not wanted",
+                    databaseType);
+        } else {
+            log.info("Sentinel uninstall: renaming {} tables to *{} rather than dropping them; "
+                    + "drop them manually once the data is no longer needed",
+                    UNINSTALL_TABLES.length, suffix);
+        }
         return statements;
+    }
+
+    /**
+     * Renders one "rename {@code from} to {@code to}" statement in the given
+     * vendor's dialect.
+     *
+     * <p>The dialects genuinely differ in shape, not just in keywords:
+     * PostgreSQL and Oracle spell it as an {@code ALTER TABLE} sub-command,
+     * Derby and MySQL as a top-level {@code RENAME TABLE} statement, and SQL
+     * Server has no rename DDL at all — it exposes the operation as the
+     * {@code sp_rename} system stored procedure, whose second argument is a
+     * bare name (schema-qualifying it is an error). Derby's {@code RENAME
+     * TABLE} exists but is unusable for us; see
+     * {@link #getUninstallStatements()}.</p>
+     *
+     * @param databaseType the engine's configured database type
+     * @param from         the current table name
+     * @param to           the target table name
+     * @return the statement, or {@code null} when this vendor cannot be renamed
+     *         safely (Derby) or is not recognized
+     */
+    private static String renameStatement(String databaseType, String from, String to) {
+        if (databaseType == null) {
+            return null;
+        }
+        switch (databaseType.toLowerCase(Locale.ROOT)) {
+            case "postgres":
+            case "oracle":
+                return "ALTER TABLE " + from + " RENAME TO " + to;
+            case "mysql":
+                return "RENAME TABLE " + from + " TO " + to;
+            case "sqlserver":
+                return "EXEC sp_rename '" + from + "', '" + to + "'";
+            default:
+                // Derby (cannot rename FK-referenced tables) and anything unrecognized:
+                // change nothing rather than risk a half-renamed schema.
+                return null;
+        }
     }
 }

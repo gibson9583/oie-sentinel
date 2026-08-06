@@ -30,6 +30,10 @@ public class Action {
     private OperationMode operationMode;
     private Integer repeatIntervalSeconds;
     private Integer maxRepeats;
+    private Integer maxNotificationsPerWindow;
+    private Integer rollupWindowSeconds;
+    private Integer escalateAfterSeconds;
+    private Integer escalateToActionId;
     private String configJson;
     private Integer createdBy;
     private Instant createdTime;
@@ -180,6 +184,126 @@ public class Action {
      */
     public void setMaxRepeats(Integer maxRepeats) {
         this.maxRepeats = maxRepeats;
+    }
+
+    /**
+     * The storm-control ceiling: how many individual notifications this action
+     * may send within one {@link #getRollupWindowSeconds()} window before it
+     * stops sending them one at a time.
+     *
+     * <p>Distinct from {@link #getMaxRepeats()}, which bounds re-notification
+     * of a <em>single</em> still-open problem. This bounds notifications across
+     * <em>all</em> problems the action matches, which is the case that actually
+     * pages people at three in the morning: one shared dependency fails, thirty
+     * channels open a problem each, and thirty separate notifications go out.
+     * Past the ceiling the individual sends are suppressed in favour of a
+     * single rollup notification naming the affected channels.</p>
+     *
+     * @return the maximum individual notifications per rollup window, or
+     *         {@code null} for no ceiling (the pre-v4 behavior, and the value
+     *         every row upgraded to v4 carries)
+     */
+    public Integer getMaxNotificationsPerWindow() {
+        return maxNotificationsPerWindow;
+    }
+
+    /**
+     * @param maxNotificationsPerWindow the maximum individual notifications per
+     *                                  rollup window; {@code null} for no
+     *                                  ceiling. Meaningful only alongside
+     *                                  {@link #setRollupWindowSeconds(Integer)}
+     */
+    public void setMaxNotificationsPerWindow(Integer maxNotificationsPerWindow) {
+        this.maxNotificationsPerWindow = maxNotificationsPerWindow;
+    }
+
+    /**
+     * The width of the window over which {@link #getMaxNotificationsPerWindow()}
+     * is counted, and equally the period a rollup notification summarizes.
+     *
+     * <p>The two are a pair: a ceiling with no window has nothing to count
+     * against, and a window with no ceiling never trips. Both are nullable and
+     * independently settable because they are separate columns, so consumers
+     * must treat "only one is set" as "storm control is not configured" rather
+     * than assuming a default for the missing half.</p>
+     *
+     * @return the rollup window in seconds, or {@code null} when storm control
+     *         is not configured
+     */
+    public Integer getRollupWindowSeconds() {
+        return rollupWindowSeconds;
+    }
+
+    /**
+     * @param rollupWindowSeconds the rollup window in seconds; {@code null}
+     *                            when storm control is not configured
+     */
+    public void setRollupWindowSeconds(Integer rollupWindowSeconds) {
+        this.rollupWindowSeconds = rollupWindowSeconds;
+    }
+
+    /**
+     * How long a problem may stay open, in seconds, before it escalates to
+     * {@link #getEscalateToActionId()}.
+     *
+     * <p>Where {@link #getRepeatIntervalSeconds()} re-notifies the same target
+     * indefinitely, this hands the problem to a different one — the shift lead,
+     * a louder channel, a wider distribution list — on the theory that a
+     * problem nobody has closed in an hour is a problem the first target is not
+     * acting on.</p>
+     *
+     * @return seconds a problem must remain open before escalating, or
+     *         {@code null} for no escalation
+     */
+    public Integer getEscalateAfterSeconds() {
+        return escalateAfterSeconds;
+    }
+
+    /**
+     * @param escalateAfterSeconds seconds a problem must remain open before
+     *                             escalating; {@code null} for no escalation
+     */
+    public void setEscalateAfterSeconds(Integer escalateAfterSeconds) {
+        this.escalateAfterSeconds = escalateAfterSeconds;
+    }
+
+    /**
+     * The id of the action a still-open problem escalates to once
+     * {@link #getEscalateAfterSeconds()} has elapsed.
+     *
+     * <p><b>This reference is not enforced by a foreign key and must be
+     * resolved defensively.</b> The column deliberately carries no FK to
+     * {@code sentinel_action(id)}: a hard constraint would make an action
+     * undeletable for as long as any other action escalated to it, and turn an
+     * ordinary "delete this obsolete action" into a constraint-violation error
+     * that names an unrelated row. ({@code ON DELETE SET NULL} would avoid the
+     * error but silently rewrite the escalating action's configuration, which
+     * is worse — an operator would discover the escalation had evaporated only
+     * when it failed to fire.)</p>
+     *
+     * <p>The consequence is that this id may point at a row that no longer
+     * exists. Every consumer must look the target up, tolerate {@code null},
+     * and treat a missing target as "the escalation chain ends here" rather
+     * than as an error. The same applies to cycles: nothing prevents two
+     * actions escalating to each other, so a chain walker needs its own visited
+     * set or depth bound.</p>
+     *
+     * @return the id of the action to escalate to, or {@code null} for no
+     *         escalation target; a non-null value is not a guarantee that the
+     *         action still exists
+     */
+    public Integer getEscalateToActionId() {
+        return escalateToActionId;
+    }
+
+    /**
+     * @param escalateToActionId the id of the action to escalate to;
+     *                           {@code null} for none. Not validated here and
+     *                           not constrained by the database — see
+     *                           {@link #getEscalateToActionId()}
+     */
+    public void setEscalateToActionId(Integer escalateToActionId) {
+        this.escalateToActionId = escalateToActionId;
     }
 
     /**

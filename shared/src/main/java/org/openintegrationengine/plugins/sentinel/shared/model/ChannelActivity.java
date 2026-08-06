@@ -41,16 +41,28 @@ public class ChannelActivity {
     }
 
     /**
-     * @return the granularity the server resolved to: {@code "RAW"} or
-     *         {@code "HOURLY"} (never {@code "AUTO"} — that is a request-side
-     *         value only)
+     * Reports what was actually drawn, which is not always what was asked
+     * for: the service promotes {@code RAW} to {@code HOURLY} over wide
+     * ranges and folds either source into at most {@code MAX_POINTS} buckets
+     * (see {@code ActivityQueryService}). Clients must label the chart from
+     * this value rather than the requested one, and must not test it for
+     * equality with {@code "RAW"} — a folded series carries a compound
+     * label.
+     *
+     * @return the resolved granularity — {@code "RAW"} or {@code "HOURLY"}
+     *         when the samples were read one-for-one, otherwise
+     *         {@code "<SOURCE>_<ISO-8601 bucket width>"} such as
+     *         {@code "HOURLY_PT1H4M48S"} when the series was downsampled.
+     *         Never {@code "AUTO"} — that is a request-side value only.
      */
     public String getGranularity() {
         return granularity;
     }
 
     /**
-     * @param granularity the granularity the server resolved to
+     * @param granularity the granularity the server resolved to; see
+     *                    {@link #getGranularity()} for the compound
+     *                    downsampled form
      */
     public void setGranularity(String granularity) {
         this.granularity = granularity;

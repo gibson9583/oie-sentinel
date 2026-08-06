@@ -6,7 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.shared.model;
 
 /**
- * The four monitor rule types Sentinel evaluates. Persisted as the literal
+ * The monitor rule types Sentinel evaluates. Persisted as the literal
  * enum name (VARCHAR(32)) in {@code sentinel_monitor.monitor_type}. Each
  * value pairs with its own {@code config_json} shape — see the
  * {@code org.openintegrationengine.plugins.sentinel.shared.model.config}
@@ -20,5 +20,14 @@ public enum MonitorType {
     /** Alerts when a metric deviates from its historical hour-of-day baseline beyond a z-score threshold. */
     ANOMALY,
     /** Alerts when a channel's connector reports a configured connection state for too long. */
-    CONNECTION_STATUS
+    CONNECTION_STATUS,
+    /** Alerts when the share of errored messages over a window reaches a configured percentage. */
+    ERROR_RATE,
+    /**
+     * Alerts when a channel's queued-message count stands at or above a
+     * configured depth for a configured duration. Unlike the other activity
+     * types this one reads an instantaneous gauge, not summed deltas — see
+     * {@code QueueDepthEvaluator}.
+     */
+    QUEUE_DEPTH
 }

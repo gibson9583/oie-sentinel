@@ -196,6 +196,7 @@ public final class MonitorRepository {
         params.put("config_json", monitor.getConfigJson());
         params.put("min_consecutive_breaches", monitor.getMinConsecutiveBreaches());
         params.put("suppressed_by_monitor_id", monitor.getSuppressedByMonitorId());
+        params.put("runbook_url", monitor.getRunbookUrl());
         params.put("created_by", monitor.getCreatedBy());
         params.put("created_time", toTimestamp(monitor.getCreatedTime()));
         params.put("updated_by", monitor.getUpdatedBy());
@@ -227,6 +228,7 @@ public final class MonitorRepository {
         monitor.setMinConsecutiveBreaches(minConsecutiveBreaches != null ? minConsecutiveBreaches : 0);
 
         monitor.setSuppressedByMonitorId(toInteger(row.get("suppressed_by_monitor_id")));
+        monitor.setRunbookUrl((String) row.get("runbook_url"));
         monitor.setCreatedBy(toInteger(row.get("created_by")));
         monitor.setCreatedTime(toInstant(row.get("created_time")));
         monitor.setUpdatedBy(toInteger(row.get("updated_by")));

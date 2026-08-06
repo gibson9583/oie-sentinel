@@ -17,8 +17,9 @@ import java.time.Instant;
  * ({@link #getRepeatType()}): one-time windows are bounded by the absolute
  * {@link #getActiveFrom()}/{@link #getActiveUntil()} instants; recurring
  * windows repeat on {@link #getDaysOfWeek()}/{@link #getDaysOfMonth()}
- * between {@link #getStartTime()} and {@link #getEndTime()} on the server's
- * local clock, optionally bounded by the absolute instants.
+ * between {@link #getStartTime()} and {@link #getEndTime()} on the clock of
+ * {@link #getTimezone()} (null = the server's zone), optionally bounded by the
+ * absolute instants.
  *
  * <p>Maps to {@code sentinel_maintenance_window}. Scope matching against a
  * specific channel or monitor, and the "is this window active right now"
@@ -38,6 +39,7 @@ public class MaintenanceWindow {
     private String daysOfMonth;
     private String startTime;
     private String endTime;
+    private String timezone;
     private Instant activeFrom;
     private Instant activeUntil;
     private boolean enabled;
@@ -178,7 +180,8 @@ public class MaintenanceWindow {
 
     /**
      * @return for recurring windows, the daily start time as {@code HH:mm}
-     *         on the server's local clock; {@code null} for one-time windows
+     *         on {@link #getTimezone()}'s clock; {@code null} for one-time
+     *         windows
      */
     public String getStartTime() {
         return startTime;
@@ -194,8 +197,8 @@ public class MaintenanceWindow {
 
     /**
      * @return for recurring windows, the daily end time as {@code HH:mm} on
-     *         the server's local clock — an end at or before the start wraps
-     *         past midnight; {@code null} for one-time windows
+     *         {@link #getTimezone()}'s clock — an end at or before the start
+     *         wraps past midnight; {@code null} for one-time windows
      */
     public String getEndTime() {
         return endTime;
@@ -207,6 +210,39 @@ public class MaintenanceWindow {
      */
     public void setEndTime(String endTime) {
         this.endTime = endTime;
+    }
+
+    /**
+     * The zone whose local clock {@link #getStartTime()}/{@link #getEndTime()}
+     * and the day-of-week/day-of-month match are read on — an IANA zone id
+     * such as {@code "America/New_York"}.
+     *
+     * <p>Stored per window rather than taken from the server so a 22:00–06:00
+     * schedule stays 8 hours across both DST transitions in the zone the
+     * on-call rotation actually lives in, instead of becoming 23 or 25 hours
+     * because the server sits in another zone (or in UTC, which has no
+     * transitions at all). Irrelevant to one-time windows: those are absolute
+     * instants, so the service blanks this for them.</p>
+     *
+     * @return the window's IANA zone id, or {@code null} to evaluate on the
+     *         server's own zone — which is what every row written before
+     *         schema v3 carries, and is why null must keep meaning exactly
+     *         that rather than being backfilled to a guess
+     */
+    public String getTimezone() {
+        return timezone;
+    }
+
+    /**
+     * @param timezone an IANA zone id (e.g. {@code "America/New_York"}) for
+     *                 recurring windows, or {@code null} to evaluate the
+     *                 schedule on the server's own zone. An unparseable id is
+     *                 rejected at save time and, if one reaches the database
+     *                 by another route, falls back to the server zone at
+     *                 evaluation ({@code WindowSchedule})
+     */
+    public void setTimezone(String timezone) {
+        this.timezone = timezone;
     }
 
     /**

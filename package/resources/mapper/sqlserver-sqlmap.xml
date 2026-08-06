@@ -33,7 +33,7 @@
 
     <select id="getMonitor" parameterType="map" resultType="map">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
-               config_json, min_consecutive_breaches, suppressed_by_monitor_id,
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
                created_by, created_time, updated_by, updated_time
         FROM sentinel_monitor
         WHERE id = #{id}
@@ -41,7 +41,7 @@
 
     <select id="listMonitors" parameterType="map" resultType="map">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
-               config_json, min_consecutive_breaches, suppressed_by_monitor_id,
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
                created_by, created_time, updated_by, updated_time
         FROM sentinel_monitor
         <where>
@@ -62,11 +62,11 @@
     <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_monitor
             (name, description, monitor_type, scope_type, scope_id, enabled, severity,
-             config_json, min_consecutive_breaches, suppressed_by_monitor_id,
+             config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
              created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id}, #{enabled}, #{severity},
-             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id},
+             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id}, #{runbook_url},
              #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
     </insert>
 
@@ -82,6 +82,7 @@
             config_json = #{config_json},
             min_consecutive_breaches = #{min_consecutive_breaches},
             suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            runbook_url = #{runbook_url},
             created_by = #{created_by},
             created_time = #{created_time},
             updated_by = #{updated_by},
@@ -152,7 +153,23 @@
             </if>
             <if test="from != null">AND opened_time &gt;= #{from}</if>
             <if test="to != null">AND opened_time &lt;= #{to}</if>
-            <if test="q != null">AND UPPER(message) LIKE UPPER(CONCAT('%', #{q}, '%'))</if>
+            <!-- Free-text search over message AND channel_id (the interface contract says
+                 "message/channel"). The Java layer has already escaped %, _ and ! inside q
+                 with AlertEventRepository.escapeLikeWildcards, so the ESCAPE '!' clause here
+                 is what makes a search for a literal "50%" mean "50%" instead of "50
+                 followed by anything" — the two halves only work as a pair, and the escape
+                 character must stay in sync with LIKE_ESCAPE_CHAR on the Java side.
+                 Known gap, specific to this vendor: SQL Server also treats '[' as a
+                 wildcard (it opens a character class), and the Java escaper leaves it
+                 alone because Derby and Oracle reject an escape character followed by
+                 anything other than %, _ or itself. A search term containing '[' can
+                 therefore over-match here.
+                 This predicate is a scan: leading-wildcard LIKE cannot use an index on any
+                 vendor. Narrow by date range first on a large sentinel_alert_event. -->
+            <if test="q != null">
+                AND (UPPER(message) LIKE UPPER(CONCAT('%', #{q}, '%')) ESCAPE '!'
+                     OR UPPER(channel_id) LIKE UPPER(CONCAT('%', #{q}, '%')) ESCAPE '!')
+            </if>
         </where>
         <!-- sortColumn/sortDir are raw ${} substitution, not #{} bind parameters. Safe ONLY because
              the Java caller allow-lists sortColumn to one of "opened_time"|"severity"|"channel_id" and
@@ -184,7 +201,23 @@
             </if>
             <if test="from != null">AND opened_time &gt;= #{from}</if>
             <if test="to != null">AND opened_time &lt;= #{to}</if>
-            <if test="q != null">AND UPPER(message) LIKE UPPER(CONCAT('%', #{q}, '%'))</if>
+            <!-- Free-text search over message AND channel_id (the interface contract says
+                 "message/channel"). The Java layer has already escaped %, _ and ! inside q
+                 with AlertEventRepository.escapeLikeWildcards, so the ESCAPE '!' clause here
+                 is what makes a search for a literal "50%" mean "50%" instead of "50
+                 followed by anything" — the two halves only work as a pair, and the escape
+                 character must stay in sync with LIKE_ESCAPE_CHAR on the Java side.
+                 Known gap, specific to this vendor: SQL Server also treats '[' as a
+                 wildcard (it opens a character class), and the Java escaper leaves it
+                 alone because Derby and Oracle reject an escape character followed by
+                 anything other than %, _ or itself. A search term containing '[' can
+                 therefore over-match here.
+                 This predicate is a scan: leading-wildcard LIKE cannot use an index on any
+                 vendor. Narrow by date range first on a large sentinel_alert_event. -->
+            <if test="q != null">
+                AND (UPPER(message) LIKE UPPER(CONCAT('%', #{q}, '%')) ESCAPE '!'
+                     OR UPPER(channel_id) LIKE UPPER(CONCAT('%', #{q}, '%')) ESCAPE '!')
+            </if>
         </where>
     </select>
 
@@ -200,6 +233,35 @@
         DELETE FROM sentinel_alert_event
         WHERE status = 'RESOLVED' AND resolved_time &lt; #{cutoff}
     </delete>
+
+    <!--
+         Per-monitor history: one row per day that had at least one alert, carrying the
+         alert count and the mean time to resolve. Days with no alerts produce no row —
+         this is a GROUP BY over the events, with no calendar to outer-join against — so a
+         caller wanting a gap-free series fills the missing days itself.
+
+         SQL Server specifics: CONVERT(date, ...) is the truncation (there is no
+         date_trunc before SQL Server 2022, and this form works on every version the
+         plugin supports). DATEDIFF(SECOND, a, b) returns an INT, and AVG over an INT does
+         INTEGER division — a 90-second and a 91-second resolve would average to 90 — so
+         the CAST to FLOAT is load-bearing, not decoration. Still-open events contribute
+         to the count but not to the average: the CASE yields NULL for them and AVG
+         ignores NULLs, which is why avg_resolve_seconds comes back null for a day whose
+         alerts are all still open.
+    -->
+    <select id="listMonitorHistory" parameterType="map" resultType="map">
+        SELECT CONVERT(date, opened_time) AS bucket,
+               COUNT(*) AS alert_count,
+               AVG(CASE WHEN resolved_time IS NOT NULL
+                        THEN CAST(DATEDIFF(SECOND, opened_time, resolved_time) AS FLOAT)
+                        ELSE NULL END) AS avg_resolve_seconds
+        FROM sentinel_alert_event
+        WHERE monitor_id = #{monitorId}
+          AND opened_time &gt;= #{from}
+          AND opened_time &lt;= #{to}
+        GROUP BY CONVERT(date, opened_time)
+        ORDER BY CONVERT(date, opened_time)
+    </select>
 
     <!-- ========== TRIGGER_STATE (table sentinel_trigger_state) ========== -->
 
@@ -244,6 +306,24 @@
 
     <!-- ========== ACTIVITY_SAMPLE (table sentinel_channel_activity_sample) ========== -->
 
+    <!--
+         Driven two ways: ActivityRepository.insertActivitySample for a one-off row,
+         and insertActivitySamples, which re-executes this same statement under a
+         MyBatis ExecutorType.BATCH session so a whole collector tick's per-channel
+         rows ship in one round trip. Deliberately NOT supplemented by a <foreach>
+         multi-row VALUES variant: that would need a different dialect per vendor
+         (Oracle has no multi-row VALUES at all) plus per-vendor chunking to stay
+         under row/parameter caps, whereas a JDBC batch re-executes this one
+         7-parameter statement N times with no such ceiling.
+
+         SQL Server note: this is the vendor where a multi-row variant breaks
+         first, and it breaks at realistic sizes. A table value constructor is
+         capped at 1000 rows, and a request is capped at 2100 parameters — only
+         300 rows at this table's 7 bound columns, which a 200+ channel server is
+         already close to and a 300+ channel server clears on its first collector
+         tick. The batch path binds 7 parameters per execution and never
+         approaches either limit.
+    -->
     <insert id="insertActivitySample" parameterType="map">
         INSERT INTO sentinel_channel_activity_sample
             (channel_id, sample_time, received_delta, sent_delta, error_delta, filtered_delta, queued_snapshot)
@@ -329,14 +409,18 @@
 
     <select id="getAction" parameterType="map" resultType="map">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
-               repeat_interval_seconds, max_repeats, config_json, created_by, created_time, updated_by, updated_time
+               repeat_interval_seconds, max_repeats, max_notifications_per_window, rollup_window_seconds,
+               escalate_after_seconds, escalate_to_action_id,
+               config_json, created_by, created_time, updated_by, updated_time
         FROM sentinel_action
         WHERE id = #{id}
     </select>
 
     <select id="listActions" parameterType="map" resultType="map">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
-               repeat_interval_seconds, max_repeats, config_json, created_by, created_time, updated_by, updated_time
+               repeat_interval_seconds, max_repeats, max_notifications_per_window, rollup_window_seconds,
+               escalate_after_seconds, escalate_to_action_id,
+               config_json, created_by, created_time, updated_by, updated_time
         FROM sentinel_action
         <where>
             <if test="enabled != null">AND enabled = #{enabled}</if>
@@ -347,10 +431,14 @@
     <insert id="insertAction" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_action
             (name, description, enabled, action_type, condition_json, operation_mode,
-             repeat_interval_seconds, max_repeats, config_json, created_by, created_time, updated_by, updated_time)
+             repeat_interval_seconds, max_repeats, max_notifications_per_window, rollup_window_seconds,
+             escalate_after_seconds, escalate_to_action_id,
+             config_json, created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{enabled}, #{action_type}, #{condition_json}, #{operation_mode},
-             #{repeat_interval_seconds}, #{max_repeats}, #{config_json}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+             #{repeat_interval_seconds}, #{max_repeats}, #{max_notifications_per_window}, #{rollup_window_seconds},
+             #{escalate_after_seconds}, #{escalate_to_action_id},
+             #{config_json}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
     </insert>
 
     <update id="updateAction" parameterType="map">
@@ -363,6 +451,10 @@
             operation_mode = #{operation_mode},
             repeat_interval_seconds = #{repeat_interval_seconds},
             max_repeats = #{max_repeats},
+            max_notifications_per_window = #{max_notifications_per_window},
+            rollup_window_seconds = #{rollup_window_seconds},
+            escalate_after_seconds = #{escalate_after_seconds},
+            escalate_to_action_id = #{escalate_to_action_id},
             config_json = #{config_json},
             created_by = #{created_by},
             created_time = #{created_time},
@@ -395,14 +487,14 @@
 
     <select id="getMaintenanceWindow" parameterType="map" resultType="map">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         WHERE id = #{id}
     </select>
 
     <select id="listMaintenanceWindows" parameterType="map" resultType="map">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         ORDER BY active_from DESC
     </select>
@@ -411,7 +503,7 @@
          checked — scope matching is deliberately not attempted in SQL. -->
     <select id="listEnabledMaintenanceWindows" resultType="map">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         WHERE enabled = 1
     </select>
@@ -419,11 +511,11 @@
     <insert id="insertMaintenanceWindow" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_maintenance_window
             (name, scope_type, scope_id, window_mode, repeat_type, days_of_week,
-            days_of_month, start_time, end_time, active_from, active_until,
+            days_of_month, start_time, end_time, timezone, active_from, active_until,
             enabled, created_by, created_time)
         VALUES
             (#{name}, #{scope_type}, #{scope_id}, #{window_mode}, #{repeat_type}, #{days_of_week},
-            #{days_of_month}, #{start_time}, #{end_time}, #{active_from}, #{active_until},
+            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from}, #{active_until},
             #{enabled}, #{created_by}, #{created_time})
     </insert>
 
@@ -438,6 +530,7 @@
             days_of_month = #{days_of_month},
             start_time = #{start_time},
             end_time = #{end_time},
+            timezone = #{timezone},
             active_from = #{active_from},
             active_until = #{active_until},
             enabled = #{enabled},
@@ -448,6 +541,55 @@
 
     <delete id="deleteMaintenanceWindow" parameterType="map">
         DELETE FROM sentinel_maintenance_window WHERE id = #{id}
+    </delete>
+
+    <!-- ========== NODE_LEASE (table sentinel_node_lease) ==========
+
+         The leader lease for multi-node deployments. Every mutating statement below is a
+         single conditional write whose WHERE clause carries the precondition, so the
+         database decides the race and the affected-row count reports the winner; there is
+         deliberately no "read, decide, then write" pair anywhere in this section. Note
+         insertNodeLease has no useGeneratedKeys: lease_name is the primary key and is
+         supplied by the caller, and the key violation raised when a second node inserts
+         the same name is exactly the signal that it lost the race.
+    -->
+
+    <select id="getNodeLease" parameterType="map" resultType="map">
+        SELECT lease_name, node_id, acquired_time, expires_time
+        FROM sentinel_node_lease
+        WHERE lease_name = #{leaseName}
+    </select>
+
+    <insert id="insertNodeLease" parameterType="map">
+        INSERT INTO sentinel_node_lease
+            (lease_name, node_id, acquired_time, expires_time)
+        VALUES
+            (#{lease_name}, #{node_id}, #{acquired_time}, #{expires_time})
+    </insert>
+
+    <!-- Heartbeat. Conditional on node_id so a node that lost the lease while stalled
+         cannot renew its way back in behind the current holder. acquired_time is left
+         alone: it still records when this node's leadership began. -->
+    <update id="renewNodeLease" parameterType="map">
+        UPDATE sentinel_node_lease
+        SET expires_time = #{expiresTime}
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
+    </update>
+
+    <!-- Failover. Safe to run on every node on every tick: only one update can find the
+         row still expired, so everyone else gets zero rows back. acquired_time IS reset
+         here because leadership genuinely restarts. -->
+    <update id="stealExpiredNodeLease" parameterType="map">
+        UPDATE sentinel_node_lease
+        SET node_id = #{nodeId},
+            acquired_time = #{acquiredTime},
+            expires_time = #{expiresTime}
+        WHERE lease_name = #{leaseName} AND expires_time &lt; #{now}
+    </update>
+
+    <delete id="deleteNodeLease" parameterType="map">
+        DELETE FROM sentinel_node_lease
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
     </delete>
 
 </mapper>

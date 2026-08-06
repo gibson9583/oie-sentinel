@@ -20,6 +20,7 @@ import com.mirth.connect.server.util.SqlConfig;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorHistoryPoint;
 import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
 
@@ -40,6 +41,23 @@ public final class AlertEventRepository {
 
     private static final String NAMESPACE = "Sentinel";
     private static final Logger log = LoggerFactory.getLogger(AlertEventRepository.class);
+
+    /**
+     * The character the free-text search uses to escape LIKE wildcards.
+     *
+     * <p>Must stay in lock-step with the literal {@code ESCAPE '!'} clause in
+     * all five {@code *-sqlmap.xml} files' {@code listAlertEvents} and {@code
+     * countAlertEvents} statements — the Java side escapes and the SQL side
+     * declares, and they only work as a pair.</p>
+     *
+     * <p>{@code !} rather than the more conventional backslash on purpose.
+     * Backslash is already LIKE's implicit escape character on PostgreSQL and
+     * MySQL and is additionally a string-literal escape in MySQL, so writing
+     * {@code ESCAPE '\'} means something subtly different on each of the five
+     * and has to be doubled in some of them. {@code !} has no special meaning
+     * to any of them, in either role.</p>
+     */
+    private static final char LIKE_ESCAPE_CHAR = '!';
 
     private AlertEventRepository() {
     }
@@ -195,6 +213,59 @@ public final class AlertEventRepository {
     }
 
     /**
+     * Aggregates one monitor's alert history into per-day points: how many
+     * alerts it opened each day, and their mean time to resolve.
+     *
+     * <p>The aggregation happens in SQL, not in Java. A monitor that has been
+     * running for a while accumulates far more events than a chart has pixels —
+     * the resolved-alert retention default alone keeps 180 days — and pulling
+     * them all back to count them in a loop would make the cost of the chart
+     * scale with history rather than with the range asked for.</p>
+     *
+     * <p>The day bucketing is the one part of this that is genuinely different
+     * on every vendor, which is why it lives in the five mapper files rather
+     * than here: PostgreSQL has {@code date_trunc('day', ...)}, Oracle
+     * {@code TRUNC(...)}, SQL Server {@code CONVERT(date, ...)}, and MySQL and
+     * Derby {@code DATE(...)}. The elapsed-seconds arithmetic diverges the same
+     * way — {@code EXTRACT(EPOCH FROM ...)}, a {@code DATE} subtraction scaled
+     * by 86400, {@code DATEDIFF}, {@code TIMESTAMPDIFF}, and the JDBC escape
+     * {@code TIMESTAMPDIFF} respectively — and the integer-division trap in
+     * {@code AVG} over an integer expression has to be defused per vendor too.
+     * All five agree only on the three column labels this method reads back.</p>
+     *
+     * <p>Days with no alerts produce no row; see {@link MonitorHistoryPoint}
+     * for why, and for what a caller wanting a continuous series must do about
+     * it.</p>
+     *
+     * @param monitorId the monitor whose history to summarize
+     * @param from      inclusive lower bound on {@code opened_time}
+     * @param to        inclusive upper bound on {@code opened_time}
+     * @return one point per day that had at least one alert, oldest first;
+     *         never {@code null}
+     * @throws RepositoryException on persistence failure
+     */
+    public static List<MonitorHistoryPoint> listMonitorHistory(int monitorId, Instant from, Instant to) {
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("monitorId", monitorId);
+            params.put("from", toTimestamp(from));
+            params.put("to", toTimestamp(to));
+
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listMonitorHistory"), params);
+
+            List<MonitorHistoryPoint> points = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                points.add(buildMonitorHistoryPoint(row));
+            }
+            return points;
+        } catch (Exception e) {
+            log.error("Failed to list monitor history (monitorId={}, from={}, to={})", monitorId, from, to, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
      * Deletes resolved alert events older than a cutoff. Used by the
      * retention job to keep the event table bounded; open ({@code PROBLEM})
      * events are never touched regardless of age.
@@ -288,8 +359,56 @@ public final class AlertEventRepository {
         params.put("acknowledged", filter.getAcknowledged());
         params.put("from", toTimestamp(filter.getFrom()));
         params.put("to", toTimestamp(filter.getTo()));
-        params.put("q", filter.getQ());
+        params.put("q", escapeLikeWildcards(filter.getQ()));
         return params;
+    }
+
+    /**
+     * Neutralizes the LIKE metacharacters in a free-text search term so it
+     * matches literally.
+     *
+     * <p>{@code q} is bound as a parameter and was never a SQL injection risk,
+     * but binding is not the same as escaping: the value still lands inside a
+     * LIKE pattern, where {@code %} and {@code _} keep their wildcard meaning.
+     * Searching for {@code 50%} therefore matched every message containing
+     * {@code 50}, and a search for {@code a_b} matched {@code axb} — quietly
+     * wrong answers rather than errors, which is why it went unnoticed. Each
+     * metacharacter is prefixed with {@link #LIKE_ESCAPE_CHAR}, as is the
+     * escape character itself so that a literal {@code !} in the search term
+     * survives.</p>
+     *
+     * <p>Escaping is done here rather than in {@link AlertEventFilter} so that
+     * the filter keeps holding exactly what the user typed: it is echoed back
+     * to the UI and reused to build subsequent requests, and a stored value
+     * carrying escape characters would accumulate them on every round trip.
+     * This is the last point before the value reaches SQL, and both statements
+     * that consume it are fed from this one map.</p>
+     *
+     * <p>One known gap, deliberately left: SQL Server also treats {@code [} as
+     * a wildcard, opening a character class. It is not escaped because Derby
+     * and Oracle reject an escape character followed by anything other than
+     * {@code %}, {@code _}, or itself, so escaping it would turn a
+     * wrong-results bug on one vendor into a hard error on two. A search term
+     * containing {@code [} may over-match on SQL Server.</p>
+     *
+     * @param q the raw search term, or {@code null}
+     * @return the term with LIKE metacharacters escaped, or {@code null} if
+     *         {@code q} was null (which the mapped statements read as "no
+     *         free-text filter")
+     */
+    private static String escapeLikeWildcards(String q) {
+        if (q == null || q.isEmpty()) {
+            return q;
+        }
+        StringBuilder escaped = new StringBuilder(q.length() + 8);
+        for (int i = 0; i < q.length(); i++) {
+            char c = q.charAt(i);
+            if (c == LIKE_ESCAPE_CHAR || c == '%' || c == '_') {
+                escaped.append(LIKE_ESCAPE_CHAR);
+            }
+            escaped.append(c);
+        }
+        return escaped.toString();
     }
 
     private static AlertEvent buildAlertEvent(Map<String, Object> row) {
@@ -318,6 +437,78 @@ public final class AlertEventRepository {
         event.setSuppressed(toBoolean(row.get("suppressed")));
 
         return event;
+    }
+
+    private static MonitorHistoryPoint buildMonitorHistoryPoint(Map<String, Object> row) {
+        MonitorHistoryPoint point = new MonitorHistoryPoint();
+        point.setBucket(toBucketInstant(row.get("bucket")));
+
+        Long alertCount = toLong(row.get("alert_count"));
+        point.setAlertCount(alertCount != null ? alertCount : 0L);
+
+        point.setAvgResolveSeconds(toDouble(row.get("avg_resolve_seconds")));
+        return point;
+    }
+
+    /**
+     * Converts the day bucket a vendor's date-truncation function produced to
+     * the {@link Instant} at the start of that day.
+     *
+     * <p>The five vendors hand this column back as three different Java types.
+     * The ones whose truncation yields a true {@code DATE} (Derby, MySQL, SQL
+     * Server) give a {@link java.sql.Date}; PostgreSQL's {@code date_trunc}
+     * yields a timestamp and Oracle's {@code TRUNC} an Oracle {@code DATE},
+     * both of which arrive as {@link Timestamp}. {@code java.time} values are
+     * accepted too, since a driver upgrade can start returning them. Anything
+     * else is a mapper/driver mismatch worth failing loudly on rather than
+     * silently charting as {@code null}.</p>
+     *
+     * @param value the raw bucket value from a result row
+     * @return the instant starting that day in the JVM's default zone, or
+     *         {@code null} if the value is null
+     */
+    private static Instant toBucketInstant(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Timestamp timestamp) {
+            return timestamp.toInstant();
+        }
+        if (value instanceof java.sql.Date date) {
+            return date.toLocalDate().atStartOfDay(java.time.ZoneId.systemDefault()).toInstant();
+        }
+        if (value instanceof java.time.LocalDate localDate) {
+            return localDate.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant();
+        }
+        if (value instanceof java.time.LocalDateTime localDateTime) {
+            return localDateTime.atZone(java.time.ZoneId.systemDefault()).toInstant();
+        }
+        throw new IllegalStateException("Unexpected history bucket type " + value.getClass().getName()
+                + "; the listMonitorHistory mapper for this database returned a column shape this class cannot read");
+    }
+
+    /**
+     * Coerces an aggregate average to a {@link Double}. {@code AVG} comes back
+     * as a {@code Double} from Derby/PostgreSQL/SQL Server but as a {@link
+     * java.math.BigDecimal} from MySQL and Oracle, so a direct {@code (Double)}
+     * cast throws {@link ClassCastException} on two of the five.
+     *
+     * @param value the raw value from a result row
+     * @return the value as a {@code Double}, or {@code null} if it is null —
+     *         which for an average over an all-null input is the normal result,
+     *         not an error
+     */
+    private static Double toDouble(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Double d) {
+            return d;
+        }
+        if (value instanceof Number n) {
+            return n.doubleValue();
+        }
+        return Double.valueOf(value.toString().trim());
     }
 
     /** Converts an {@link Instant} to the {@link Timestamp} MyBatis/JDBC expects as a bound parameter. */

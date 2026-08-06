@@ -41,6 +41,7 @@
         <result property="config_json" column="config_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
         <result property="min_consecutive_breaches" column="min_consecutive_breaches" />
         <result property="suppressed_by_monitor_id" column="suppressed_by_monitor_id" />
+        <result property="runbook_url" column="runbook_url" />
         <result property="created_by" column="created_by" />
         <result property="created_time" column="created_time" />
         <result property="updated_by" column="updated_by" />
@@ -128,6 +129,10 @@
         <result property="operation_mode" column="operation_mode" />
         <result property="repeat_interval_seconds" column="repeat_interval_seconds" />
         <result property="max_repeats" column="max_repeats" />
+        <result property="max_notifications_per_window" column="max_notifications_per_window" />
+        <result property="rollup_window_seconds" column="rollup_window_seconds" />
+        <result property="escalate_after_seconds" column="escalate_after_seconds" />
+        <result property="escalate_to_action_id" column="escalate_to_action_id" />
         <result property="config_json" column="config_json" typeHandler="org.openintegrationengine.plugins.sentinel.server.db.ClobStringTypeHandler" />
         <result property="created_by" column="created_by" />
         <result property="created_time" column="created_time" />
@@ -155,6 +160,7 @@
         <result property="days_of_month" column="days_of_month" />
         <result property="start_time" column="start_time" />
         <result property="end_time" column="end_time" />
+        <result property="timezone" column="timezone" />
         <result property="active_from" column="active_from" />
         <result property="active_until" column="active_until" />
         <result property="enabled" column="enabled" />
@@ -162,20 +168,37 @@
         <result property="created_time" column="created_time" />
     </resultMap>
 
+    <!-- Aggregate shape, not a table: the three columns are the labels listMonitorHistory
+         projects, and AlertEventRepository.buildMonitorHistoryPoint reads exactly these
+         keys. bucket arrives as a java.sql.Date on Derby (DATE() truncates to a DATE), and
+         avg_resolve_seconds as a Double because the statement casts before averaging. -->
+    <resultMap id="monitorHistoryResult" type="map">
+        <result property="bucket" column="bucket" />
+        <result property="alert_count" column="alert_count" />
+        <result property="avg_resolve_seconds" column="avg_resolve_seconds" />
+    </resultMap>
+
+    <resultMap id="nodeLeaseResult" type="map">
+        <result property="lease_name" column="lease_name" />
+        <result property="node_id" column="node_id" />
+        <result property="acquired_time" column="acquired_time" />
+        <result property="expires_time" column="expires_time" />
+    </resultMap>
+
     <!-- ========== MONITOR (sentinel_monitor) ========== -->
 
     <select id="getMonitor" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
-               config_json, min_consecutive_breaches, suppressed_by_monitor_id, created_by,
-               created_time, updated_by, updated_time
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
+               created_by, created_time, updated_by, updated_time
         FROM sentinel_monitor
         WHERE id = #{id}
     </select>
 
     <select id="listMonitors" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
-               config_json, min_consecutive_breaches, suppressed_by_monitor_id, created_by,
-               created_time, updated_by, updated_time
+               config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
+               created_by, created_time, updated_by, updated_time
         FROM sentinel_monitor
         <where>
             <if test="scopeType != null">AND scope_type = #{scopeType}</if>
@@ -194,10 +217,10 @@
     <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_monitor (name, description, monitor_type, scope_type, scope_id,
             enabled, severity, config_json, min_consecutive_breaches, suppressed_by_monitor_id,
-            created_by, created_time, updated_by, updated_time)
+            runbook_url, created_by, created_time, updated_by, updated_time)
         VALUES (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id},
             #{enabled}, #{severity}, #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id},
-            #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+            #{runbook_url}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
     </insert>
 
     <update id="updateMonitor" parameterType="map">
@@ -212,6 +235,7 @@
             config_json = #{config_json},
             min_consecutive_breaches = #{min_consecutive_breaches},
             suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            runbook_url = #{runbook_url},
             created_by = #{created_by},
             created_time = #{created_time},
             updated_by = #{updated_by},
@@ -283,12 +307,23 @@
             <if test="acknowledged != null and acknowledged == false">AND acknowledged_by IS NULL</if>
             <if test="from != null">AND opened_time &gt;= #{from}</if>
             <if test="to != null">AND opened_time &lt;= #{to}</if>
-            <!-- Substring semantics: the raw q text is bound as-is by the Java layer, so the
-                 wildcards must be added here (|| concat, verified against the engine's
-                 derby-10.10.2 jar — the bind parameter is typed VARCHAR, not CHAR(1), inside the
-                 concatenation). A bare LIKE would silently degrade the Problems free-text search
-                 to whole-message equality. -->
-            <if test="q != null">AND UPPER(message) LIKE UPPER('%' || #{q} || '%')</if>
+            <!-- Free-text search over message AND channel_id (the interface contract says
+                 "message/channel"). Substring semantics: the wildcards are added here (||
+                 concat rather than CONCAT() — Derby's CONCAT takes exactly two arguments;
+                 verified against the engine's derby-10.10.2 jar, where the bind parameter
+                 types as VARCHAR, not CHAR(1), inside the concatenation). A bare LIKE would
+                 silently degrade the Problems free-text search to whole-message equality.
+                 The Java layer escapes %, _ and ! inside q with
+                 AlertEventRepository.escapeLikeWildcards, and the ESCAPE '!' clause here is
+                 the half that makes that mean anything — a search for a literal "50%" finds
+                 "50%" rather than everything containing "50". The escape character must stay
+                 in sync with LIKE_ESCAPE_CHAR on the Java side.
+                 This predicate is a scan: leading-wildcard LIKE cannot use an index on any
+                 vendor. Narrow by date range first on a large sentinel_alert_event. -->
+            <if test="q != null">
+                AND (UPPER(message) LIKE UPPER('%' || #{q} || '%') ESCAPE '!'
+                     OR UPPER(channel_id) LIKE UPPER('%' || #{q} || '%') ESCAPE '!')
+            </if>
         </where>
         <!-- sortColumn/sortDir are raw ${} substitution, not #{} bind parameters. This is safe
              ONLY because the Java caller allow-lists sortColumn to one of
@@ -320,12 +355,23 @@
             <if test="acknowledged != null and acknowledged == false">AND acknowledged_by IS NULL</if>
             <if test="from != null">AND opened_time &gt;= #{from}</if>
             <if test="to != null">AND opened_time &lt;= #{to}</if>
-            <!-- Substring semantics: the raw q text is bound as-is by the Java layer, so the
-                 wildcards must be added here (|| concat, verified against the engine's
-                 derby-10.10.2 jar — the bind parameter is typed VARCHAR, not CHAR(1), inside the
-                 concatenation). A bare LIKE would silently degrade the Problems free-text search
-                 to whole-message equality. -->
-            <if test="q != null">AND UPPER(message) LIKE UPPER('%' || #{q} || '%')</if>
+            <!-- Free-text search over message AND channel_id (the interface contract says
+                 "message/channel"). Substring semantics: the wildcards are added here (||
+                 concat rather than CONCAT() — Derby's CONCAT takes exactly two arguments;
+                 verified against the engine's derby-10.10.2 jar, where the bind parameter
+                 types as VARCHAR, not CHAR(1), inside the concatenation). A bare LIKE would
+                 silently degrade the Problems free-text search to whole-message equality.
+                 The Java layer escapes %, _ and ! inside q with
+                 AlertEventRepository.escapeLikeWildcards, and the ESCAPE '!' clause here is
+                 the half that makes that mean anything — a search for a literal "50%" finds
+                 "50%" rather than everything containing "50". The escape character must stay
+                 in sync with LIKE_ESCAPE_CHAR on the Java side.
+                 This predicate is a scan: leading-wildcard LIKE cannot use an index on any
+                 vendor. Narrow by date range first on a large sentinel_alert_event. -->
+            <if test="q != null">
+                AND (UPPER(message) LIKE UPPER('%' || #{q} || '%') ESCAPE '!'
+                     OR UPPER(channel_id) LIKE UPPER('%' || #{q} || '%') ESCAPE '!')
+            </if>
         </where>
     </select>
 
@@ -340,6 +386,38 @@
     <delete id="deleteResolvedAlertEventsOlderThan" parameterType="map">
         DELETE FROM sentinel_alert_event WHERE status = 'RESOLVED' AND resolved_time &lt; #{cutoff}
     </delete>
+
+    <!--
+         Per-monitor history: one row per day that had at least one alert, carrying the
+         alert count and the mean time to resolve. Days with no alerts produce no row —
+         this is a GROUP BY over the events, with no calendar to outer-join against — so a
+         caller wanting a gap-free series fills the missing days itself.
+
+         Derby specifics, both verified against the engine's derby-10.10.2 jar:
+         DATE(opened_time) truncates a TIMESTAMP to a DATE, and elapsed seconds come from
+         the JDBC escape function {fn TIMESTAMPDIFF(SQL_TSI_SECOND, a, b)} — Derby has no
+         plain SQL TIMESTAMPDIFF, and subtracting two TIMESTAMPs is not valid here. The
+         braces are invisible to MyBatis, which only rewrites #{...} and ${...}, and the
+         driver expands the escape itself. The CAST to DOUBLE is load-bearing: TIMESTAMPDIFF
+         yields an INTEGER and Derby's AVG over an INTEGER does integer division, so without
+         it a 90-second and a 91-second resolve would average to 90. Still-open events
+         contribute to the count but not to the average: the CASE yields NULL for them and
+         AVG ignores NULLs, which is why avg_resolve_seconds comes back null for a day whose
+         alerts are all still open.
+    -->
+    <select id="listMonitorHistory" parameterType="map" resultMap="monitorHistoryResult">
+        SELECT DATE(opened_time) AS bucket,
+               COUNT(*) AS alert_count,
+               AVG(CASE WHEN resolved_time IS NOT NULL
+                        THEN CAST({fn TIMESTAMPDIFF(SQL_TSI_SECOND, opened_time, resolved_time)} AS DOUBLE)
+                        ELSE NULL END) AS avg_resolve_seconds
+        FROM sentinel_alert_event
+        WHERE monitor_id = #{monitorId}
+          AND opened_time &gt;= #{from}
+          AND opened_time &lt;= #{to}
+        GROUP BY DATE(opened_time)
+        ORDER BY DATE(opened_time)
+    </select>
 
     <!-- ========== TRIGGER_STATE (sentinel_trigger_state) ========== -->
 
@@ -382,6 +460,20 @@
 
     <!-- ========== ACTIVITY_SAMPLE (sentinel_channel_activity_sample) ========== -->
 
+    <!--
+         Driven two ways: ActivityRepository.insertActivitySample for a one-off row,
+         and insertActivitySamples, which re-executes this same statement under a
+         MyBatis ExecutorType.BATCH session so a whole collector tick's per-channel
+         rows ship in one round trip. Deliberately NOT supplemented by a <foreach>
+         multi-row VALUES variant: that would need a different dialect per vendor
+         (Oracle has no multi-row VALUES at all) plus per-vendor chunking to stay
+         under row/parameter caps, whereas a JDBC batch re-executes this one
+         7-parameter statement N times with no such ceiling.
+
+         Derby note: Derby does accept a multi-row VALUES table constructor, so a
+         multi-row variant would have been legal here — it is omitted only to keep
+         one statement shape across all five mappers.
+    -->
     <insert id="insertActivitySample" parameterType="map">
         INSERT INTO sentinel_channel_activity_sample (channel_id, sample_time, received_delta,
             sent_delta, error_delta, filtered_delta, queued_snapshot)
@@ -467,16 +559,18 @@
 
     <select id="getAction" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
-               repeat_interval_seconds, max_repeats, config_json, created_by, created_time,
-               updated_by, updated_time
+               repeat_interval_seconds, max_repeats, max_notifications_per_window,
+               rollup_window_seconds, escalate_after_seconds, escalate_to_action_id,
+               config_json, created_by, created_time, updated_by, updated_time
         FROM sentinel_action
         WHERE id = #{id}
     </select>
 
     <select id="listActions" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
-               repeat_interval_seconds, max_repeats, config_json, created_by, created_time,
-               updated_by, updated_time
+               repeat_interval_seconds, max_repeats, max_notifications_per_window,
+               rollup_window_seconds, escalate_after_seconds, escalate_to_action_id,
+               config_json, created_by, created_time, updated_by, updated_time
         FROM sentinel_action
         <where>
             <if test="enabled != null">AND enabled = #{enabled}</if>
@@ -486,11 +580,13 @@
 
     <insert id="insertAction" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_action (name, description, enabled, action_type, condition_json,
-            operation_mode, repeat_interval_seconds, max_repeats, config_json, created_by,
-            created_time, updated_by, updated_time)
+            operation_mode, repeat_interval_seconds, max_repeats, max_notifications_per_window,
+            rollup_window_seconds, escalate_after_seconds, escalate_to_action_id, config_json,
+            created_by, created_time, updated_by, updated_time)
         VALUES (#{name}, #{description}, #{enabled}, #{action_type}, #{condition_json},
-            #{operation_mode}, #{repeat_interval_seconds}, #{max_repeats}, #{config_json}, #{created_by},
-            #{created_time}, #{updated_by}, #{updated_time})
+            #{operation_mode}, #{repeat_interval_seconds}, #{max_repeats}, #{max_notifications_per_window},
+            #{rollup_window_seconds}, #{escalate_after_seconds}, #{escalate_to_action_id}, #{config_json},
+            #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
     </insert>
 
     <update id="updateAction" parameterType="map">
@@ -503,6 +599,10 @@
             operation_mode = #{operation_mode},
             repeat_interval_seconds = #{repeat_interval_seconds},
             max_repeats = #{max_repeats},
+            max_notifications_per_window = #{max_notifications_per_window},
+            rollup_window_seconds = #{rollup_window_seconds},
+            escalate_after_seconds = #{escalate_after_seconds},
+            escalate_to_action_id = #{escalate_to_action_id},
             config_json = #{config_json},
             created_by = #{created_by},
             created_time = #{created_time},
@@ -535,14 +635,14 @@
 
     <select id="getMaintenanceWindow" parameterType="map" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         WHERE id = #{id}
     </select>
 
     <select id="listMaintenanceWindows" parameterType="map" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         ORDER BY active_from DESC
     </select>
@@ -551,17 +651,17 @@
          channel or monitor being checked — do not attempt scope matching in SQL. -->
     <select id="listEnabledMaintenanceWindows" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
-            start_time, end_time, active_from, active_until, enabled, created_by, created_time
+            start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         WHERE enabled = TRUE
     </select>
 
     <insert id="insertMaintenanceWindow" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_maintenance_window (name, scope_type, scope_id, window_mode, repeat_type, days_of_week,
-            days_of_month, start_time, end_time, active_from, active_until,
+            days_of_month, start_time, end_time, timezone, active_from, active_until,
             enabled, created_by, created_time)
         VALUES (#{name}, #{scope_type}, #{scope_id}, #{window_mode}, #{repeat_type}, #{days_of_week},
-            #{days_of_month}, #{start_time}, #{end_time}, #{active_from}, #{active_until},
+            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from}, #{active_until},
             #{enabled}, #{created_by}, #{created_time})
     </insert>
 
@@ -576,6 +676,7 @@
             days_of_month = #{days_of_month},
             start_time = #{start_time},
             end_time = #{end_time},
+            timezone = #{timezone},
             active_from = #{active_from},
             active_until = #{active_until},
             enabled = #{enabled},
@@ -586,6 +687,57 @@
 
     <delete id="deleteMaintenanceWindow" parameterType="map">
         DELETE FROM sentinel_maintenance_window WHERE id = #{id}
+    </delete>
+
+    <!-- ========== NODE_LEASE (sentinel_node_lease) ==========
+
+         The leader lease for multi-node deployments. Every mutating statement below is a
+         single conditional write whose WHERE clause carries the precondition, so the
+         database decides the race and the affected-row count reports the winner; there is
+         deliberately no "read, decide, then write" pair anywhere in this section. Note
+         insertNodeLease has no useGeneratedKeys: lease_name is the primary key and is
+         supplied by the caller, and the key violation raised when a second node inserts
+         the same name is exactly the signal that it lost the race.
+
+         Derby is single-node in practice (the embedded database is not shared between
+         engine nodes), so these statements exist for contract parity across the five
+         mappers rather than because a Derby deployment will ever contend for the lease.
+    -->
+
+    <select id="getNodeLease" parameterType="map" resultMap="nodeLeaseResult">
+        SELECT lease_name, node_id, acquired_time, expires_time
+        FROM sentinel_node_lease
+        WHERE lease_name = #{leaseName}
+    </select>
+
+    <insert id="insertNodeLease" parameterType="map">
+        INSERT INTO sentinel_node_lease (lease_name, node_id, acquired_time, expires_time)
+        VALUES (#{lease_name}, #{node_id}, #{acquired_time}, #{expires_time})
+    </insert>
+
+    <!-- Heartbeat. Conditional on node_id so a node that lost the lease while stalled
+         cannot renew its way back in behind the current holder. acquired_time is left
+         alone: it still records when this node's leadership began. -->
+    <update id="renewNodeLease" parameterType="map">
+        UPDATE sentinel_node_lease
+        SET expires_time = #{expiresTime}
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
+    </update>
+
+    <!-- Failover. Safe to run on every node on every tick: only one update can find the
+         row still expired, so everyone else gets zero rows back. acquired_time IS reset
+         here because leadership genuinely restarts. -->
+    <update id="stealExpiredNodeLease" parameterType="map">
+        UPDATE sentinel_node_lease
+        SET node_id = #{nodeId},
+            acquired_time = #{acquiredTime},
+            expires_time = #{expiresTime}
+        WHERE lease_name = #{leaseName} AND expires_time &lt; #{now}
+    </update>
+
+    <delete id="deleteNodeLease" parameterType="map">
+        DELETE FROM sentinel_node_lease
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
     </delete>
 
 </mapper>

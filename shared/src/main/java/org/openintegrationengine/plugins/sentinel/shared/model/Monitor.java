@@ -31,6 +31,7 @@ public class Monitor {
     private String configJson;
     private int minConsecutiveBreaches;
     private Integer suppressedByMonitorId;
+    private String runbookUrl;
     private Integer createdBy;
     private Instant createdTime;
     private Integer updatedBy;
@@ -213,6 +214,36 @@ public class Monitor {
      */
     public void setSuppressedByMonitorId(Integer suppressedByMonitorId) {
         this.suppressedByMonitorId = suppressedByMonitorId;
+    }
+
+    /**
+     * The link an on-call responder should follow when this monitor fires: the
+     * runbook, wiki page, or ticket queue that explains what the alert means
+     * and what to do about it.
+     *
+     * <p>Carried on the monitor rather than composed into each alert message so
+     * that it reaches every delivery path unchanged — the problem detail pane
+     * renders it as a link, and it travels in the alert payload to email
+     * bodies, SNS messages, webhook templates, and channel source maps. Stored
+     * as an opaque string in a 1024-character column and never fetched,
+     * validated, or resolved by the plugin; whatever an operator typed is what
+     * a responder sees.</p>
+     *
+     * @return the runbook URL for this monitor, or {@code null} if none was
+     *         configured (the common case — it is optional)
+     */
+    public String getRunbookUrl() {
+        return runbookUrl;
+    }
+
+    /**
+     * @param runbookUrl the runbook URL for this monitor; {@code null} or empty
+     *                   for none. Not validated as a URL at this layer, and not
+     *                   escaped — any consumer that renders it into markup or a
+     *                   message template owns escaping it there
+     */
+    public void setRunbookUrl(String runbookUrl) {
+        this.runbookUrl = runbookUrl;
     }
 
     /**

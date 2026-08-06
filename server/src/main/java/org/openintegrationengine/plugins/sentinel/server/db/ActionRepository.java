@@ -49,6 +49,14 @@ public final class ActionRepository {
     /**
      * Fetches one action by its database id.
      *
+     * <p>Also the lookup that resolves an escalation target. {@code
+     * sentinel_action.escalate_to_action_id} carries no foreign key — see
+     * {@link Action#getEscalateToActionId()} for why — so it may name a row
+     * that has since been deleted. A caller following an escalation chain must
+     * therefore treat a {@code null} return as "the chain ends here" rather
+     * than as an error, and must bound its own walk: nothing stops two actions
+     * from escalating to each other.</p>
+     *
      * @param id database id to look up
      * @return the action, or {@code null} if no row exists
      * @throws RepositoryException on persistence failure
@@ -164,6 +172,10 @@ public final class ActionRepository {
         params.put("operation_mode", action.getOperationMode() != null ? action.getOperationMode().name() : null);
         params.put("repeat_interval_seconds", action.getRepeatIntervalSeconds());
         params.put("max_repeats", action.getMaxRepeats());
+        params.put("max_notifications_per_window", action.getMaxNotificationsPerWindow());
+        params.put("rollup_window_seconds", action.getRollupWindowSeconds());
+        params.put("escalate_after_seconds", action.getEscalateAfterSeconds());
+        params.put("escalate_to_action_id", action.getEscalateToActionId());
         params.put("config_json", action.getConfigJson());
         params.put("created_by", action.getCreatedBy());
         params.put("created_time", toTimestamp(action.getCreatedTime()));
@@ -189,6 +201,10 @@ public final class ActionRepository {
 
         action.setRepeatIntervalSeconds(toInteger(row.get("repeat_interval_seconds")));
         action.setMaxRepeats(toInteger(row.get("max_repeats")));
+        action.setMaxNotificationsPerWindow(toInteger(row.get("max_notifications_per_window")));
+        action.setRollupWindowSeconds(toInteger(row.get("rollup_window_seconds")));
+        action.setEscalateAfterSeconds(toInteger(row.get("escalate_after_seconds")));
+        action.setEscalateToActionId(toInteger(row.get("escalate_to_action_id")));
         action.setConfigJson((String) row.get("config_json"));
         action.setCreatedBy(toInteger(row.get("created_by")));
         action.setCreatedTime(toInstant(row.get("created_time")));

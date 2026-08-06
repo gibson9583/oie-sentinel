@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,10 +34,13 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * so unlike {@code RbacRepository} this class carries no constructor-time
  * setup and needs no singleton lifecycle — plain static methods are
  * sufficient. Most statements here are a single MyBatis call and use
- * auto-commit; {@link #replaceActivityTrendForHour(ActivityTrend)} is the one
- * multi-statement sequence (delete-then-reinsert) and opens a manual-commit
- * session so a mid-flight failure leaves the prior bucket in place rather
- * than a deleted-but-not-reinserted gap.</p>
+ * auto-commit. Two methods are not: {@link #replaceActivityTrendForHour(ActivityTrend)}
+ * is a multi-statement sequence (delete-then-reinsert) and opens a
+ * manual-commit session so a mid-flight failure leaves the prior bucket in
+ * place rather than a deleted-but-not-reinserted gap, and
+ * {@link #insertActivitySamples(List)} opens a manual-commit
+ * {@link ExecutorType#BATCH} session so a whole collector tick's rows land in
+ * one round trip, all or nothing.</p>
  */
 public final class ActivityRepository {
 
@@ -54,9 +58,17 @@ public final class ActivityRepository {
     // ========== Activity Sample ==========
 
     /**
-     * Inserts a new activity sample. Plain insert — {@code
+     * Inserts a single activity sample. Plain insert — {@code
      * sentinel_channel_activity_sample} rows are never updated after
      * creation, so no generated-key retrieval is needed.
+     *
+     * <p>The collector — the only high-frequency writer — goes through
+     * {@link #insertActivitySamples(List)} instead, so this method has no
+     * caller in the plugin today. It is retained as the repository's
+     * single-row entry point: it is the cheaper shape for a genuinely single
+     * sample, where opening a batch session costs more than it saves, and it
+     * shares the same mapped statement, so it cannot drift from the batch
+     * path.</p>
      *
      * @param sample the sample to persist; its {@code id} field is ignored
      * @throws RepositoryException on persistence failure
@@ -69,6 +81,92 @@ public final class ActivityRepository {
             log.error("Failed to insert activity sample for channel {} at {}",
                     sample.getChannelId(), sample.getSampleTime(), e);
             throw new RepositoryException(e);
+        }
+    }
+
+    /**
+     * Inserts a whole collector tick's activity samples in one batched round
+     * trip. This is the plugin's hot write path — one row per deployed
+     * channel per tick — so the per-row cost is the number that matters: at
+     * the 30-second default with 200 channels, the single-row path above was
+     * 200 statements every 30 seconds against the same database the engine
+     * uses for message data.
+     *
+     * <p><b>Why a batch executor and not a multi-row insert.</b> MyBatis
+     * offers both, and the alternative would have been a {@code <foreach>}
+     * multi-row {@code VALUES} statement written five times in
+     * {@code package/resources/mapper}. The {@link ExecutorType#BATCH}
+     * session won on four counts:</p>
+     *
+     * <ul>
+     *   <li><i>The session infrastructure already supports it.</i> Batch
+     *   access is not awkward through {@code SqlSessionManager}: its
+     *   {@code openSession(ExecutorType, boolean)} delegates straight to the
+     *   underlying session factory, the same call shape as the manual-commit
+     *   {@code openSession(false)} this class already uses in
+     *   {@link #replaceActivityTrendForHour(ActivityTrend)}. The rest of the
+     *   repository layer calls {@code getSqlSessionManager()} statement
+     *   methods directly only because every one of those is a single round
+     *   trip with nothing to batch or roll back.</li>
+     *
+     *   <li><i>One statement, five vendors.</i> This re-executes the existing
+     *   single-row {@code insertActivitySample} verbatim, so the cross-vendor
+     *   mapper contract gains nothing new to keep in sync. A multi-row
+     *   variant would need three dialects: Oracle has no multi-row
+     *   {@code VALUES} clause at all and would require
+     *   {@code INSERT ALL ... SELECT * FROM dual}.</li>
+     *
+     *   <li><i>No row or parameter ceiling.</i> A multi-row {@code VALUES}
+     *   list would need per-vendor chunking to stay legal — SQL Server caps a
+     *   table value constructor at 1000 rows and a request at 2100
+     *   parameters, which is only 300 rows at this table's 7 bound columns
+     *   and is cleared on the first tick of a 200+ channel server;
+     *   PostgreSQL's extended-query protocol caps a statement at 65535 bind
+     *   parameters. A JDBC batch re-executes one 7-parameter statement per
+     *   row, so the only bound is the deployed channel count.</li>
+     *
+     *   <li><i>All-or-nothing.</i> The batch commits as one manual-commit
+     *   transaction, which is exactly the guarantee
+     *   {@code ActivityCollectorJob} needs to decide whether to advance its
+     *   previous-counters snapshots.</li>
+     * </ul>
+     *
+     * <p>Returns no row count deliberately: JDBC drivers may report
+     * {@code Statement.SUCCESS_NO_INFO} for batched statements, so a count
+     * here would be unreliable, and the collector has no use for one.</p>
+     *
+     * @param samples the samples to persist, in any order; each sample's
+     *                {@code id} field is ignored. A {@code null} or empty
+     *                list is a no-op — a tick with no deployed channels must
+     *                not open a session
+     * @throws RepositoryException on persistence failure. The transaction is
+     *                             rolled back, so no sample in the batch is
+     *                             persisted; callers must treat the whole
+     *                             tick as unwritten
+     */
+    public static void insertActivitySamples(List<ActivitySample> samples) {
+        if (samples == null || samples.isEmpty()) {
+            return;
+        }
+
+        SqlSession session = null;
+        try {
+            session = SqlConfig.getInstance().getSqlSessionManager().openSession(ExecutorType.BATCH, false);
+
+            for (ActivitySample sample : samples) {
+                session.insert(stmt("insertActivitySample"), toSampleColumnMap(sample));
+            }
+
+            // Flushes the accumulated batch and commits it; under BATCH
+            // nothing has reached the driver before this point.
+            session.commit();
+        } catch (Exception e) {
+            log.error("Failed to insert batch of {} activity samples", samples.size(), e);
+            throw new RepositoryException(e);
+        } finally {
+            if (session != null) {
+                session.close();
+            }
         }
     }
 
