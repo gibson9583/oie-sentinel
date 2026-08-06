@@ -7,7 +7,7 @@
         "build": "node build.mjs"
     },
     "devDependencies": {
-        "esbuild": "^0.21.0"
+        "esbuild": "^0.28.1"
     },
     "dependencies": {
         "recharts": "^2.12.0"
