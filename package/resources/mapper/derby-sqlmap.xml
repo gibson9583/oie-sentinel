@@ -383,8 +383,16 @@
         OFFSET 0 ROWS FETCH NEXT #{limit} ROWS ONLY
     </select>
 
+    <!-- Chunked on purpose: one call deletes at most ${chunkSize} rows and the
+         repository loops until a pass comes back short. Derby has no LIMIT on DELETE, so the chunk is chosen by a PK subquery.
+         chunkSize is a plugin constant, not user input (see ChunkedDelete). -->
     <delete id="deleteResolvedAlertEventsOlderThan" parameterType="map">
-        DELETE FROM sentinel_alert_event WHERE status = 'RESOLVED' AND resolved_time &lt; #{cutoff}
+        DELETE FROM sentinel_alert_event
+        WHERE id IN (
+            SELECT id FROM sentinel_alert_event
+            WHERE status = 'RESOLVED' AND resolved_time &lt; #{cutoff}
+            FETCH FIRST ${chunkSize} ROWS ONLY
+        )
     </delete>
 
     <!--
@@ -500,8 +508,16 @@
         WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
     </select>
 
+    <!-- Chunked on purpose: one call deletes at most ${chunkSize} rows and the
+         repository loops until a pass comes back short. Derby has no LIMIT on DELETE, so the chunk is chosen by a PK subquery.
+         chunkSize is a plugin constant, not user input (see ChunkedDelete). -->
     <delete id="deleteActivitySamplesOlderThan" parameterType="map">
-        DELETE FROM sentinel_channel_activity_sample WHERE sample_time &lt; #{cutoff}
+        DELETE FROM sentinel_channel_activity_sample
+        WHERE id IN (
+            SELECT id FROM sentinel_channel_activity_sample
+            WHERE sample_time &lt; #{cutoff}
+            FETCH FIRST ${chunkSize} ROWS ONLY
+        )
     </delete>
 
     <!-- ========== ACTIVITY_TREND (sentinel_channel_activity_trend) ========== -->
@@ -527,8 +543,16 @@
         ORDER BY hour_bucket ASC
     </select>
 
+    <!-- Chunked on purpose: one call deletes at most ${chunkSize} rows and the
+         repository loops until a pass comes back short. Derby has no LIMIT on DELETE, so the chunk is chosen by a PK subquery.
+         chunkSize is a plugin constant, not user input (see ChunkedDelete). -->
     <delete id="deleteActivityTrendOlderThan" parameterType="map">
-        DELETE FROM sentinel_channel_activity_trend WHERE hour_bucket &lt; #{cutoff}
+        DELETE FROM sentinel_channel_activity_trend
+        WHERE id IN (
+            SELECT id FROM sentinel_channel_activity_trend
+            WHERE hour_bucket &lt; #{cutoff}
+            FETCH FIRST ${chunkSize} ROWS ONLY
+        )
     </delete>
 
     <!-- ========== CONNECTOR_STATUS_EVENT (sentinel_connector_status_event) ========== -->

@@ -237,20 +237,19 @@ public final class ActivityRepository {
      * job to keep the raw-sample table bounded once its data has been folded
      * into {@code sentinel_channel_activity_trend}.
      *
+     * <p>Runs in bounded passes via {@link ChunkedDelete} rather than as one
+     * statement — this is the largest table Sentinel owns, and the pass that
+     * follows an operator lowering {@code sampleRetentionDays} can span tens
+     * of millions of rows. See that class for why one transaction would be a
+     * hazard.</p>
+     *
      * @param cutoff samples with {@code sample_time} before this instant are
      *               removed
-     * @return the number of rows deleted
+     * @return the number of rows deleted across all passes
      * @throws RepositoryException on persistence failure
      */
     public static int deleteActivitySamplesOlderThan(Instant cutoff) {
-        try {
-            Map<String, Object> params = new HashMap<>();
-            params.put("cutoff", toTimestamp(cutoff));
-            return SqlConfig.getInstance().getSqlSessionManager().delete(stmt("deleteActivitySamplesOlderThan"), params);
-        } catch (Exception e) {
-            log.error("Failed to delete activity samples older than {}", cutoff, e);
-            throw new RepositoryException(e);
-        }
+        return ChunkedDelete.run(stmt("deleteActivitySamplesOlderThan"), cutoff, "activity samples");
     }
 
     // ========== Activity Trend ==========
@@ -332,20 +331,18 @@ public final class ActivityRepository {
     /**
      * Deletes trend buckets older than a cutoff.
      *
+     * <p>Chunked like the raw-sample prune ({@link ChunkedDelete}). Smaller
+     * per night — one row per channel per hour rather than per tick — but
+     * {@code trendRetentionDays} reaches ten years, so lowering it has the
+     * same shape of problem.</p>
+     *
      * @param cutoff buckets with {@code hour_bucket} before this instant are
      *               removed
-     * @return the number of rows deleted
+     * @return the number of rows deleted across all passes
      * @throws RepositoryException on persistence failure
      */
     public static int deleteActivityTrendOlderThan(Instant cutoff) {
-        try {
-            Map<String, Object> params = new HashMap<>();
-            params.put("cutoff", toTimestamp(cutoff));
-            return SqlConfig.getInstance().getSqlSessionManager().delete(stmt("deleteActivityTrendOlderThan"), params);
-        } catch (Exception e) {
-            log.error("Failed to delete activity trend older than {}", cutoff, e);
-            throw new RepositoryException(e);
-        }
+        return ChunkedDelete.run(stmt("deleteActivityTrendOlderThan"), cutoff, "activity trend buckets");
     }
 
     // ========== Map <-> DTO Conversion ==========

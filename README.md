@@ -98,6 +98,26 @@ Any series is capped at 2000 points: a wider range is folded into equal buckets 
 the caption under the chart reports what was actually drawn (for example "hourly rollup, 1h5m
 buckets") rather than what was requested.
 
+**Long retention belongs to the hourly tier, not the raw one.** Raw samples are capped at 90 days
+precisely because they are 120× denser: at a 30-second collector each channel writes 2,880 raw rows
+a day but only 24 hourly ones. A year of history for 200 channels is about 1.75 million hourly rows
+— trivial. The same year at raw resolution would be 210 million, which is why it isn't offered.
+
+### Pruning
+
+A nightly job at 03:30 (leadership-gated, so one node in a cluster) removes raw samples, hourly
+buckets and resolved alerts past their retention. Open problems are never pruned regardless of age,
+and dispatch history follows its alert out by cascade. Retention values are re-read on every run, so
+a settings change takes effect that night with no restart.
+
+Deletes run in bounded passes of 5,000 rows rather than one statement, each its own transaction.
+This matters for one specific operation: **lowering** a retention setting. Dropping
+`sampleRetentionDays` from 90 to 7 asks the next prune to remove 83 days at once — roughly 48
+million rows for 200 channels — and as a single transaction that means a long table lock, a
+transaction log sized for the whole delete, and on PostgreSQL enough dead tuples to need a manual
+`VACUUM`. Chunking bounds all three, and an interrupted prune simply leaves the remainder for the
+next night.
+
 ## Screenshots
 
 | | |

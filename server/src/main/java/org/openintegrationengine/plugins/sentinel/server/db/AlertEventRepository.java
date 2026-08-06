@@ -270,21 +270,19 @@ public final class AlertEventRepository {
      * retention job to keep the event table bounded; open ({@code PROBLEM})
      * events are never touched regardless of age.
      *
+     * <p>Chunked via {@link ChunkedDelete}. Each removed event also cascades
+     * to its {@code sentinel_action_dispatch_log} rows, so the real write
+     * amplification per pass is higher than the row count suggests — one more
+     * reason not to do this in a single transaction. A storm that opened tens
+     * of thousands of alerts is exactly the history that ages out together.</p>
+     *
      * @param cutoff resolved events with {@code resolved_time} before this
      *               instant are removed
-     * @return the number of rows deleted
+     * @return the number of rows deleted across all passes
      * @throws RepositoryException on persistence failure
      */
     public static int deleteResolvedAlertEventsOlderThan(Instant cutoff) {
-        try {
-            Map<String, Object> params = new HashMap<>();
-            params.put("cutoff", toTimestamp(cutoff));
-            return SqlConfig.getInstance().getSqlSessionManager()
-                    .delete(stmt("deleteResolvedAlertEventsOlderThan"), params);
-        } catch (Exception e) {
-            log.error("Failed to delete resolved alert events older than {}", cutoff, e);
-            throw new RepositoryException(e);
-        }
+        return ChunkedDelete.run(stmt("deleteResolvedAlertEventsOlderThan"), cutoff, "resolved alert events");
     }
 
     // ========== Map <-> DTO Conversion ==========

@@ -73,6 +73,17 @@ import org.slf4j.LoggerFactory;
  *       it, so the reference is resolved defensively in Java instead: the
  *       chain-walking code looks the target up and treats a missing row as
  *       "escalation ends here". See {@code Action#getEscalateToActionId()}.</p></li>
+ *   <li><b>5</b> — Retention-prune indexes. The nightly prune filters on
+ *       {@code sample_time}, {@code hour_bucket} and
+ *       {@code status}/{@code resolved_time}, but every pre-v5 index on those
+ *       tables led with {@code channel_id}, so none of them could serve the
+ *       predicate and each prune degenerated to a full scan — tolerable at the
+ *       7-day sample default, not at the 90-day maximum, where the sample table
+ *       is tens of millions of rows. Adds
+ *       {@code idx_sentinel_activity_sample_time},
+ *       {@code idx_sentinel_activity_trend_hour} and
+ *       {@code idx_sentinel_alert_event_resolved (status, resolved_time)}.
+ *       Index-only, so nothing about existing rows changes.</li>
  * </ul>
  *
  * <h3>Backfill</h3>
@@ -89,7 +100,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 4;
+    public static final int LATEST_VERSION = 5;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -133,6 +144,9 @@ public class SentinelMigrator extends Migrator {
         if (current < 4) {
             applyV4();
         }
+        if (current < 5) {
+            applyV5();
+        }
         writeSchemaVersion(LATEST_VERSION);
         log.info("Sentinel schema at version {}", LATEST_VERSION);
     }
@@ -145,7 +159,7 @@ public class SentinelMigrator extends Migrator {
      * @return the detected current version (0 = fresh install, 1 = all nine
      *         tables present, 2 = window mode/recurrence columns present,
      *         3 = window timezone column present, 4 = monitor runbook column
-     *         present)
+     *         present, 5 = retention-prune indexes present)
      */
     private int detectAndAlignSchemaVersion() throws MigrationException {
         int detected = detectFromState();
@@ -204,6 +218,11 @@ public class SentinelMigrator extends Migrator {
             // it would report a v4 that stopped halfway as a v3 and re-run the ALTERs,
             // which fail on the columns that already exist. Probing the first statement's
             // column keeps "detected version" monotonic with script progress.
+            // v5 adds no columns, only indexes, so it is index-detected — on the FIRST
+            // index its script creates, for the same monotonicity reason as v4's column.
+            if (indexExists("sentinel_channel_activity_sample", "idx_sentinel_activity_sample_time")) {
+                return 5;
+            }
             if (columnExists("sentinel_monitor", "runbook_url")) {
                 return 4;
             }
@@ -225,6 +244,12 @@ public class SentinelMigrator extends Migrator {
     private void applyV1() throws MigrationException {
         log.info("Applying Sentinel schema v1 (create tables)");
         executeScript("/" + getDatabaseType() + "-sentinel-tables.sql");
+    }
+
+    /** Creates the retention-prune indexes (see class Javadoc). */
+    private void applyV5() throws MigrationException {
+        log.info("Applying Sentinel schema v5 (retention prune indexes)");
+        executeScript("/" + getDatabaseType() + "-sentinel-v5.sql");
     }
 
     /** Adds the maintenance-window mode/recurrence columns (see class Javadoc). */
@@ -311,6 +336,38 @@ public class SentinelMigrator extends Migrator {
                         return true;
                     }
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks for an index by name on a table, across the conventional
+     * identifier cases different JDBC drivers normalise to. v5's detection
+     * signal — unlike every earlier version it adds no column to probe.
+     *
+     * <p>{@code getIndexInfo} needs the table name in the case the driver
+     * stores it and throws on some drivers when the table does not resolve,
+     * so each candidate is tried independently and a failure moves on to the
+     * next rather than aborting detection. {@code approximate = true} lets
+     * the driver answer from cached statistics instead of forcing an
+     * analyze, which on a large sample table would be an expensive way to
+     * answer a yes/no question at startup.</p>
+     */
+    private boolean indexExists(String tableName, String indexName) throws Exception {
+        Connection conn = getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        for (String tableCandidate : namingCandidates(tableName)) {
+            try (ResultSet rs = meta.getIndexInfo(null, null, tableCandidate, false, true)) {
+                while (rs.next()) {
+                    String found = rs.getString("INDEX_NAME");
+                    if (found != null && found.equalsIgnoreCase(indexName)) {
+                        return true;
+                    }
+                }
+            } catch (Exception e) {
+                // Unknown table in this case form; try the next candidate.
+                log.trace("getIndexInfo failed for table candidate {}", tableCandidate, e);
             }
         }
         return false;
