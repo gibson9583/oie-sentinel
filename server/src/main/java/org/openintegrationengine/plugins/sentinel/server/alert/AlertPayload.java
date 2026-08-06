@@ -46,6 +46,7 @@ public final class AlertPayload {
     private final String message;
     private final Instant openedTime;
     private final String valueJson;
+    private final String runbookUrl;
 
     /**
      * Package-private so that {@link ActionDispatcher#sendTest(org.openintegrationengine.plugins.sentinel.shared.model.Action)}
@@ -53,10 +54,28 @@ public final class AlertPayload {
      * without routing through {@link #of}, which resolves the channel name
      * from the live engine cache. All production payloads must come from
      * {@link #of} so the resolution rules stay in one place.
+     *
+     * <p>Delegates with no runbook URL. Kept as its own overload rather than
+     * folded into the full constructor because a synthetic payload has no
+     * monitor behind it to carry one, and because the callers that build test
+     * payloads should not have to name a field that is only ever null for
+     * them.</p>
      */
     AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
             String channelId, String channelName, Integer metadataId, Severity severity,
             String eventType, String message, Instant openedTime, String valueJson) {
+        this(alertEventId, monitorId, monitorName, monitorType, channelId, channelName, metadataId,
+                severity, eventType, message, openedTime, valueJson, null);
+    }
+
+    /**
+     * Full constructor, adding the owning monitor's runbook URL to the
+     * synthetic-payload shape above.
+     */
+    AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
+            String channelId, String channelName, Integer metadataId, Severity severity,
+            String eventType, String message, Instant openedTime, String valueJson,
+            String runbookUrl) {
         this.alertEventId = alertEventId;
         this.monitorId = monitorId;
         this.monitorName = monitorName;
@@ -69,6 +88,7 @@ public final class AlertPayload {
         this.message = message;
         this.openedTime = openedTime;
         this.valueJson = valueJson;
+        this.runbookUrl = runbookUrl;
     }
 
     /**
@@ -104,7 +124,8 @@ public final class AlertPayload {
                 eventType,
                 event.getMessage(),
                 event.getOpenedTime(),
-                event.getDetailsJson());
+                event.getDetailsJson(),
+                monitor != null ? monitor.getRunbookUrl() : null);
     }
 
     /**
@@ -203,5 +224,31 @@ public final class AlertPayload {
      */
     public String getValueJson() {
         return valueJson;
+    }
+
+    /**
+     * The owning monitor's runbook link — the page telling whoever is woken up
+     * what this alert means and what to do about it.
+     *
+     * <p>Resolved here, at dispatch time, for the same reason every other
+     * display value is: it is pinned to what the monitor said <em>when the alert
+     * fired</em>, and every transport then reads it from one place. That is what
+     * makes it available identically as the {@code ${runbookUrl}} template token
+     * in {@code EmailAlertSender} and {@code WebhookAlertSender}, as a labelled
+     * line in the email body, and as a field of the serialized payload — which
+     * is the message body {@code ChannelAlertSender} routes, the message
+     * {@code SnsAlertSender} publishes, and the default webhook body.</p>
+     *
+     * <p>Validated at save time by {@code MonitorService} as an absolute
+     * http/https URL, so senders may treat it as one; it is still ordinary
+     * operator-supplied text, so a sender writing it into a header-shaped field
+     * flattens it with {@link AlertSender#singleLine} like any other rendered
+     * value.</p>
+     *
+     * @return the runbook URL, or {@code null} when the monitor has none (the
+     *         common case), was deleted, or the payload is synthetic
+     */
+    public String getRunbookUrl() {
+        return runbookUrl;
     }
 }

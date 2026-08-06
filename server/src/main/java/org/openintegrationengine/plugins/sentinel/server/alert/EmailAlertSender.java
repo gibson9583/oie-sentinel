@@ -30,9 +30,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
  * — passed straight through, because the engine's
  * {@code ServerSMTPConnection.send} splits on commas itself. The subject
  * template supports simple {@code ${var}} substitution (monitorName,
- * channelName, severity, status, message); deliberately not Velocity — alert
- * subjects need value interpolation, not scripting, and a template typo must
- * never be able to break dispatch.</p>
+ * channelName, severity, status, message, runbookUrl); deliberately not
+ * Velocity — alert subjects need value interpolation, not scripting, and a
+ * template typo must never be able to break dispatch.</p>
  */
 public final class EmailAlertSender implements AlertSender {
 
@@ -120,14 +120,32 @@ public final class EmailAlertSender implements AlertSender {
      * {@code String.replace} per token: unknown tokens are left verbatim
      * (visible in the subject, so the operator notices the typo) rather than
      * throwing, because a bad template must never cost the notification.
+     *
+     * <p>Every substituted value is flattened to a single line
+     * ({@link AlertSender#singleLine}) because this renders the {@code Subject}
+     * header. JavaMail happens to encode that header, so a CRLF in a monitor
+     * name is not exploitable today — but the asymmetry with
+     * {@code SnsAlertSender}, which has always sanitized, is the kind that
+     * becomes a real defect the moment this method is reused for a header
+     * nothing encodes.</p>
+     *
+     * <p>{@code ${runbookUrl}} is flattened like every other value even though
+     * {@code MonitorService} has already rejected anything that is not a
+     * syntactically valid absolute http/https URL (and a valid URI cannot
+     * contain a control character). The exemption would be sound today and
+     * would silently stop being sound the first time a payload gained a runbook
+     * URL from somewhere other than a validated monitor — an import path, a
+     * hand-edited row — so the token carries no special case. An absent runbook
+     * substitutes to the empty string, matching every other absent value.</p>
      */
     private static String render(String template, AlertPayload payload) {
         return template
-                .replace("${monitorName}", safe(payload.getMonitorName()))
-                .replace("${channelName}", safe(payload.getChannelName()))
+                .replace("${monitorName}", AlertSender.singleLine(payload.getMonitorName()))
+                .replace("${channelName}", AlertSender.singleLine(payload.getChannelName()))
                 .replace("${severity}", payload.getSeverity() != null ? payload.getSeverity().name() : "")
-                .replace("${status}", safe(payload.getEventType()))
-                .replace("${message}", safe(payload.getMessage()));
+                .replace("${status}", AlertSender.singleLine(payload.getEventType()))
+                .replace("${message}", AlertSender.singleLine(payload.getMessage()))
+                .replace("${runbookUrl}", AlertSender.singleLine(payload.getRunbookUrl()));
     }
 
     /**
@@ -135,6 +153,15 @@ public final class EmailAlertSender implements AlertSender {
      * Sentinel mail scans the same way regardless of monitor type), the
      * evaluator's message as the narrative, and optionally the raw value JSON
      * as the machine-readable evidence block.
+     *
+     * <p>The runbook line sits with the label block rather than at the foot,
+     * and is emitted only when the monitor has one — an empty "Runbook:" line
+     * on every alert would train the reader to stop looking at that spot,
+     * which costs exactly the monitors that bothered to set it. It is
+     * deliberately not flattened by {@link AlertSender#singleLine}: this is
+     * body text, not a header, where a newline is a line break rather than a
+     * structural delimiter, and mail clients linkify a bare URL on its own
+     * line.</p>
      */
     private static String buildBody(AlertPayload payload, boolean includeDetails) {
         StringBuilder body = new StringBuilder(256);
@@ -158,6 +185,9 @@ public final class EmailAlertSender implements AlertSender {
         body.append("Status:   ").append(safe(payload.getEventType())).append('\n');
         if (payload.getOpenedTime() != null) {
             body.append("Opened:   ").append(payload.getOpenedTime()).append('\n');
+        }
+        if (payload.getRunbookUrl() != null && !payload.getRunbookUrl().isBlank()) {
+            body.append("Runbook:  ").append(payload.getRunbookUrl()).append('\n');
         }
         if (payload.getMessage() != null) {
             body.append('\n').append(payload.getMessage()).append('\n');

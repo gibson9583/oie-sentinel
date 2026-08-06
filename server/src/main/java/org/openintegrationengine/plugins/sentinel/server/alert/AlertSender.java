@@ -44,4 +44,28 @@ public interface AlertSender {
      *                   persisted (truncated) as the dispatch failure reason
      */
     void send(Action action, AlertEvent event, AlertPayload payload) throws Exception;
+
+    /**
+     * Flattens CR, LF, tab and any other control character to spaces — the
+     * one-line-header guard every transport shares.
+     *
+     * <p>Operator-supplied text (monitor names, channel names, evaluator
+     * messages) reaches header-shaped fields through the senders' template
+     * rendering. A newline in a value that lands in an unencoded header
+     * splits it, so the sanitizing has to happen at render time rather than
+     * being left to whatever the transport happens to do with it: JavaMail
+     * encodes the {@code Subject} header and SNS rejects multi-line subjects
+     * outright, but neither is a property this code should depend on, and a
+     * transport added later (a webhook writing raw headers) would inherit
+     * the gap silently.</p>
+     *
+     * <p>Returns {@code ""} for null so callers can render an absent value
+     * without a null check.</p>
+     *
+     * @param value the raw text to flatten; may be {@code null}
+     * @return the value with every control character replaced by a space
+     */
+    static String singleLine(String value) {
+        return value == null ? "" : value.replaceAll("[\\r\\n\\t\\p{Cntrl}]", " ");
+    }
 }

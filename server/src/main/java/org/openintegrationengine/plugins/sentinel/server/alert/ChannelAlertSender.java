@@ -93,6 +93,9 @@ public final class ChannelAlertSender implements AlertSender {
         put(sourceMap, "sentinelChannelId", payload.getChannelId());
         put(sourceMap, "sentinelChannelName", payload.getChannelName());
         put(sourceMap, "sentinelMessage", payload.getMessage());
+        // Absent for monitors with no runbook — put() skips nulls, so a
+        // receiving channel's filter can test presence rather than emptiness.
+        put(sourceMap, "sentinelRunbookUrl", payload.getRunbookUrl());
         put(sourceMap, "sentinelAlertEventId", String.valueOf(payload.getAlertEventId()));
         return sourceMap;
     }

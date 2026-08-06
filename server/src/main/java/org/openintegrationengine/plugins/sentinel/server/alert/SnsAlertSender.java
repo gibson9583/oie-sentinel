@@ -5,6 +5,7 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
+import java.time.Duration;
 import java.util.Locale;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -13,11 +14,13 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sns.SnsClient;
 import software.amazon.awssdk.services.sns.SnsClientBuilder;
 import software.amazon.awssdk.services.sns.model.PublishRequest;
 import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.sts.StsClientBuilder;
 import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider;
 import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
 import software.amazon.awssdk.utils.SdkAutoCloseable;
@@ -58,6 +61,20 @@ public final class SnsAlertSender implements AlertSender {
      * delivery over a long monitor name.
      */
     private static final int MAX_SUBJECT_LENGTH = 100;
+
+    /**
+     * Wall-clock ceiling for one publish/assume-role call including retries,
+     * and for each individual attempt. Without these the only bound is the
+     * HTTP client's socket defaults, which an unreachable or blackholed
+     * endpoint does not trip — the call simply parks. That used to park the
+     * evaluator thread; since dispatch moved to its own executor it parks a
+     * dispatch worker instead, which is better but still finite: four stuck
+     * publishes exhaust the pool and every other transport queues behind
+     * them. A notification that has not been delivered in ten seconds has
+     * missed the point of being an alert anyway.
+     */
+    private static final Duration API_CALL_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration API_CALL_ATTEMPT_TIMEOUT = Duration.ofSeconds(5);
 
     /**
      * Publishes one notification: subject = short payload summary, message =
@@ -111,7 +128,16 @@ public final class SnsAlertSender implements AlertSender {
      * metadata) resolves it, exactly as sqs-source-connector behaves.
      */
     private static SnsClient buildClient(SnsCredentials credentials, String region) {
+        // Explicit HTTP client rather than SPI discovery: the engine supplies
+        // apache-client at server-lib/aws/ (see server/pom.xml) and Sentinel
+        // bundles no HTTP client of its own, so naming it here makes the
+        // dependency contract explicit instead of implicit in classpath order.
+        // httpClientBuilder (not httpClient) so the SDK client owns and closes it.
         SnsClientBuilder builder = SnsClient.builder()
+                .httpClientBuilder(ApacheHttpClient.builder())
+                .overrideConfiguration(c -> c
+                        .apiCallTimeout(API_CALL_TIMEOUT)
+                        .apiCallAttemptTimeout(API_CALL_ATTEMPT_TIMEOUT))
                 .credentialsProvider(credentials.getProvider());
         if (region != null && !region.isBlank()) {
             builder.region(Region.of(region));
@@ -130,7 +156,7 @@ public final class SnsAlertSender implements AlertSender {
         String severity = payload.getSeverity() != null ? payload.getSeverity().name() : "UNKNOWN";
         String summary = "[Sentinel][" + severity + "] " + safe(payload.getMonitorName())
                 + " - " + safe(payload.getChannelName()) + ": " + safe(payload.getEventType());
-        summary = summary.replaceAll("[\\r\\n\\t\\p{Cntrl}]", " ");
+        summary = AlertSender.singleLine(summary);
         if (summary.length() > MAX_SUBJECT_LENGTH) {
             summary = summary.substring(0, MAX_SUBJECT_LENGTH);
         }
@@ -255,9 +281,15 @@ public final class SnsAlertSender implements AlertSender {
                         roleRequestBuilder.externalId(externalId);
                     }
 
-                    StsClient stsClient = region != null && !region.isBlank()
-                            ? StsClient.builder().region(Region.of(region)).build()
-                            : StsClient.builder().build();
+                    StsClientBuilder stsBuilder = StsClient.builder()
+                            .httpClientBuilder(ApacheHttpClient.builder())
+                            .overrideConfiguration(c -> c
+                                    .apiCallTimeout(API_CALL_TIMEOUT)
+                                    .apiCallAttemptTimeout(API_CALL_ATTEMPT_TIMEOUT));
+                    if (region != null && !region.isBlank()) {
+                        stsBuilder.region(Region.of(region));
+                    }
+                    StsClient stsClient = stsBuilder.build();
 
                     AwsCredentialsProvider provider = StsAssumeRoleCredentialsProvider.builder()
                             .stsClient(stsClient)
