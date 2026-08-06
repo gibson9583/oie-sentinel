@@ -23,17 +23,139 @@
             <version>${revision}</version>
         </dependency>
 
-        <!-- SNS alert action. Not engine-provided (confirmed: sqs-source-connector in this
-             workspace bundles the AWS SDK v2 the same way) — default/compile scope so it is
-             staged into to-be-packed and shipped inside the plugin zip. Version resolved from
-             the aws-sdk BOM imported in the root pom. -->
+        <!-- ==================== AWS SDK ====================
+             The engine ships the ENTIRE AWS SDK 2.15.28 core on the server classpath at
+             server-lib/aws/ (verified against the 4.6.0 GA distribution): annotations,
+             apache-client, auth, aws-core, aws-json-protocol, aws-query-protocol,
+             aws-xml-protocol, eventstream, http-client-spi, kms, metrics-spi, profiles,
+             protocol-core, regions, s3, sdk-core, sts, utils — plus netty 4.1.119 under
+             aws/ext/netty. The one artifact it does NOT ship is `sns`.
+
+             So `sns` is the only jar this plugin bundles; everything else is `provided`
+             and resolves from the engine at runtime. Classpath visibility is not an
+             assumption: MirthLauncher adds server-lib via FileUtils.listFiles(dir,
+             fileFilter, trueFileFilter()) — a RECURSIVE walk — into the same
+             URLClassLoader the extensions are then appended to, which is also why the
+             already-working `provided` donkey-server (server-lib/donkey/) resolves.
+
+             This is not merely a size win. We were shipping a netty 4.1.53 — five years
+             older than the engine's patched 4.1.119, and carrying request-smuggling and
+             DoS CVEs — inside a distributed artifact. Because server-lib is added to the
+             classloader BEFORE extensions, the engine's newer copy actually won at
+             load time, so those jars were mostly inert; the real costs were an artifact
+             full of vulnerable code, and the live hazard of a half-and-half netty if the
+             engine's set were ever narrower than ours.
+
+             MUST stay pinned at ${aws-sdk.version} = the engine's 2.15.28. Bumping it here
+             without the engine bumping server-lib/aws would reintroduce the skew this
+             removes; minEngineVersion is the compatibility contract.
+
+             The `provided` entries below are explicit on purpose — without them Maven
+             resolves each as a compile-scope transitive of `sns` and stages it into
+             to-be-packed. A direct declaration wins over the transitive path. -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>sns</artifactId>
+            <exclusions>
+                <!-- "Ship sns and nothing else", enforced structurally. Every one of sns's
+                     transitives is supplied by the engine at server-lib/aws/, so a wildcard
+                     exclusion states the intent exactly once and stays correct if the SDK
+                     adds a transitive later.
+
+                     This must be an EXCLUSION, not just `provided` scope on the artifacts
+                     below: dependency mediation is per-project, so the `provided` markers
+                     here govern only this module's classpath. The packaging module pulls
+                     sns transitively through sentinel-server, where those markers do not
+                     apply and every transitive would resolve back to compile scope and be
+                     staged into the zip. Exclusions travel with the dependency node, so
+                     they hold in every consumer's graph.
+
+                     The compile classpath is supplied by the `provided` declarations below;
+                     the runtime classpath by the engine. build.sh's library-drift check and
+                     SentinelServicePlugin's startup classload probe are the two guards that
+                     turn a wrong assumption here into a loud failure rather than a silent
+                     one at first alert. -->
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
+
+        <!-- Compile-time only; all supplied by the engine at server-lib/aws/. -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>sts</artifactId>
+            <scope>provided</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- The sync HTTP client SnsAlertSender selects explicitly. The engine ships
+             apache-client but NOT url-connection-client, so Apache is the correct
+             choice here — see SnsAlertSender.buildClient. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sdk-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>aws-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>auth</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>regions</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>profiles</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>http-client-spi</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>protocol-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>aws-query-protocol</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>utils</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>annotations</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>metrics-spi</artifactId>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 </project>

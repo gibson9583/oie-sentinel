@@ -52,47 +52,19 @@
     <library type="SERVER" path="sentinel-server-${project.version}.jar" />
     <library type="SHARED" path="sentinel-shared-${project.version}.jar" />
 
-    <!-- AWS SDK v2 for the SNS alert sender, plus its transitive closure — the engine does not
-         bundle any of these (sqs-source-connector precedent: each staged jar must be hand-listed
-         here or the extension classloader never sees it). This list mirrors exactly what
-         maven-dependency-plugin stages into package/target/to-be-packed; regenerate after an
-         aws-sdk.version bump with:
-           ls package/target/to-be-packed/*.jar | grep -v sentinel- -->
-    <library type="SERVER" path="annotations-2.15.28.jar" />
-    <library type="SERVER" path="apache-client-2.15.28.jar" />
-    <library type="SERVER" path="auth-2.15.28.jar" />
-    <library type="SERVER" path="aws-core-2.15.28.jar" />
-    <library type="SERVER" path="aws-query-protocol-2.15.28.jar" />
-    <library type="SERVER" path="commons-codec-1.11.jar" />
-    <library type="SERVER" path="commons-logging-1.2.jar" />
-    <library type="SERVER" path="eventstream-1.0.1.jar" />
-    <library type="SERVER" path="httpclient-4.5.13.jar" />
-    <library type="SERVER" path="http-client-spi-2.15.28.jar" />
-    <library type="SERVER" path="httpcore-4.4.11.jar" />
-    <library type="SERVER" path="jackson-annotations-2.14.3.jar" />
-    <library type="SERVER" path="jackson-core-2.14.3.jar" />
-    <library type="SERVER" path="metrics-spi-2.15.28.jar" />
-    <library type="SERVER" path="netty-buffer-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-codec-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-codec-http2-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-codec-http-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-common-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-handler-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-nio-client-2.15.28.jar" />
-    <library type="SERVER" path="netty-reactive-streams-2.0.4.jar" />
-    <library type="SERVER" path="netty-reactive-streams-http-2.0.4.jar" />
-    <library type="SERVER" path="netty-resolver-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-transport-4.1.53.Final.jar" />
-    <library type="SERVER" path="netty-transport-native-epoll-4.1.53.Final-linux-x86_64.jar" />
-    <library type="SERVER" path="netty-transport-native-unix-common-4.1.53.Final.jar" />
-    <library type="SERVER" path="profiles-2.15.28.jar" />
-    <library type="SERVER" path="protocol-core-2.15.28.jar" />
-    <library type="SERVER" path="reactive-streams-1.0.2.jar" />
-    <library type="SERVER" path="regions-2.15.28.jar" />
-    <library type="SERVER" path="sdk-core-2.15.28.jar" />
+    <!-- AWS SDK: `sns` ONLY. The engine ships the entire AWS SDK 2.15.28 core on the server
+         classpath at server-lib/aws/ (annotations, apache-client, auth, aws-core, the protocol
+         jars, http-client-spi, metrics-spi, profiles, protocol-core, regions, sdk-core, sts,
+         utils — plus netty 4.1.119 under aws/ext/netty and jackson 2.14.3 under
+         server-lib/jackson). `sns` is the one artifact it does not ship, so it is the one
+         artifact Sentinel bundles; see the AWS block in server/pom.xml for the full rationale.
+
+         Every path listed here must exist in the built zip — the engine logs
+         "could not locate library" at ERROR for each miss and silently carries on with a
+         short classpath. build.sh diffs this list against the staged jars and fails the
+         build on drift, so regenerate with:
+           ls package/target/to-be-packed/*.jar | xargs -n1 basename -->
     <library type="SERVER" path="sns-2.15.28.jar" />
-    <library type="SERVER" path="sts-2.15.28.jar" />
-    <library type="SERVER" path="utils-2.15.28.jar" />
 
     <apiProvider type="SERVLET_INTERFACE" name="org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface" />
     <apiProvider type="SERVER_CLASS" name="org.openintegrationengine.plugins.sentinel.server.servlet.SentinelServlet" />

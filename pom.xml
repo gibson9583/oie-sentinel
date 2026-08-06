@@ -14,7 +14,7 @@
     <packaging>pom</packaging>
 
     <properties>
-        <revision>0.1.0</revision>
+        <revision>1.0.0</revision>
 
         <plugin.supported.mc.versions>${mc.version}</plugin.supported.mc.versions>
 
@@ -150,6 +150,22 @@
             <version>${jackson.version}</version>
             <scope>provided</scope>
         </dependency>
+        <!-- core/annotations would otherwise ride in transitively (compile scope)
+             through the AWS SDK and land in the zip as byte-identical duplicates
+             of the engine's own jackson 2.14.3 jars. Direct provided-scope
+             declarations win over the transitive path and keep them out. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>${jackson.version}</version>
+            <scope>provided</scope>
+        </dependency>
         <!-- Engine ships jackson-datatype-jsr310-2.14.3 alongside databind; needed so the REST
              layer's ObjectMapper can serialize the shared DTOs' java.time.Instant fields. -->
         <dependency>
@@ -182,6 +198,20 @@
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
             <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Test-only, and only to make the engine's own classes linkable. Maven omits
+             the transitives of `provided` artifacts, and the engine jars installed by
+             scripts/install-engine-jars.sh carry no dependency metadata at all, so
+             ChannelStatistics fails to link at test time: its toString() reaches
+             ToStringBuilder.reflectionToString and commons-lang3 is absent. Without this
+             the collector tests cannot even mock the type. Pinned to the version the
+             engine ships (server-lib/commons/commons-lang3-3.20.0.jar) so tests link
+             against exactly what runs in production. -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.20.0</version>
             <scope>test</scope>
         </dependency>
         <dependency>

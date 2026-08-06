@@ -17,19 +17,22 @@ import com.mirth.connect.server.controllers.ConfigurationController;
 import com.mirth.connect.server.controllers.ControllerFactory;
 import com.mirth.connect.server.controllers.EventController;
 
+import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
 import org.openintegrationengine.plugins.sentinel.server.db.SentinelMigrator;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelConnectorStatusListener;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
 
 /**
  * Sentinel's engine lifecycle hook — the {@code <serverClasses>} entry in
- * plugin.xml. Owns exactly two runtime resources: the connector-status
- * {@code EventListener} and the private Quartz scheduler, wired up in
- * {@link #start()} and torn down in {@link #stop()}. Everything else in the
- * plugin is stateless (static services/repositories) or a self-managing
- * singleton, so there is deliberately nothing else to manage here.
+ * plugin.xml. Owns exactly four runtime resources: the connector-status
+ * {@code EventListener}, the leader-lease heartbeat, the private Quartz
+ * scheduler, and the alert dispatch thread pool, wired up in {@link #start()}
+ * and torn down in {@link #stop()}. Everything else in the plugin is
+ * stateless (static services/repositories) or a self-managing singleton, so
+ * there is deliberately nothing else to manage here.
  *
  * <p>No XStream {@code allowTypes} registration happens here, unlike the
  * RBAC precedent: Sentinel's REST layer uses the raw-JSON pattern (every
@@ -112,9 +115,19 @@ public class SentinelServicePlugin implements ServicePlugin {
     }
 
     /**
-     * Starts the two runtime resources: the connector-status listener first
-     * (so no state transitions are missed while the scheduler spins up),
-     * then the scheduler with the persisted settings.
+     * Starts the four runtime resources: the alert dispatch pool first (the
+     * scheduler's evaluator hands every notification to it), then the
+     * connector-status listener (so no state transitions are missed while the
+     * scheduler spins up), then the leader-lease heartbeat, then the scheduler
+     * with the persisted settings.
+     *
+     * <p>The heartbeat must precede the scheduler, and not merely by
+     * convention: the job bodies ask {@link SentinelLeadership} whether this
+     * node may work, and a scheduler started first would fire its opening
+     * collector and evaluator ticks against a subsystem that had not yet
+     * decided. {@code startHeartbeat} settles the first acquire-or-renew
+     * synchronously before returning, so by the time the scheduler exists
+     * every tick has a real answer to consult.</p>
      *
      * <p>The whole body is guarded: a failure here (typically the settings
      * read against an unavailable database) must degrade Sentinel to "not
@@ -134,14 +147,63 @@ public class SentinelServicePlugin implements ServicePlugin {
                 return;
             }
 
+            probeSnsClasspath();
+
+            // Before the scheduler: the evaluator hands every notification to
+            // this pool, and a tick that found no pool would drop its alerts.
+            ActionDispatcher.startDispatchExecutor();
+
             connectorStatusListener = new SentinelConnectorStatusListener();
             ControllerFactory.getFactory().createEventController().addListener(connectorStatusListener);
+
+            // Before the scheduler: the job bodies consult this to decide
+            // whether this node is the one that does the work.
+            SentinelLeadership.startHeartbeat();
 
             SentinelScheduler.getInstance().start(SettingsService.get());
 
             log.info("OIE Sentinel started");
         } catch (Exception e) {
             log.error("OIE Sentinel failed to start; monitoring is inactive until the server is restarted", e);
+        }
+    }
+
+    /**
+     * Verifies at startup that the AWS SDK classes the SNS action needs are
+     * actually reachable, and says so loudly if they are not.
+     *
+     * <p>Sentinel bundles only {@code sns} and relies on the engine's
+     * {@code server-lib/aws/} for the SDK core and {@code apache-client}
+     * (see the AWS block in {@code server/pom.xml}). If that assumption ever
+     * breaks — an engine repackaging, a stripped distribution — the natural
+     * failure point is deep inside {@code SnsAlertSender} at the moment an
+     * alert fires, which is the worst possible time for a monitoring plugin
+     * to discover a missing class. Loading the two entry points here converts
+     * that into one actionable line in the startup log.</p>
+     *
+     * <p>Deliberately non-fatal: SNS is one of three transports, so a missing
+     * SDK must not stop the collector, the evaluator, or email and channel
+     * alerting from working.</p>
+     */
+    private static void probeSnsClasspath() {
+        // Class.forName over a direct reference: this must report the problem,
+        // not become another site that throws NoClassDefFoundError.
+        String missing = null;
+        for (String className : new String[] {
+                "software.amazon.awssdk.services.sns.SnsClient",
+                "software.amazon.awssdk.http.apache.ApacheHttpClient" }) {
+            try {
+                Class.forName(className, false, SentinelServicePlugin.class.getClassLoader());
+            } catch (Throwable t) {
+                missing = className;
+                break;
+            }
+        }
+        if (missing != null) {
+            log.error("AWS SDK class {} is not on the extension classpath — SNS alert actions will fail "
+                    + "when they fire. Sentinel bundles only sns-*.jar and expects the SDK core and "
+                    + "apache-client from the engine's server-lib/aws/ directory; check that this engine "
+                    + "build ships them. Email and channel actions are unaffected.", missing);
         }
     }
 
@@ -165,10 +227,21 @@ public class SentinelServicePlugin implements ServicePlugin {
 
     /**
      * Tears down in reverse start order: scheduler first so no job tick can
-     * race the listener removal, then the listener
-     * ({@code removeListener} also shuts down its consumer thread). Each
-     * step is independently guarded so a failure in one never leaks the
-     * other resource.
+     * race the listener removal, then the leader-lease heartbeat, then the
+     * listener ({@code removeListener} also shuts down its consumer thread),
+     * then the alert dispatch pool. The pool goes last on purpose — with the
+     * evaluator already stopped nothing is producing notifications any more,
+     * so its short drain window is spent delivering the final tick's alerts
+     * rather than chasing new arrivals. Each step is independently guarded so
+     * a failure in one never leaks the other resources.
+     *
+     * <p>The heartbeat's position is the mirror of its position in
+     * {@link #start()}, and load-bearing for the same reason: the scheduler's
+     * shutdown waits for any in-flight job, so by the time the lease is
+     * released no tick is left that could still believe this node leads. The
+     * release is what lets a peer pick the work up within a heartbeat instead
+     * of waiting out the lease — the difference between a rolling restart
+     * costing seconds of monitoring and costing minutes.</p>
      */
     @Override
     public void stop() {
@@ -176,6 +249,12 @@ public class SentinelServicePlugin implements ServicePlugin {
             SentinelScheduler.getInstance().shutdown();
         } catch (Exception e) {
             log.warn("Failed to shut down the Sentinel scheduler", e);
+        }
+
+        try {
+            SentinelLeadership.stopHeartbeat();
+        } catch (Exception e) {
+            log.warn("Failed to stop the Sentinel leadership heartbeat", e);
         }
 
         if (connectorStatusListener != null) {
@@ -187,6 +266,12 @@ public class SentinelServicePlugin implements ServicePlugin {
             } finally {
                 connectorStatusListener = null;
             }
+        }
+
+        try {
+            ActionDispatcher.shutdownDispatchExecutor();
+        } catch (Exception e) {
+            log.warn("Failed to shut down the Sentinel alert dispatch executor", e);
         }
 
         log.info("OIE Sentinel stopped");
