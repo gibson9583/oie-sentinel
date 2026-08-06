@@ -9,6 +9,14 @@
 #     repository with Contents + Pull requests read/write
 #
 # workflow_dispatch with a tag input backfills an already-published release.
+#
+# Supply chain:
+#   * Every action is pinned to a full commit SHA, not a mutable tag. The
+#     trailing `# vX.Y.Z` comment is documentation only; the SHA is what runs.
+#   * GITHUB_TOKEN is read-only here. Every write this job performs — the
+#     catalog checkout, the branch push, the PR — goes through CATALOG_TOKEN,
+#     a PAT scoped to the catalog repository, so no write scope on *this*
+#     repository is needed or granted.
 
 name: Catalog PR
 
@@ -20,6 +28,10 @@ on:
       tag:
         description: "Published release tag to file (e.g. v0.1.0) — for backfilling"
         required: true
+
+# Least privilege: see the header note. Reads only; writes use CATALOG_TOKEN.
+permissions:
+  contents: read
 
 jobs:
   catalog-manifest:
@@ -57,12 +69,12 @@ jobs:
           echo "STORE_DOCS=$(node -p "JSON.parse(require('fs').readFileSync('oie.json','utf8')).storeDocs || 'README.md'")" >> "$GITHUB_ENV"
           echo "UI_JSON=$(node -p "JSON.stringify(JSON.parse(require('fs').readFileSync('oie.json','utf8')).ui || ['web'])")" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ vars.CATALOG_REPO }}
           token: ${{ secrets.CATALOG_TOKEN }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 

@@ -1,0 +1,55 @@
+# Dependency update automation.
+#
+# Scope note (from the plan's CI/supply-chain section): Dependabot reads the
+# poms and package.json, so it catches stale declared versions — it would have
+# flagged the stale aws-sdk.version — but it cannot see the duplicate-of-engine
+# problem underneath that, where plugin.xml bundles libraries the engine
+# already ships. The check that catches *that* class of bug is a CI step
+# diffing plugin.xml's library list against the target engine distribution's
+# server-lib tree. Dependabot is not a substitute for it.
+
+version: 2
+updates:
+  # Maven, multi-module: the aggregator pom.xml at the root declares
+  # <modules>shared, server, package</modules>. Dependabot follows the module
+  # list from the root pom and raises PRs covering the child poms too, so a
+  # single "/" entry is the whole reactor — do not add per-module entries or
+  # the same dependency gets proposed several times.
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    ignore:
+      # The engine jars are installed into the local repo by
+      # scripts/install-engine-jars.sh (CI: from the pinned distribution
+      # tarball). Their version tracks oie.json's minEngineVersion and is
+      # bumped deliberately with the engine, never by a dependency PR.
+      - dependency-name: "com.mirth.connect:*"
+
+  # webadmin dashboard bundle (esbuild + recharts); package-lock.json is
+  # committed, so Dependabot updates the lockfile alongside package.json.
+  - package-ecosystem: npm
+    directory: "/webadmin"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+
+  # Keeps the SHA pins in .github/workflows/* current. Because every `uses:` is
+  # pinned to a commit SHA, this is the only mechanism that moves them, and
+  # Dependabot rewrites both the SHA and its trailing `# vX.Y.Z` comment.
+  # Major-version bumps arrive as reviewable PRs rather than silently.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"

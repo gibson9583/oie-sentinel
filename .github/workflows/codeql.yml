@@ -1,0 +1,70 @@
+# CodeQL static analysis for the two languages in this repository: the Java
+# plugin (shared/, server/, package/) and the webadmin dashboard's JS.
+#
+# Build mode: `none` for both. For java-kotlin this is the buildless extractor,
+# which builds the CodeQL database straight from source and therefore needs
+# neither JDK 21 nor the engine jars — so this workflow deliberately does not
+# repeat build.yaml's distribution-tarball install. That keeps it fast and
+# keeps one fewer copy of the engine-jar bootstrap to maintain. The trade-off
+# is that unresolved external types (engine classes) are modelled less
+# precisely than in a traced build; if that ever costs a real finding, swap
+# this job to `build-mode: manual` and lift the install steps from build.yaml.
+# If GitHub temporarily disables buildless Java, the action falls back to
+# autobuild on its own rather than failing.
+#
+# Scheduled run: analysis re-runs weekly even with no pushes, so newly
+# published queries reach existing code instead of only new commits.
+#
+# Actions are pinned to full commit SHAs, not mutable tags; the trailing
+# `# vX.Y.Z` comment is documentation only. Dependabot's github-actions
+# ecosystem (.github/dependabot.yml) moves them.
+
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Mondays 07:30 UTC, offset off the hour to avoid the scheduler's peak.
+    - cron: '30 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # upload the SARIF results to code scanning
+      actions: read            # read workflow run metadata for the analysis
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: java-kotlin
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Default query suite (security only). Add
+          # `queries: security-and-quality` if the maintenance-quality alerts
+          # are wanted too — they are considerably noisier.
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          category: "/language:${{ matrix.language }}"

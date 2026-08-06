@@ -3,6 +3,18 @@
 # not on public Maven mirrors, so they are installed from the published OIE
 # distribution tarball (cached between runs) — the CI twin of
 # scripts/install-engine-jars.sh's local-checkout flow.
+#
+# Supply chain:
+#   * Every action is pinned to a full commit SHA, not a mutable tag. The
+#     trailing `# vX.Y.Z` comment is documentation only; the SHA is what runs.
+#     Dependabot's github-actions ecosystem (.github/dependabot.yml) proposes
+#     the bumps and rewrites both the SHA and the comment.
+#   * The distribution tarball is the single external input this build trusts,
+#     so its sha256 is pinned in OIE_TARBALL_SHA256 and verified on every run —
+#     including cache hits, since a restored cache entry is no more trustworthy
+#     than a fresh download. A mismatch fails the build.
+#   * The engine is the 4.6.0 GA release, matching oie.json's minEngineVersion.
+#     Releases must not be built against a release-candidate engine.
 
 name: Build plugin
 
@@ -13,39 +25,56 @@ on:
       - main
   pull_request:
 
+# Least privilege: this workflow only reads the repo and uploads a run-scoped
+# artifact (which needs no additional scope).
+permissions:
+  contents: read
+
 env:
-  OIE_TAG: v4.6.0-rc1
-  OIE_TARBALL: oie_unix_4_6_0-rc1.tar.gz
+  OIE_TAG: v4.6.0
+  OIE_TARBALL: oie_unix_4_6_0.tar.gz
+  # sha256 of the published oie_unix_4_6_0.tar.gz asset on the v4.6.0 release.
+  # Cross-checked against the release's own `sha256sums` manifest. Update this
+  # in the same commit as OIE_TAG/OIE_TARBALL, never separately.
+  OIE_TARBALL_SHA256: 7c82e79027e671277e1d78d0f7bbb1c53ddf1be476f1e80c2ddbfcf7855900ea
   MC_VERSION: '4.6.0'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # JDK 21: the 4.6.0 engine jars are Java 21 bytecode (the plugin itself
       # still targets --release 17); build.sh enforces this.
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
 
+      # The digest is part of the cache key so a change to the pinned checksum
+      # can never be served a stale entry built from the old tarball.
       - name: Cache OIE distribution
         id: oie-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.OIE_TARBALL }}
-          key: oie-dist-${{ env.OIE_TAG }}
+          key: oie-dist-${{ env.OIE_TAG }}-${{ env.OIE_TARBALL_SHA256 }}
 
       - name: Download OIE distribution
         if: steps.oie-cache.outputs.cache-hit != 'true'
         run: curl -fSL -o "$OIE_TARBALL" "https://github.com/OpenIntegrationEngine/engine/releases/download/${OIE_TAG}/${OIE_TARBALL}"
 
+      # Runs on both paths (fresh download and cache hit) — see the header note.
+      - name: Verify OIE distribution checksum
+        run: |
+          echo "${OIE_TARBALL_SHA256}  ${OIE_TARBALL}" | sha256sum -c -
+
       # The same four jars scripts/install-engine-jars.sh installs from a local
-      # engine checkout, taken from the published distribution instead.
+      # engine checkout, taken from the published distribution instead. The GA
+      # tarball's layout is identical to the rc1 one this used to read.
       - name: Install engine jars into the local Maven repo
         run: |
           tar xzf "$OIE_TARBALL" \
@@ -65,7 +94,34 @@ jobs:
       - name: Build plugin
         run: ./build.sh
 
-      - uses: actions/upload-artifact@v4
+      # The regression guard for the whole "ship sns and nothing else" decision.
+      # build.sh already fails when plugin.xml and the staged jars disagree; this
+      # is the other half — a jar the ENGINE already provides must never be
+      # bundled, because shipping our own copy means shipping a second, older
+      # version of it inside the extension. That is exactly how a netty five
+      # years behind the engine's ended up in this artifact once already.
+      #
+      # Compared by artifact name with the version stripped, since the point is
+      # "the engine has this library", not "the engine has this exact build".
+      - name: Assert no bundled jar duplicates the engine's server-lib
+        run: |
+          tar xzf "$OIE_TARBALL" --wildcards 'oie/server-lib/*'
+          find oie/server-lib -name '*.jar' -exec basename {} \; \
+            | sed -E 's/-[0-9][^-]*(\.[^-]*)*\.jar$//;s/\.jar$//' | sort -u > /tmp/engine-libs.txt
+          unzip -Z1 package/target/sentinel-*.zip 'sentinel/*.jar' \
+            | xargs -n1 basename \
+            | sed -E 's/-[0-9][^-]*(\.[^-]*)*\.jar$//;s/\.jar$//' | sort -u > /tmp/bundled-libs.txt
+          # Sentinel's own jars are expected to be absent from the engine.
+          DUPES="$(comm -12 /tmp/bundled-libs.txt /tmp/engine-libs.txt || true)"
+          if [ -n "$DUPES" ]; then
+            echo "::error::These bundled jars are already provided by the engine at server-lib/ —"
+            echo "::error::mark them <scope>provided</scope> in server/pom.xml instead of shipping them:"
+            printf '  %s\n' $DUPES
+            exit 1
+          fi
+          echo "No bundled jar duplicates the engine's server-lib."
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sentinel-plugin
           path: package/target/sentinel-*.zip

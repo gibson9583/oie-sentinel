@@ -16,6 +16,24 @@
 # Store discovery needs no registry step at all: any OIE Community Store that
 # lists this repository (or its owning account with the `oie-plugin` topic)
 # reads oie.json and these release assets directly once published.
+#
+# Supply chain:
+#   * Every action is pinned to a full commit SHA, not a mutable tag. The
+#     trailing `# vX.Y.Z` comment is documentation only; the SHA is what runs.
+#   * The engine distribution tarball is the single external input the build
+#     trusts, so its sha256 is pinned in OIE_TARBALL_SHA256 and verified on
+#     every run, cache hits included. A mismatch fails the release.
+#   * The engine is the 4.6.0 GA release, matching oie.json's minEngineVersion.
+#     Never cut a release against a release-candidate engine.
+#   * The `.sha256` sidecar is self-attesting — anyone able to replace the zip
+#     can replace the sidecar — so it is a convenience, not evidence. The real
+#     integrity statement is the Sigstore-backed build provenance attestation
+#     produced below, which binds the zip's digest to this workflow, this
+#     repository and this commit. Consumers verify it with:
+#
+#       gh attestation verify sentinel-<version>.zip -R <owner>/<repo>
+#
+#     That is why this workflow holds id-token/attestations write.
 
 name: Release
 
@@ -26,22 +44,28 @@ on:
 
 permissions:
   contents: write        # required to create the GitHub Release
+  id-token: write        # OIDC token used to sign the provenance attestation
+  attestations: write    # required to store the attestation on the repository
 
 env:
-  OIE_TAG: v4.6.0-rc1
-  OIE_TARBALL: oie_unix_4_6_0-rc1.tar.gz
+  OIE_TAG: v4.6.0
+  OIE_TARBALL: oie_unix_4_6_0.tar.gz
+  # sha256 of the published oie_unix_4_6_0.tar.gz asset on the v4.6.0 release.
+  # Cross-checked against the release's own `sha256sums` manifest. Update this
+  # in the same commit as OIE_TAG/OIE_TARBALL, never separately.
+  OIE_TARBALL_SHA256: 7c82e79027e671277e1d78d0f7bbb1c53ddf1be476f1e80c2ddbfcf7855900ea
   MC_VERSION: '4.6.0'
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # JDK 21: the 4.6.0 engine jars are Java 21 bytecode (the plugin itself
       # still targets --release 17); build.sh enforces this.
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21'
@@ -58,19 +82,27 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The digest is part of the cache key so a change to the pinned checksum
+      # can never be served a stale entry built from the old tarball.
       - name: Cache OIE distribution
         id: oie-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.OIE_TARBALL }}
-          key: oie-dist-${{ env.OIE_TAG }}
+          key: oie-dist-${{ env.OIE_TAG }}-${{ env.OIE_TARBALL_SHA256 }}
 
       - name: Download OIE distribution
         if: steps.oie-cache.outputs.cache-hit != 'true'
         run: curl -fSL -o "$OIE_TARBALL" "https://github.com/OpenIntegrationEngine/engine/releases/download/${OIE_TAG}/${OIE_TARBALL}"
 
+      # Runs on both paths (fresh download and cache hit) — see the header note.
+      - name: Verify OIE distribution checksum
+        run: |
+          echo "${OIE_TARBALL_SHA256}  ${OIE_TARBALL}" | sha256sum -c -
+
       # The same four jars scripts/install-engine-jars.sh installs from a local
-      # engine checkout, taken from the published distribution instead.
+      # engine checkout, taken from the published distribution instead. The GA
+      # tarball's layout is identical to the rc1 one this used to read.
       - name: Install engine jars into the local Maven repo
         run: |
           tar xzf "$OIE_TARBALL" \
@@ -110,9 +142,18 @@ jobs:
           ( cd out && sha256sum "${ASSET}" > "${ASSET}.sha256" )
           echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
 
+      # Signed, Sigstore-backed statement that this exact zip came out of this
+      # workflow at this commit. Unlike the .sha256 sidecar it cannot be forged
+      # by whoever can overwrite the release assets. Runs before the release is
+      # created so a failure here means no draft is staged at all.
+      - name: Attest build provenance for the release asset
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: out/${{ steps.pkg.outputs.asset }}
+
       # Draft: CI stages the release; a human reviews and publishes it.
       - name: Create draft GitHub Release with assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           draft: true
           files: |
