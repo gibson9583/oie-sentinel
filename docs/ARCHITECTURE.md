@@ -109,10 +109,13 @@ No new CRUD, no membership table, no duplicate taxonomy to desync.
    `alert_event_id (FK CASCADE)`, `action_id (FK SET NULL — deleting an action shouldn't destroy its
    dispatch history)`, `dispatch_time, success, error_message`.
 9. **`sentinel_maintenance_window`** — one-off and recurring windows (schema v2 added
-   recurrence + modes): `name, scope_type, scope_id, window_mode (SUPPRESS|ACTIVE),
+   recurrence + modes, v3 the timezone): `name, scope_type, scope_id, window_mode (SUPPRESS|ACTIVE),
    repeat_type (NONE|WEEKLY|MONTHLY), days_of_week, days_of_month, start_time, end_time,
-   active_from, active_until (nullable bounds for recurring), enabled`. ACTIVE windows are
-   alerting schedules: covered channels notify only inside the window's times.
+   timezone (nullable IANA zone id; null = the server's zone), active_from, active_until
+   (nullable bounds for recurring), enabled`. ACTIVE windows are alerting schedules: covered
+   channels notify only inside the window's times. A recurring window's daily times and day set
+   are read on its own `timezone`, so a 22:00–06:00 schedule stays eight hours across both DST
+   transitions in the zone the rotation lives in rather than the server's.
 
 Uninstall order (FK-safe, child-first): `action_dispatch_log → alert_event → trigger_state →
 connector_status_event → activity_trend → activity_sample → action → maintenance_window → monitor`.
@@ -132,7 +135,7 @@ repository layer before being substituted raw (`${sortColumn} ${sortDir}`) into 
 - `INACTIVITY`: `{ noDataForSeconds }`
 - `LOW_VOLUME`: `{ windowSeconds, compareTo: FIXED|BASELINE_RELATIVE, minCount?, baselinePercent?, baselineLookbackDays? }`
 - `ANOMALY`: `{ metric: RECEIVED|SENT|ERROR, zScoreThreshold, direction: LOW_ONLY|HIGH_ONLY|BOTH, baselineWindowDays, useWeekendBucket }`
-- `CONNECTION_STATUS`: `{ alertOnStates: [...ConnectionStatusEventType], minDurationSeconds }`
+- `CONNECTION_STATUS`: `{ alertOnStates: [...ConnectionStatusEventType], minDurationSeconds, rollup: CONNECTOR|CHANNEL }` — `rollup` (default `CONNECTOR`) decides whether one channel's connectors open one problem each or collapse into a single channel-level problem (`metadataId = null`, per-connector detail retained in the value JSON). `SCOPE` is reserved and rejected until scope-level rollup ships.
 
 ## Collection & evaluation pipeline
 
@@ -187,7 +190,9 @@ All three confirmed against engine source, no new plumbing needed for Email/Chan
 
 - **Email**: `com.mirth.connect.server.util.ServerSMTPConnectionFactory.createSMTPConnection().send(to, cc, subject, body)` — reuses the engine's already-configured SMTP settings (`ConfigurationController.getServerSettings()`), Apache Commons Email under the hood. No new SMTP config surface in Sentinel at all.
 - **Channel**: `new com.mirth.connect.server.userutil.VMRouter().routeMessageByChannelId(channelId, rawMessage)` → `EngineController.dispatchRawMessage(...)`. This is the *exact* mechanism the core alert system's `ChannelProtocol` and the VM Router/"Channel Writer" destination connector both already use — not a workaround, the canonical way to inject a message into a channel from plugin code. Alert JSON goes in the message body; alert fields also flattened into the `RawMessage`'s source map so the receiving channel's transformer can reference them without parsing JSON. This is what makes Email+Channel+SNS sufficient for v1 — a channel destination (HTTP Sender, etc.) lets users fan out to Slack/Teams/PagerDuty/SMS themselves without Sentinel building native integrations for each.
-- **SNS**: AWS SDK v2 (`software.amazon.awssdk:sns` + `:sts`, default/compile scope — engine doesn't bundle these, confirmed via `sqs-source-connector/server/pom.xml`'s identical shape), mirroring `sqs-source-connector`'s `AwsConnectorCredentials` factory (DEFAULT/STATIC/ROLE auth types, `StsAssumeRoleCredentialsProvider` for cross-account). Unlike that connector (which stores AWS secrets in plaintext), Sentinel encrypts `secretAccessKey` via `ConfigurationController.getInstance().getEncryptor()` before persisting.
+- **SNS**: AWS SDK v2, mirroring `sqs-source-connector`'s `AwsConnectorCredentials` factory (DEFAULT/STATIC/ROLE auth types, `StsAssumeRoleCredentialsProvider` for cross-account). Unlike that connector (which stores AWS secrets in plaintext), Sentinel encrypts `secretAccessKey` via `ConfigurationController.getInstance().getEncryptor()` before persisting, and redacts `accessKeyId`/`assumeRoleArn` on read.
+
+  **The plugin bundles `sns` and nothing else.** The engine ships the whole AWS SDK 2.15.28 core at `server-lib/aws/` (verified against the 4.6.0 GA distribution) — `apache-client`, `auth`, `sdk-core`, `aws-core`, `regions`, `profiles`, the protocol jars, `sts`, `utils`, plus netty 4.1.119 under `aws/ext/netty` — and `sns` is the one artifact it does not. Everything else is `provided`. This is safe because `MirthLauncher` walks `server-lib` *recursively* (`FileUtils.listFiles(dir, fileFilter, trueFileFilter())`) into the same `URLClassLoader` extensions are appended to, which is the same mechanism the already-working `provided` `donkey-server` (at `server-lib/donkey/`) relies on. The earlier shape — bundling the full transitive closure, 36 jars — shipped a netty five years older than the engine's inside the distributed artifact. Two guards keep the assumption honest: `build.sh` fails the build if `plugin.xml`'s `<library>` list and the staged jars disagree in either direction, and `SentinelServicePlugin.start()` probes `SnsClient`/`ApacheHttpClient` at boot so a broken classpath is one startup log line rather than a `NoClassDefFoundError` at first alert. The SDK version must stay pinned to the engine's; `minEngineVersion` is the compatibility contract.
 
 ## Audit logging (two-layer, matching RBAC's actual pattern)
 

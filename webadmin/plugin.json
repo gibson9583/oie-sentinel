@@ -1,7 +1,7 @@
 {
     "id": "sentinel",
     "name": "OIE Sentinel",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "author": "Chris Gibson",
     "description": "Zabbix-inspired monitoring and alerting for channel activity.",
     "enabled": true,
