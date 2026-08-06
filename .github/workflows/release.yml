@@ -41,6 +41,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-run. A tag push is a one-shot event: if it is lost — a GitHub
+  # Actions incident swallowing the trigger is the case this was added for —
+  # the only other way back in is deleting and re-pushing the tag, which is a
+  # poor thing to have to do to a release tag people may already have fetched.
+  #
+  # Run this against the TAG, not a branch: the version comes from the ref
+  # name. Choosing a branch means the ref is "main", which fails the oie.json
+  # version check below rather than building something mislabelled.
+  workflow_dispatch:
 
 permissions:
   contents: write        # required to create the GitHub Release

@@ -32,9 +32,31 @@ if [[ -n "${JAVA_MAJOR}" && "${JAVA_MAJOR}" -lt 21 ]]; then
     exit 1
 fi
 
-if ! mvn -q dependency:get -Dartifact=com.mirth.connect:mirth-server:4.6.0 -o >/dev/null 2>&1; then
-    echo "error: engine jars missing from the local Maven repository." >&2
+# Are the engine jars installed? Checked by looking for the files, NOT with
+# `mvn dependency:get -o`: an artifact put in place by `install:install-file`
+# carries none of the remote-repository metadata that resolver expects, so it
+# reports the jar missing on a clean machine even when it is sitting right
+# there. That passed locally (where a real ~/.m2 has the metadata from other
+# builds) and failed every CI run on a fresh runner — the wrong answer in
+# exactly the environment the check exists to protect.
+MC_VERSION="$(sed -nE 's/.*<mc\.version>([^<]+)<\/mc\.version>.*/\1/p' pom.xml | head -1)"
+if [[ -z "${MC_VERSION}" ]]; then
+    echo "error: could not read <mc.version> from pom.xml" >&2
+    exit 1
+fi
+# Honour a relocated local repository; fall back to Maven's default.
+M2_REPO="${MAVEN_REPO_LOCAL:-${HOME}/.m2/repository}"
+MISSING_JARS=()
+for artifact in mirth-server mirth-crypto mirth-client-core donkey-server; do
+    if [[ ! -f "${M2_REPO}/com/mirth/connect/${artifact}/${MC_VERSION}/${artifact}-${MC_VERSION}.jar" ]]; then
+        MISSING_JARS+=("${artifact}-${MC_VERSION}")
+    fi
+done
+if [[ ${#MISSING_JARS[@]} -gt 0 ]]; then
+    echo "error: engine jars missing from the local Maven repository (${M2_REPO}):" >&2
+    printf '    %s\n' "${MISSING_JARS[@]}" >&2
     echo "  run: ENGINE_DIR=/path/to/engine ./scripts/install-engine-jars.sh" >&2
+    echo "  (CI installs the same jars from the published distribution tarball)" >&2
     exit 1
 fi
 
