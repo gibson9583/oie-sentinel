@@ -784,13 +784,13 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * body is required" and "the body is not JSON" are wire concerns this
      * layer owns, exactly as for the bulk endpoints — and delegates the
      * document's own validity, the name matching, and every write to
-     * {@link ExportImportService#importDocument(JsonNode, boolean, int)}.</p>
+     * {@link ExportImportService#importDocument(JsonNode, int)}.</p>
      */
     @Override
-    public String importConfiguration(String bodyJson, boolean dryRun) {
+    public String importConfiguration(String bodyJson) {
         try {
             return Json.write(ExportImportService.importDocument(
-                    readBodyTree(bodyJson), dryRun, getCurrentUserId()));
+                    readBodyTree(bodyJson), getCurrentUserId()));
         } catch (Exception e) {
             throw translate("importConfiguration", e);
         }

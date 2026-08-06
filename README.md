@@ -51,8 +51,8 @@ console, riding its existing session (no separate login).
 - Drag-and-drop template tokens (`${monitorName}`, `${channelName}`, `${severity}`, `${status}`,
   `${message}`) for the email subject template.
 
-**Maintenance windows & alerting schedules**
-- **Suppress** windows: classic maintenance — alerts born inside the window never notify.
+**Schedules** (the *Schedules* tab)
+- **Suppress** schedules — classic maintenance windows: alerts born inside the window never notify.
 - **Alerting schedule** windows: the inverse — alerts on covered channels notify *only inside* the
   window (business hours, on-call rotations).
 - One-time, weekly (days of week), or monthly (days of month) recurrence with start/end times on a
@@ -68,8 +68,9 @@ console, riding its existing session (no separate login).
   every alert template.
 - **Prometheus endpoint** at `/extensions/sentinel/metrics` — open problems by severity, per-channel
   throughput, and collector/evaluator heartbeat age, honouring channel restrictions.
-- **Export / import** of monitors, actions and windows as one JSON document, matched by name with a
-  dry-run diff, so configuration is promotable dev → test → prod and version-controllable.
+- **Export / import** of monitors, actions and schedules as one JSON document, matched by name and
+  reported entity by entity, so configuration is promotable dev → test → prod and
+  version-controllable.
 - Five RBAC permissions published for authorization plugins (see [Permissions](#permissions)).
 - Mutations audited through the engine's event log; alert history, trigger state, and activity
   samples persist across restarts with configurable retention.
@@ -191,7 +192,7 @@ operational roles:
 | --- | --- |
 | View Monitoring | All reads: dashboard, problems, monitors, actions, windows, activity |
 | Acknowledge Problems | Acknowledge, bulk acknowledge, manual resolve |
-| Manage Maintenance Windows | Window create/update/delete and "activate now" (on-call tier) |
+| Manage Schedules | Schedule create/update/delete and "activate now" (on-call tier) |
 | Manage Monitoring | Monitor and action authoring, including delivery credentials and test sends |
 | Manage Settings | Scheduler intervals and data retention only |
 

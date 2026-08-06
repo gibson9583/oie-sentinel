@@ -150,16 +150,6 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * through leaves the entries already applied in place, and re-running converges
  * because of that idempotence.</p>
  *
- * <p><b>Dry run.</b> {@code dryRun} produces the same {@link ImportResult}
- * shape by the same code path, with every service call suppressed, so the UI
- * renders one component for the preview and the outcome. It resolves names,
- * classifies secrets, and detects unchanged entities exactly as the real run
- * does. The one thing it cannot report is field-level validation: the services
- * expose no validate-only entry point, so a definition the target would reject
- * shows as CREATED/UPDATED in the preview and as skipped-with-reason on apply.
- * In practice a document produced by export already passed that validation on
- * the source server.</p>
- *
  * <p>Errors follow the plugin-wide convention: {@link IllegalArgumentException}
  * → 400, {@link NoSuchElementException} → 404 (mapped in the servlet). Only a
  * document that cannot be read at all — wrong shape, missing or unsupported
@@ -190,10 +180,10 @@ public final class ExportImportService {
     /** Entity type of an {@link ImportEntry} sourced from {@code maintenanceWindows}. */
     public static final String TYPE_MAINTENANCE_WINDOW = "MAINTENANCE_WINDOW";
 
-    /** Outcome: no entity of that name existed here, so one was (or would be) created. */
+    /** Outcome: no entity of that name existed here, so one was created. */
     public static final String OUTCOME_CREATED = "CREATED";
 
-    /** Outcome: an entity of that name existed here and was (or would be) rewritten. */
+    /** Outcome: an entity of that name existed here and was rewritten. */
     public static final String OUTCOME_UPDATED = "UPDATED";
 
     /**
@@ -349,8 +339,7 @@ public final class ExportImportService {
     // ========== Import ==========
 
     /**
-     * Applies an export document to this server, or previews the application
-     * when {@code dryRun} is set.
+     * Applies an export document to this server.
      *
      * <p>Order is monitors → actions → windows, because an action's
      * {@code MONITOR} condition rows name monitors that the same document may
@@ -360,30 +349,27 @@ public final class ExportImportService {
      * @param document the parsed request body (the servlet owns "a body is
      *                 required" and "the body is not JSON"; this method owns
      *                 "the body is not an export document")
-     * @param dryRun   {@code true} to compute the result without writing
-     *                 anything
      * @param userId   the acting user, stamped and audited by the services
      *                 this delegates to
      * @return one entry per document entity plus the created/updated/skipped
-     *         totals; identical in shape whether or not it was a dry run
+     *         totals
      * @throws IllegalArgumentException if the document is not an object, or
      *                                  carries a missing/unsupported
      *                                  {@code schemaVersion}, or holds a
      *                                  non-array where an entity list belongs
      */
-    public static ImportResult importDocument(JsonNode document, boolean dryRun, int userId) {
+    public static ImportResult importDocument(JsonNode document, int userId) {
         if (document == null || !document.isObject()) {
             throw new IllegalArgumentException("The import body must be an export document (a JSON object)");
         }
         int schemaVersion = requireSchemaVersion(document);
 
         List<ImportEntry> entries = new ArrayList<>();
-        MonitorIndex monitors = importMonitors(entityArray(document, KEY_MONITORS), dryRun, userId, entries);
-        importActions(entityArray(document, KEY_ACTIONS), monitors, dryRun, userId, entries);
-        importWindows(entityArray(document, KEY_WINDOWS), dryRun, userId, entries);
+        MonitorIndex monitors = importMonitors(entityArray(document, KEY_MONITORS), userId, entries);
+        importActions(entityArray(document, KEY_ACTIONS), monitors, userId, entries);
+        importWindows(entityArray(document, KEY_WINDOWS), userId, entries);
 
         ImportResult result = new ImportResult();
-        result.setDryRun(dryRun);
         result.setSchemaVersion(schemaVersion);
         result.setExportedAt(textOrNull(document, "exportedAt"));
         result.setEntries(entries);
@@ -449,13 +435,8 @@ public final class ExportImportService {
      * only reachable through a hand-edited document, since
      * {@code MonitorService} rejects cycles on save — terminate as a reported
      * skip instead of spinning.</p>
-     *
-     * <p>In a dry run a would-be-created monitor is added to the index as a
-     * placeholder (name, no id), so its children and any action naming it
-     * resolve exactly as they would on the real run.</p>
      */
-    private static MonitorIndex importMonitors(ArrayNode nodes, boolean dryRun, int userId,
-            List<ImportEntry> entries) {
+    private static MonitorIndex importMonitors(ArrayNode nodes, int userId, List<ImportEntry> entries) {
         MonitorIndex index = MonitorIndex.of(MonitorService.list());
         if (nodes == null) {
             return index;
@@ -480,7 +461,7 @@ public final class ExportImportService {
                     deferred.add(node);
                     continue;
                 }
-                entries.add(applyMonitor(node, index, dryRun, userId));
+                entries.add(applyMonitor(node, index, userId));
                 progressed = true;
             }
             if (!progressed) {
@@ -519,7 +500,7 @@ public final class ExportImportService {
      * {@link #monitorNode} — so a monitor whose only difference is its
      * environment's serial ids never reads as changed.
      */
-    private static ImportEntry applyMonitor(JsonNode node, MonitorIndex index, boolean dryRun, int userId) {
+    private static ImportEntry applyMonitor(JsonNode node, MonitorIndex index, int userId) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_MONITOR, name);
         if (isBlank(name)) {
@@ -549,13 +530,6 @@ public final class ExportImportService {
         }
         incoming.setSuppressedByMonitorId(parent == null ? null : parent.getId());
 
-        if (dryRun) {
-            if (existing == null) {
-                index.put(placeholderMonitor(name));
-                return entry.created();
-            }
-            return entry.updated();
-        }
         try {
             if (existing == null) {
                 index.put(MonitorService.create(incoming, userId));
@@ -576,7 +550,7 @@ public final class ExportImportService {
      * {@code MONITOR} condition rows) is satisfied by the monitor index the
      * previous pass returned.
      */
-    private static void importActions(ArrayNode nodes, MonitorIndex monitors, boolean dryRun, int userId,
+    private static void importActions(ArrayNode nodes, MonitorIndex monitors, int userId,
             List<ImportEntry> entries) {
         if (nodes == null) {
             return;
@@ -586,7 +560,7 @@ public final class ExportImportService {
             byName.put(nameKey(action.getName()), action);
         }
         for (JsonNode node : nodes) {
-            entries.add(applyAction(node, byName, monitors, dryRun, userId));
+            entries.add(applyAction(node, byName, monitors, userId));
         }
     }
 
@@ -603,7 +577,7 @@ public final class ExportImportService {
      * file.</p>
      */
     private static ImportEntry applyAction(JsonNode node, Map<String, Action> byName, MonitorIndex monitors,
-            boolean dryRun, int userId) {
+            int userId) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_ACTION, name);
         if (isBlank(name)) {
@@ -639,12 +613,12 @@ public final class ExportImportService {
 
         List<String> unresolved = new ArrayList<>();
         UnaryOperator<String> toId = value -> {
-            if (!monitors.has(value)) {
+            Integer id = monitors.idOf(value);
+            if (id == null) {
                 unresolved.add(value);
                 return null;
             }
-            Integer id = monitors.idOf(value);
-            return id == null ? null : String.valueOf(id); // null only for a dry-run placeholder
+            return String.valueOf(id);
         };
         String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), toId);
         if (!unresolved.isEmpty()) {
@@ -655,13 +629,6 @@ public final class ExportImportService {
         incoming.setConditionJson(resolvedCondition);
         incoming.setConfigJson(secrets.configJson);
 
-        if (dryRun) {
-            if (existing == null) {
-                byName.put(nameKey(name), incoming);
-                return entry.created();
-            }
-            return entry.updated();
-        }
         try {
             if (existing == null) {
                 byName.put(nameKey(name), ActionService.create(incoming, userId));
@@ -686,7 +653,7 @@ public final class ExportImportService {
      * which of two identically named windows the operator meant could silence
      * the wrong channels.</p>
      */
-    private static void importWindows(ArrayNode nodes, boolean dryRun, int userId, List<ImportEntry> entries) {
+    private static void importWindows(ArrayNode nodes, int userId, List<ImportEntry> entries) {
         if (nodes == null) {
             return;
         }
@@ -695,13 +662,13 @@ public final class ExportImportService {
             byName.computeIfAbsent(nameKey(window.getName()), k -> new ArrayList<>()).add(window);
         }
         for (JsonNode node : nodes) {
-            entries.add(applyWindow(node, byName, dryRun, userId));
+            entries.add(applyWindow(node, byName, userId));
         }
     }
 
     /** Creates, updates, or skips one maintenance window. */
     private static ImportEntry applyWindow(JsonNode node, Map<String, List<MaintenanceWindow>> byName,
-            boolean dryRun, int userId) {
+            int userId) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_MAINTENANCE_WINDOW, name);
         if (isBlank(name)) {
@@ -727,13 +694,6 @@ public final class ExportImportService {
             return entry.skipped("Already matches this server");
         }
 
-        if (dryRun) {
-            if (existing == null) {
-                byName.put(nameKey(name), List.of(incoming));
-                return entry.created();
-            }
-            return entry.updated();
-        }
         try {
             if (existing == null) {
                 byName.put(nameKey(name), List.of(MaintenanceWindowService.create(incoming, userId)));
@@ -997,9 +957,10 @@ public final class ExportImportService {
      *
      * <p>Kept live through the run — every create feeds back into it — so a
      * monitor created early in a document can be a suppression parent or a
-     * condition target later in the same document. On a dry run it holds
-     * id-less placeholders for the monitors that would be created, which makes
-     * every resolution decision identical to the real run's.</p>
+     * condition target later in the same document. Everything it holds is
+     * therefore a persisted monitor with a real id, which is what lets the
+     * dependency passes resolve a reference straight to the id they have to
+     * write.</p>
      */
     private static final class MonitorIndex {
 
@@ -1036,7 +997,11 @@ public final class ExportImportService {
             return name != null && byName.containsKey(nameKey(name));
         }
 
-        /** Target id for a name, or {@code null} for an unknown name or a dry-run placeholder. */
+        /**
+         * Target id for a name, or {@code null} for a name neither this server
+         * nor this run has — every monitor in the index is persisted, so an
+         * absent id and an unknown name are the same answer to the caller.
+         */
         Integer idOf(String name) {
             Monitor monitor = byName(name);
             return monitor == null ? null : monitor.getId();
@@ -1055,17 +1020,6 @@ public final class ExportImportService {
                 return null; // not an id at all — leave the value alone
             }
         }
-    }
-
-    /**
-     * A name-only monitor standing in for one a dry run would create. It never
-     * reaches a service or a repository; it exists so the dry run's dependency
-     * resolution sees the same world the real run would.
-     */
-    private static Monitor placeholderMonitor(String name) {
-        Monitor placeholder = new Monitor();
-        placeholder.setName(name);
-        return placeholder;
     }
 
     /** Match key: trimmed and case-folded, matching the services' duplicate-name check. */
@@ -1113,14 +1067,13 @@ public final class ExportImportService {
     // ========== Result DTOs ==========
 
     /**
-     * The {@code POST /import} response, returned unchanged in shape for both
-     * a dry run and a real run so the dashboard renders one component for the
-     * preview and the outcome — the preview differing only in that
-     * {@link #isDryRun()} is set and nothing was written.
+     * The {@code POST /import} response: a report of what the run actually did
+     * to this server, per entity. Totals alone would not do — an entry a
+     * validation failure or an unresolved reference left untouched is the one
+     * the operator has to go act on, and only its own row can say why.
      */
     public static final class ImportResult {
 
-        private boolean dryRun;
         private int schemaVersion;
         private String exportedAt;
         private int created;
@@ -1128,18 +1081,6 @@ public final class ExportImportService {
         private int skipped;
         private List<ImportEntry> entries = new ArrayList<>();
         private String secretsNotice;
-
-        /**
-         * @return {@code true} when this was a preview and nothing was
-         *         written; {@code false} when the entries were applied
-         */
-        public boolean isDryRun() {
-            return dryRun;
-        }
-
-        public void setDryRun(boolean dryRun) {
-            this.dryRun = dryRun;
-        }
 
         /**
          * @return the {@code schemaVersion} the document declared, echoed so a
@@ -1167,7 +1108,7 @@ public final class ExportImportService {
             this.exportedAt = exportedAt;
         }
 
-        /** @return how many entities were (or would be) created */
+        /** @return how many entities were created */
         public int getCreated() {
             return created;
         }
@@ -1176,7 +1117,7 @@ public final class ExportImportService {
             this.created = created;
         }
 
-        /** @return how many entities were (or would be) updated */
+        /** @return how many entities were updated */
         public int getUpdated() {
             return updated;
         }
@@ -1224,10 +1165,7 @@ public final class ExportImportService {
         }
     }
 
-    /**
-     * What happened (or would happen) to one entity in the document — one row
-     * of the result table.
-     */
+    /** What happened to one entity in the document — one row of the result table. */
     public static final class ImportEntry {
 
         private final String entityType;
@@ -1283,8 +1221,7 @@ public final class ExportImportService {
         /**
          * @return {@link ExportImportService#OUTCOME_CREATED},
          *         {@link ExportImportService#OUTCOME_UPDATED}, or
-         *         {@link ExportImportService#OUTCOME_SKIPPED}; on a dry run,
-         *         what would happen
+         *         {@link ExportImportService#OUTCOME_SKIPPED}
          */
         public String getOutcome() {
             return outcome;

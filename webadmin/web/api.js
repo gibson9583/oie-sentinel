@@ -261,17 +261,16 @@ export const updateSettings = (settings) => apiPut(`${BASE}/settings`, settings)
     target. */
 export const exportConfiguration = () => apiGet(`${BASE}/export`);
 
-/** POST /import?dryRun= (body: an export document) -> ImportResult
-    { dryRun, schemaVersion, exportedAt, created, updated, skipped,
-      secretsNotice,
+/** POST /import (body: an export document) -> ImportResult
+    { schemaVersion, exportedAt, created, updated, skipped, secretsNotice,
       entries: [{ entityType: 'MONITOR'|'ACTION'|'MAINTENANCE_WINDOW', name,
                   outcome: 'CREATED'|'UPDATED'|'SKIPPED', reason,
                   secretsKept: [], secretsRequired: [], secretsNote }] }
 
-    Identical shape for a dry run and a real run, so one component renders
-    both. Entities match on name: known name -> update, unknown -> create,
-    nothing is ever deleted, and an entity already matching the server is
-    skipped as unchanged. dryRun defaults to TRUE server-side, so a dropped or
-    mistyped flag previews rather than applies. */
-export const importConfiguration = (document_, dryRun) =>
-    apiPost(`${BASE}/import`, document_, { dryRun: !!dryRun });
+    Writes immediately — confirm before calling. Entities match on name: known
+    name -> update, unknown -> create, nothing is ever deleted, and an entity
+    already matching the server is skipped as unchanged, which is what makes a
+    re-run safe after a partial failure. The per-entry outcome is the point of
+    the response: an entity the server's own validation rejected comes back
+    SKIPPED with its reason rather than failing the whole document. */
+export const importConfiguration = (document_) => apiPost(`${BASE}/import`, document_);

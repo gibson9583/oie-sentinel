@@ -227,7 +227,7 @@ reconfiguring monitors/actions/SNS credentials): `PERMISSION_VIEW` ("View Monito
 |---|---|
 | Monitors | `GET/POST /monitors`, `GET/PUT/DELETE /monitors/{id}`, `POST /monitors/{id}/_setEnabled`, `POST /monitors/_test` (dry-run against recent samples) |
 | Actions | `GET/POST /actions`, `GET/PUT/DELETE /actions/{id}`, `POST /actions/{id}/_test` |
-| Maintenance | `GET/POST /maintenanceWindows`, `GET/PUT/DELETE /maintenanceWindows/{id}`, `POST /maintenanceWindows/{id}/_activateNow` |
+| Schedules | `GET/POST /maintenanceWindows`, `GET/PUT/DELETE /maintenanceWindows/{id}`, `POST /maintenanceWindows/{id}/_activateNow` |
 | Problems | `GET /problems` (paginated/filtered — see below), `GET /problems/{id}` (detail incl. dispatch log), `POST /problems/{id}/_acknowledge`, `POST /problems/{id}/_resolve`, `POST /problems/_bulkAcknowledge` |
 | Settings | `GET/PUT /settings` — collector/evaluator intervals + retention windows, persisted in the engine `CONFIGURATION` property store |
 | Dashboard | `GET /dashboard/summary` — severity counts, top problem channels, monitor health, recent problems |
@@ -289,7 +289,7 @@ plugin rides the host page's already-authenticated session for free.
 
 **UI toolkit — `@oie/web-ui`** (confirmed via `packages/web-ui/types/core/ui.d.ts`, an imperative DOM
 toolkit the React view calls into, not a props-driven React component library):
-- `DataTable<T>(columns, options)` — the table for Problems/Monitors/Actions/Maintenance. Sortable,
+- `DataTable<T>(columns, options)` — the table for Problems/Monitors/Actions/Schedules. Sortable,
   single/multi-selectable, optional persisted column visibility/order. It's an imperative class (own
   `.el` HTMLElement, `.setRows()`), so each list view creates one in a `useRef`+`useEffect` (mount
   `table.el` into a container div once, call `table.setRows(data)` on every data change) — a small
@@ -318,7 +318,7 @@ toolkit the React view calls into, not a props-driven React component library):
 
 **Internal navigation** (single `SentinelView` root component, `page` state via `useState`, no
 router beyond the one `registerView('/sentinel', ...)` registration): a `.tabs`/`.tab` strip
-(Dashboard, Problems, Monitors, Actions, Maintenance, Settings — Zabbix's own top-nav grouping,
+(Dashboard, Problems, Monitors, Actions, Schedules, Settings — Zabbix's own top-nav grouping,
 identical CSS pattern to `oie-community-store`'s Browse/Installed/Settings tabs) with a `selected`
 override state that swaps the tab body for a detail/editor view (problem detail + ack, monitor
 editor with the four type-specific config fieldsets, action editor with the condition builder) —
@@ -359,7 +359,7 @@ tool invocations rather than one linear pass — most of the work decomposes int
 fan out cleanly, with a verification pass (build + targeted manual checks) after each phase:
 1. **Schema + persistence**: migrator, 5×DDL files, sqlmap XML, repositories — pipeline per table/resource.
 2. **Engine + REST**: collector, evaluator, baseline resolver, action senders, servlet/service layer — pipeline per component, since most only depend on the persistence layer, not each other.
-3. **Web UI**: the `SentinelView` shell + tab navigation first (everything else depends on it), then each tab's page component (Dashboard, Problems, Monitors, Actions, Maintenance, Settings) fanned out in parallel, then the shared components (`SeverityChip`, `ActivityChart`, `useDataTable`, pickers) — all inside the single `webadmin/` bundle, no separate companion app.
+3. **Web UI**: the `SentinelView` shell + tab navigation first (everything else depends on it), then each tab's page component (Dashboard, Problems, Monitors, Actions, Schedules, Settings) fanned out in parallel, then the shared components (`SeverityChip`, `ActivityChart`, `useDataTable`, pickers) — all inside the single `webadmin/` bundle, no separate companion app.
 4. **Packaging + verification**: assembly, build.sh, deploy to a local OIE instance, end-to-end check per the Verification section below.
 
 ## Verification

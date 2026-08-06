@@ -89,12 +89,18 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String PERMISSION_MANAGE = "Manage Monitoring";
 
     /**
-     * Extension permission gating maintenance-window mutation, including
-     * "activate now". Split from {@link #PERMISSION_MANAGE} for the on-call
-     * tier: an operator silencing alerts mid-incident should not need the
-     * right to reconfigure monitors or actions.
+     * Extension permission gating schedule mutation (the Schedules tab —
+     * suppression windows and alerting schedules), including "activate now".
+     * Split from {@link #PERMISSION_MANAGE} for the on-call tier: an operator
+     * silencing alerts mid-incident, or adjusting when their rotation is
+     * paged, should not need the right to reconfigure monitors or actions.
+     *
+     * <p>The stored entity is still a {@code MaintenanceWindow} in
+     * {@code sentinel_maintenance_window}: the type and table predate alerting
+     * schedules and renaming them would be a migration for no behavior change.
+     * Only the operator-facing vocabulary moved.</p>
      */
-    String PERMISSION_MAINTENANCE = "Manage Maintenance Windows";
+    String PERMISSION_MAINTENANCE = "Manage Schedules";
 
     /**
      * Extension permission gating settings mutation (scheduler intervals,
@@ -808,8 +814,7 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String exportConfiguration() throws ClientException;
 
     /**
-     * Applies an export document to this server, or previews the application
-     * when {@code dryRun} is set.
+     * Applies an export document to this server.
      *
      * <p><b>Entities are matched by name, never by id</b>, because ids are
      * per-install serials and a promoted document cannot mean anything by
@@ -820,11 +825,13 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * UI would reject, and a rejected entity is reported as skipped carrying
      * the validation message rather than failing the whole document.</p>
      *
-     * <p><b>The dry-run and real responses have the same shape</b> —
-     * {@code {dryRun, schemaVersion, exportedAt, created, updated, skipped,
-     * entries[], secretsNotice}}, where each entry is {@code {entityType,
-     * name, outcome, reason, secretsKept[], secretsRequired[], secretsNote}} —
-     * so one client component renders the preview and the outcome.</p>
+     * <p><b>The response is a per-entity report</b> —
+     * {@code {schemaVersion, exportedAt, created, updated, skipped, entries[],
+     * secretsNotice}}, where each entry is {@code {entityType, name, outcome,
+     * reason, secretsKept[], secretsRequired[], secretsNote}} — because a
+     * bare success count would hide the entries a validation failure or an
+     * unresolved reference left untouched, and those are precisely the ones an
+     * operator has to act on.</p>
      *
      * <p><b>Secrets must be re-entered here.</b> The export carries them as
      * the redaction marker, so a marker backed by a value already stored on
@@ -832,14 +839,12 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * nothing behind it is reported as {@code secretsRequired}, per action,
      * naming the exact fields to go enter. Import never invents a credential.</p>
      *
-     * <p>{@code dryRun} defaults to {@code true}. Query parameters are
-     * case-sensitive, so a mistyped {@code ?dryrun=true} binds nothing and
-     * falls back to the default — which must therefore be the harmless one.
-     * Applying requires saying so.</p>
+     * <p>There is no enclosing transaction: a failure part way through leaves
+     * the entries already applied in place. That is safe to re-run — the
+     * import is additive and idempotent, so a second pass reports the landed
+     * entries as unchanged and retries only the rest.</p>
      *
      * @param bodyJson an export document as produced by {@link #exportConfiguration()}
-     * @param dryRun   {@code true} (default) to report what would change
-     *                 without writing; {@code false} to apply
      * @return JSON ImportResult
      * @throws ClientException if the body is absent, is not JSON, is not an
      *                         export document, or declares a schema version
@@ -847,8 +852,7 @@ public interface SentinelServletInterface extends BaseServletInterface {
      */
     @POST
     @Path("/import")
-    @Operation(summary = "Applies an export document, matching entities by name; dry run by default")
+    @Operation(summary = "Applies an export document to this server, matching entities by name")
     @MirthOperation(name = "sentinelImportConfiguration", display = "Import Sentinel configuration", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC)
-    String importConfiguration(@Param(value = "body", excludeFromAudit = true) String bodyJson,
-            @Param("dryRun") @QueryParam("dryRun") @DefaultValue("true") boolean dryRun) throws ClientException;
+    String importConfiguration(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
 }

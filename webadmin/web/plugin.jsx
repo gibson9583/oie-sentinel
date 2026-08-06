@@ -79,7 +79,7 @@ const TABS = [
     { key: 'problems', label: 'Problems', component: ProblemsPage },
     { key: 'monitors', label: 'Monitors', component: MonitorsPage },
     { key: 'actions', label: 'Actions', component: ActionsPage },
-    { key: 'maintenance', label: 'Maintenance', component: MaintenancePage },
+    { key: 'schedules', label: 'Schedules', component: MaintenancePage },
     { key: 'settings', label: 'Settings', component: SettingsPage, manageOnly: true },
 ];
 

@@ -1,7 +1,7 @@
 // OIE Sentinel — channel monitoring & alerting plugin.
 // Published under the terms of the Mozilla Public License 2.0.
 //
-// Maintenance page: DataTable list of maintenance windows (name, mode tag,
+// Schedules page: DataTable list of alerting schedules (name, mode tag,
 // scope resolved to names, human schedule summary, enabled toggle, server-
 // stamped activeNow indicator, per-row "Activate now" for one-time windows)
 // with a page-local WindowEditor sub-view (name, mode + scope segpills with
@@ -283,7 +283,7 @@ function buildOptions(handlersRef) {
         selectable: false,
         rowKey: (r) => String(r.id),
         onActivate: (r) => handlersRef.current.open(r),
-        emptyText: 'No maintenance windows yet.',
+        emptyText: 'No schedules yet.',
     };
 }
 
@@ -378,7 +378,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
         try {
             if (isNew) await createMaintenanceWindow(payload);
             else await updateMaintenanceWindow(win.id, payload);
-            toast(`Maintenance window "${payload.name}" ${isNew ? 'created' : 'saved'}.`, 'success');
+            toast(`Schedule "${payload.name}" ${isNew ? 'created' : 'saved'}.`, 'success');
             onChanged();
             onClose();
         } catch (e) {
@@ -390,7 +390,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     };
 
     const del = async () => {
-        const ok = await confirmDialog('Delete Maintenance Window',
+        const ok = await confirmDialog('Delete Schedule',
             win.mode === 'ACTIVE'
                 ? `Delete "${win.name}"? Its alerting schedule is removed and alerts on its channels notify normally again.`
                 : `Delete "${win.name}"? Problems on its channels stop being suppressed immediately.`,
@@ -399,7 +399,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
         setBusy('delete');
         try {
             await deleteMaintenanceWindow(win.id);
-            toast(`Maintenance window "${win.name}" deleted.`, 'success');
+            toast(`Schedule "${win.name}" deleted.`, 'success');
             onChanged();
             onClose();
         } catch (e) {
@@ -412,7 +412,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     return (
         <div className="panel">
             <div className="panel-header">
-                {isNew ? 'New maintenance window' : `Edit maintenance window — ${win.name}`}
+                {isNew ? 'New schedule' : `Edit schedule — ${win.name}`}
                 <div className="panel-tools">
                     <button className="btn btn-sm" onClick={onClose}>Back to list</button>
                 </div>
@@ -420,7 +420,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
             <div className="panel-body">
                 {!manage ? (
                     <div className="sn-hint" style={{ marginBottom: 10 }}>
-                        Read-only: the Manage Monitoring permission is required to change maintenance windows.
+                        Read-only: the Manage Schedules permission is required to change schedules.
                     </div>
                 ) : null}
                 <fieldset disabled={!manage} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>

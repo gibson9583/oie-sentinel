@@ -10,7 +10,7 @@
 // Also hosts the Export / Import panel over GET /export and POST /import. Those
 // two endpoints are MANAGE-gated rather than SETTINGS-gated (the export carries
 // the full action config surface), so their controls use canManage() while the
-// settings form above keeps canManageSettings(). Finally, a read-only About panel.
+// settings form above keeps canManageSettings().
 
 import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog } from '@oie/web-ui';
@@ -74,12 +74,12 @@ const ENTITY_LABELS = {
     MAINTENANCE_WINDOW: 'Maintenance window',
 };
 
-// One row style per outcome, with the dry-run wording in the same table so the
-// preview can never be mistaken for something that was written.
+// One row style per outcome. Only a create is accented — an update and a skip
+// are the ordinary results of re-importing a document that mostly matches.
 const OUTCOME_META = {
-    CREATED: { label: 'Created', would: 'Would create', cls: 'tag accent' },
-    UPDATED: { label: 'Updated', would: 'Would update', cls: 'tag' },
-    SKIPPED: { label: 'Skipped', would: 'Would skip', cls: 'tag' },
+    CREATED: { label: 'Created', cls: 'tag accent' },
+    UPDATED: { label: 'Updated', cls: 'tag' },
+    SKIPPED: { label: 'Skipped', cls: 'tag' },
 };
 
 /** sentinel-config-20260806-0915.json — sorts chronologically in a directory. */
@@ -89,28 +89,23 @@ function exportFilename(now) {
         + `-${p(now.getHours())}${p(now.getMinutes())}.json`;
 }
 
-function outcomeNode(outcome, dryRun) {
+function outcomeNode(outcome) {
     const meta = OUTCOME_META[outcome];
     if (!meta) return <span className="sn-hint">{outcome || '—'}</span>;
-    return <span className={meta.cls}>{dryRun ? meta.would : meta.label}</span>;
+    return <span className={meta.cls}>{meta.label}</span>;
 }
 
-/** Renders an ImportResult. The dry-run and applied payloads have the same
-    shape by server contract, so this is deliberately ONE component — only the
-    wording keys off result.dryRun. */
+/** Renders an ImportResult — what the run did, entity by entity. The table is
+    not decoration: a SKIPPED row carries the validation failure or unresolved
+    reference that left that entity alone, and the totals alone would hide it. */
 function ImportResult({ result }) {
     const entries = Array.isArray(result.entries) ? result.entries : [];
-    const dry = !!result.dryRun;
     return (
         <div style={{ marginTop: 12 }}>
             <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
-                <span className={dry ? 'tag' : 'tag accent'}>
-                    {dry ? 'Dry run — nothing was written' : 'Applied'}
-                </span>
+                <span className="tag accent">Applied</span>
                 <span className="sn-hint">
-                    {dry ? 'Would create' : 'Created'} {result.created},
-                    {' '}{dry ? 'update' : 'updated'} {result.updated},
-                    {' '}skipped {result.skipped}
+                    Created {result.created}, updated {result.updated}, skipped {result.skipped}
                 </span>
                 {result.exportedAt
                     ? <span className="sn-hint">Document exported {fmtTime(result.exportedAt)}</span>
@@ -131,7 +126,7 @@ function ImportResult({ result }) {
                             <tr key={`${e.entityType}:${e.name}:${i}`}>
                                 <td>{ENTITY_LABELS[e.entityType] || e.entityType}</td>
                                 <td>{e.name || <span className="sn-hint">(unnamed)</span>}</td>
-                                <td>{outcomeNode(e.outcome, dry)}</td>
+                                <td>{outcomeNode(e.outcome)}</td>
                                 <td>
                                     {e.reason ? <div>{e.reason}</div> : null}
                                     {e.secretsNote ? <div className="sn-hint">{e.secretsNote}</div> : null}
@@ -148,7 +143,7 @@ function ImportResult({ result }) {
 
 function ExportImportPanel() {
     const manage = canManage();
-    const [busy, setBusy] = React.useState(null);   // null | 'export' | 'dryRun' | 'apply'
+    const [busy, setBusy] = React.useState(null);   // null | 'export' | 'import'
     const [doc, setDoc] = React.useState(null);     // { name, parsed }
     const [result, setResult] = React.useState(null);
 
@@ -191,26 +186,26 @@ function ExportImportPanel() {
         }
     };
 
-    const run = async (dryRun) => {
+    // The import writes as soon as it is called, so the confirm is the only
+    // step between the click and the change — it has to name the file and say
+    // plainly what is about to be touched.
+    const run = async () => {
         if (!doc) return;
-        if (!dryRun) {
-            const ok = await confirmDialog('Apply Import',
-                `Apply ${doc.name} to this server? Entities are matched by name — a name already `
-                + 'here is overwritten, an unknown name is created, and nothing is deleted.',
-                { okLabel: 'Apply' });
-            if (!ok) return;
-        }
-        setBusy(dryRun ? 'dryRun' : 'apply');
+        const ok = await confirmDialog('Import Configuration',
+            `Import ${doc.name} into this server? Monitors, actions and maintenance windows are `
+            + 'created and updated here immediately — entities are matched by name, so a name '
+            + 'already on this server is overwritten. Nothing is deleted.',
+            { danger: true, okLabel: 'Import' });
+        if (!ok) return;
+        setBusy('import');
         try {
-            const applied = await importConfiguration(doc.parsed, dryRun);
+            const applied = await importConfiguration(doc.parsed);
             setResult(applied);
-            if (!dryRun) {
-                toast(`Import applied: ${applied.created} created, ${applied.updated} updated, `
-                    + `${applied.skipped} skipped.`, 'success');
-            }
+            toast(`Import applied: ${applied.created} created, ${applied.updated} updated, `
+                + `${applied.skipped} skipped.`, 'success');
         } catch (e) {
             setResult(null);
-            errorModal(dryRun ? 'Dry Run Failed' : 'Import Failed', errText(e));
+            errorModal('Import Failed', errText(e));
         } finally {
             setBusy(null);
         }
@@ -236,7 +231,8 @@ function ExportImportPanel() {
                         and must be re-entered here — the result names the fields per action.
                     </div>
                     <div style={{ marginTop: 4 }}>
-                        Dry run first: it reports the same result the apply would, without writing.
+                        Importing writes to this server as soon as it is confirmed, and reports what
+                        it did to every entity in the document.
                     </div>
                 </div>
 
@@ -253,17 +249,11 @@ function ExportImportPanel() {
                 </div>
 
                 <div className="flex items-center gap-2 mt-3">
-                    <button type="button" className="btn"
-                        disabled={!manage || !doc || !!busy}
-                        title={manage ? 'Reports what would change, without writing anything.' : manageTitle}
-                        onClick={() => run(true)}>
-                        {busy === 'dryRun' ? 'Checking…' : 'Dry run'}
-                    </button>
                     <button type="button" className="btn btn-primary"
                         disabled={!manage || !doc || !!busy}
                         title={manageTitle}
-                        onClick={() => run(false)}>
-                        {busy === 'apply' ? 'Applying…' : 'Apply'}
+                        onClick={run}>
+                        {busy === 'import' ? 'Importing…' : 'Import'}
                     </button>
                     {!doc ? <span className="sn-hint">Choose an export document to import.</span> : null}
                 </div>
@@ -321,9 +311,9 @@ export function SettingsPage() {
         }
     };
 
-    // The settings form has its own load/error states, but Export / Import and
-    // About depend on neither — so the states are rendered as the Settings
-    // PANEL rather than as the whole page, and the panels below always mount.
+    // The settings form has its own load/error states, but Export / Import
+    // depends on neither — so the states are rendered as the Settings PANEL
+    // rather than as the whole page, and the panel below always mounts.
     const settingsPanel = settings.error && !form ? (
         <div className="panel mb-3">
             <div className="panel-header">Settings</div>
@@ -380,38 +370,6 @@ export function SettingsPage() {
             {settingsPanel}
 
             <ExportImportPanel />
-
-            <div className="panel">
-                <div className="panel-header">About</div>
-                <div className="panel-body">
-                    <div className="flex items-center gap-2">
-                        <span className="font-semibold">OIE Sentinel</span>
-                        <span className="tag">v0.1.0</span>
-                    </div>
-                    <div style={{ color: 'var(--text-dim)', fontSize: 12, lineHeight: 1.55, marginTop: 8 }}>
-                        <div>
-                            A background collector samples every deployed channel&apos;s message
-                            statistics on the collector interval and stores the per-tick deltas
-                            (received, sent, errored, filtered, queued) as activity samples. An
-                            hourly rollup condenses those samples into per-channel trends — the
-                            learned baselines behind low-volume and anomaly monitors. A separate
-                            listener tracks connector connection-state transitions as they happen.
-                        </div>
-                        <div style={{ marginTop: 6 }}>
-                            The evaluator runs on the evaluator interval: each enabled monitor is
-                            checked against its scoped channels, consecutive breaches open problems
-                            at the monitor&apos;s severity, recoveries resolve them, and matching
-                            actions dispatch notifications (email, channel, or SNS). Maintenance
-                            windows and monitor dependencies suppress notifications without
-                            discarding the underlying problems.
-                        </div>
-                        <div style={{ marginTop: 6 }}>
-                            Nightly retention jobs prune raw samples, hourly trends, and resolved
-                            problems older than the ages configured above.
-                        </div>
-                    </div>
-                </div>
-            </div>
         </div>
     );
 }

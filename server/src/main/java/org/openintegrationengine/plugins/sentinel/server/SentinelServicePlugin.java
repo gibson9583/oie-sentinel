@@ -279,7 +279,7 @@ public class SentinelServicePlugin implements ServicePlugin {
 
     /**
      * Declares Sentinel's five permissions — View / Acknowledge /
-     * Maintenance / Manage / Settings — with their REST operations resolved
+     * Schedules / Manage / Settings — with their REST operations resolved
      * from the servlet interface's annotations (see class Javadoc). Deliberately has no dependency on
      * {@link #start()} having succeeded: the extension controller calls this
      * exactly once after all plugin starts, and permissions must register
@@ -306,7 +306,7 @@ public class SentinelServicePlugin implements ServicePlugin {
                 new ExtensionPermission(
                         SentinelServletInterface.PLUGIN_POINT,
                         SentinelServletInterface.PERMISSION_MAINTENANCE,
-                        "Allows creating, modifying and activating Sentinel maintenance windows.",
+                        "Allows creating, modifying and activating Sentinel schedules — both suppression windows and alerting schedules.",
                         OperationUtil.getOperationNamesForPermission(
                                 SentinelServletInterface.PERMISSION_MAINTENANCE, SentinelServletInterface.class),
                         new String[] { SentinelServletInterface.TASK_MAINTENANCE }),
