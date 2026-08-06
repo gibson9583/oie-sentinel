@@ -3,7 +3,8 @@
 //
 // Problems page: server-side paginated/filtered/sorted list over GET /problems
 // plus a master-detail ProblemDetail pane (GET /problems/{id}) with single and
-// bulk acknowledge and manual resolve. The DataTable stays mounted (hidden)
+// bulk acknowledge, manual resolve, and the channel's throughput either side of
+// the open (the alert's evidence). The DataTable stays mounted (hidden)
 // while the detail pane is open, so the 30s background refresh preserves
 // filters, sort, page and multi-selection. Plain click opens the detail pane;
 // ctrl/cmd/shift-click builds a multi-selection for the bulk-acknowledge
@@ -13,12 +14,12 @@ import { platform } from '@oie/web-shell';
 import { errorModal } from '@oie/web-ui';
 import {
     getProblems, getProblem, acknowledgeProblem, resolveProblem,
-    bulkAcknowledgeProblems, listMonitors, getCoreChannels, errText,
+    bulkAcknowledgeProblems, bulkResolveProblems, listMonitors, getCoreChannels, errText,
 } from '../api.js';
 import {
     canAcknowledge, toast, useApi, useDataTable, useUsernames, FilterBar,
-    DEFAULT_PROBLEM_FILTERS, SeverityChip, SEVERITY_META, MONITOR_TYPE_META,
-    fmtTime, fmtAgo,
+    ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, SEVERITY_META,
+    MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
 
 const React = platform.React;
@@ -52,6 +53,12 @@ function confirmWithComment({ title, message, okLabel, danger = false }) {
 
 const PAGE_SIZE = 25;
 const POLL_MS = 30000;
+
+/* Activity window on the detail pane: this much either side of the open, so
+   the operator sees the run-up as well as the aftermath. Three hours puts the
+   6h span exactly on AUTO's raw-sample threshold — the granularity control is
+   there for when a wider view is wanted. */
+const DETAIL_WINDOW_MS = 3 * 3600 * 1000;
 
 // Client column key -> server sort column (AlertEventFilter.ALLOWED_SORT_COLUMNS).
 const SORT_COLUMNS = { severity: 'severity', channel: 'channel_id', opened: 'opened_time' };
@@ -362,6 +369,36 @@ export function ProblemsPage() {
         }
     };
 
+    /* Mirrors bulkAck, with the danger styling single-resolve already uses:
+       resolving closes the problem, and the monitor only re-opens it if the
+       condition is still true on a later tick. The server skips ids that are
+       already resolved or that this user cannot see, so the reported count
+       can legitimately be lower than the selection. */
+    const bulkResolve = async () => {
+        const t = table();
+        if (!t) return;
+        const ids = t.selectedRows().map((r) => r.id);
+        if (!ids.length) return;
+        const comment = await confirmWithComment({
+            title: 'Resolve Problems',
+            message: `Manually resolve ${ids.length} selected problem${ids.length === 1 ? '' : 's'}?`
+                + ' Each monitor will re-open its problem if the condition recurs.',
+            okLabel: 'Resolve',
+            danger: true,
+        });
+        if (comment == null) return;
+        try {
+            const res = await bulkResolveProblems(ids, comment);
+            const n = res && typeof res.resolved === 'number' ? res.resolved : ids.length;
+            toast(`Resolved ${n} problem${n === 1 ? '' : 's'}.`, 'success');
+            t.clearSelection();
+            setSelCount(0);
+            load(false);
+        } catch (e) {
+            errorModal('Bulk Resolve Failed', errText(e));
+        }
+    };
+
     const rangeText = !data ? '' : (data.total === 0
         ? '0 of 0'
         : `${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + data.items.length} of ${data.total}`);
@@ -370,6 +407,7 @@ export function ProblemsPage() {
         <div className="sn-problems">
             {detailId != null ? (
                 <ProblemDetailPane id={detailId}
+                    monitors={monitorsApi.data}
                     onBack={() => setDetailId(null)}
                     onChanged={() => load(true)} />
             ) : null}
@@ -384,9 +422,14 @@ export function ProblemsPage() {
                     </span>
                     <span style={{ flex: 1 }} />
                     {canAcknowledge() && selCount > 0 ? (
-                        <button className="btn btn-sm btn-primary" onClick={bulkAck}>
-                            Acknowledge {selCount} selected
-                        </button>
+                        <>
+                            <button className="btn btn-sm btn-primary" onClick={bulkAck}>
+                                Acknowledge {selCount} selected
+                            </button>
+                            <button className="btn btn-sm btn-danger" onClick={bulkResolve}>
+                                Resolve {selCount} selected
+                            </button>
+                        </>
                     ) : null}
                     <button className="btn btn-sm" onClick={() => load(false)} disabled={loading}>
                         {loading ? 'Refreshing…' : 'Refresh'}
@@ -448,7 +491,30 @@ function detailValue(v) {
     return String(v);
 }
 
-function ProblemDetailPane({ id, onBack, onChanged }) {
+/**
+ * The raising monitor's runbook, rendered as the one link on this page that
+ * points off the console.
+ *
+ * `rel="noopener noreferrer"` is not boilerplate here. `target="_blank"` alone
+ * hands the opened page a live `window.opener` handle back to the admin
+ * console, which is enough to navigate this tab to a credential-phishing copy
+ * of the login screen from a page whose URL an operator typed months ago into a
+ * monitor; `noreferrer` additionally keeps the console's URL out of the
+ * destination's logs. The URL itself is validated at save time by
+ * MonitorService as an absolute http/https URL, which is what stops a
+ * `javascript:` href from ever reaching this attribute — belt and braces, since
+ * a value in the database predating that validation would still land here.
+ */
+function RunbookLink({ url }) {
+    return (
+        <a href={url} target="_blank" rel="noopener noreferrer" title={url}
+            style={{ overflowWrap: 'anywhere' }}>
+            {url}
+        </a>
+    );
+}
+
+function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
     const userNameOf = useUsernames();
     const [detail, setDetail] = React.useState(null);
     const [error, setError] = React.useState(null);
@@ -520,9 +586,57 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
         }
     };
 
+    /* Throughput either side of the open: the evidence for the alert, which
+       detailsJson otherwise reduces to a single number. from/to are fetch deps
+       inside ChannelActivityPanel, so they must be memoised — a fresh window
+       per render would refetch forever. */
+    const openedMs = ev.openedTime ? new Date(ev.openedTime).getTime() : NaN;
+    const resolvedMs = ev.resolvedTime ? new Date(ev.resolvedTime).getTime() : NaN;
+    const activityWindow = React.useMemo(
+        () => (isNaN(openedMs)
+            ? null
+            : { from: openedMs - DETAIL_WINDOW_MS, to: openedMs + DETAIL_WINDOW_MS }),
+        [openedMs],
+    );
+    // A long-running problem resolves past the right edge; say so rather than
+    // stretching the axis out to a marker with no data around it.
+    const resolveInWindow = !!activityWindow && !isNaN(resolvedMs)
+        && resolvedMs >= activityWindow.from && resolvedMs <= activityWindow.to;
+    /* Text tokens, not the series hues: --err and --ok are the Errors and Sent
+       lines, and an annotation borrowing a series color reads as that series.
+       Both labels sit to the right of their own rule but in different vertical
+       bands, so a problem that resolves seconds after it opened still gets two
+       readable labels instead of one overprinted smear. */
+    const activityMarkers = React.useMemo(() => {
+        const list = [];
+        if (!isNaN(openedMs)) {
+            list.push({ time: openedMs, label: 'Opened', color: 'var(--text)', position: 'insideTopLeft' });
+        }
+        if (resolveInWindow) {
+            list.push({ time: resolvedMs, label: 'Resolved', color: 'var(--text-dim)', position: 'insideBottomLeft' });
+        }
+        return list;
+    }, [openedMs, resolvedMs, resolveInWindow]);
+    const activityHint = `3h either side of the open${
+        !isNaN(resolvedMs) && !resolveInWindow ? `, resolved ${fmtTime(ev.resolvedTime)} (outside it)` : ''}`;
+    const activityUnavailable = !ev.channelId
+        ? 'This problem is not scoped to a single channel, so there is no throughput series to chart.'
+        : (!activityWindow
+            ? 'This problem has no open time recorded, so there is no window to chart.'
+            : null);
+
     const parsed = detail ? parseDetails(ev.detailsJson) : null;
     const dispatches = (detail && detail.dispatches) || [];
     const typeMeta = detail && MONITOR_TYPE_META[detail.monitorType];
+    /* The runbook lives on the monitor, not on ProblemDetail, so it comes from
+       the monitor list the page already loaded for its Monitor column — no
+       extra round trip, and it degrades to no row (never an error) while that
+       list is loading, if it failed, or if the monitor has since been deleted. */
+    const runbookUrl = React.useMemo(() => {
+        const owner = (monitors || []).find((m) => m.id === ev.monitorId);
+        const url = owner && owner.runbookUrl ? String(owner.runbookUrl).trim() : '';
+        return url || null;
+    }, [monitors, ev.monitorId]);
 
     return (
         <div className="sn-problem-detail">
@@ -584,6 +698,11 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
                                         {typeMeta ? <span className="text-text-dim"> — {typeMeta.label}</span> : null}
                                         <span className="text-text-faint mono"> (#{ev.monitorId})</span>
                                     </DetailRow>
+                                    {runbookUrl ? (
+                                        <DetailRow label="Runbook">
+                                            <RunbookLink url={runbookUrl} />
+                                        </DetailRow>
+                                    ) : null}
                                     <DetailRow label="Channel">
                                         {detail.channelName || ev.channelId || '—'}
                                         {ev.channelId ? <span className="text-text-faint mono"> ({ev.channelId})</span> : null}
@@ -619,6 +738,15 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
                             </table>
                         </div>
                     </div>
+
+                    <ChannelActivityPanel
+                        title={`Channel activity${detail.channelName ? ` — ${detail.channelName}` : ''}`}
+                        channelId={ev.channelId}
+                        from={activityWindow ? activityWindow.from : null}
+                        to={activityWindow ? activityWindow.to : null}
+                        markers={activityMarkers}
+                        hint={activityHint}
+                        unavailable={activityUnavailable} />
 
                     <div className="panel mb-3">
                         <div className="panel-header">Last Value</div>

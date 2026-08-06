@@ -84,6 +84,31 @@ export const setMonitorEnabled = (id, enabled) =>
     { ok, message, outcomes: [{ channelId, channelName, status, valueSummary }] } */
 export const testMonitor = (monitor) => apiPost(`${BASE}/monitors/_test`, monitor);
 
+/** GET /monitors/{id}/history -> daily alerting history
+    { monitorId, from, to, bucket: 'DAY', truncated,
+      points: [{ bucket, alertCount, avgResolveSeconds }] }.
+    opts: { from (epoch millis), to (epoch millis) }; defaults to the last 30
+    days, and a range wider than 366 days is a 400.
+
+    The series is CONTINUOUS — one point per calendar day across the whole
+    range, oldest first, including days with no alerts. Read the two measures
+    differently on an empty day:
+      alertCount        0, a real measurement — plot it
+      avgResolveSeconds null (a day with nothing to resolve has no MTTR, which
+                        is NOT the same as resolving instantly) — leave the gap
+                        in the line rather than substituting 0, or the chart
+                        draws a dive to the floor on every quiet day
+    A populated day whose alerts are all still open reports null the same way.
+    Buckets are server-local midnights.
+
+    `truncated` is true when the response could not count every matching event
+    (only reachable for channel-restricted callers, whose series is computed
+    over their authorized channels rather than from the server-side aggregate);
+    the earliest days then understate. Say so in the UI rather than presenting
+    a partial count as complete. */
+export const getMonitorHistory = (id, opts) =>
+    apiGet(`${BASE}/monitors/${enc(id)}/history`, opts || {});
+
 /* ---- Actions ------------------------------------------------------------ */
 
 /** GET /actions -> Action[] (configJson redacted; secretAccessKey arrives as
@@ -155,6 +180,13 @@ export const resolveProblem = (id, comment) =>
 export const bulkAcknowledgeProblems = (ids, comment) =>
     apiPost(`${BASE}/problems/_bulkAcknowledge`, { ids: ids || [], comment: comment || '' });
 
+/** POST /problems/_bulkResolve {ids, comment} -> { resolved: n }.
+    Note the response key is `resolved`, not `acknowledged` — same shape, verb-matched name.
+    Ids the caller cannot see, or that are already RESOLVED, are skipped, so the returned
+    count can be lower than ids.length. */
+export const bulkResolveProblems = (ids, comment) =>
+    apiPost(`${BASE}/problems/_bulkResolve`, { ids: ids || [], comment: comment || '' });
+
 /* ---- Dashboard / activity ----------------------------------------------- */
 
 /** GET /dashboard/summary -> DashboardSummary
@@ -165,7 +197,18 @@ export const getDashboardSummary = () => apiGet(`${BASE}/dashboard/summary`);
 
 /** GET /channels/{channelId}/activity -> ChannelActivity
     { channelId, granularity, points: [{ time, received, sent, error, filtered, queued }] }.
-    opts: { from (epoch millis), to (epoch millis), granularity AUTO|RAW|HOURLY } */
+    opts: { from (epoch millis), to (epoch millis), granularity AUTO|RAW|HOURLY }.
+
+    The series is capped at 2000 points, so any range is safe to request; how
+    the server met that cap is reported back on `granularity`, which describes
+    what was DRAWN and not what was asked for (it is never 'AUTO'):
+      'RAW' / 'HOURLY'              source read one-for-one
+      '<SOURCE>_<ISO-8601 width>'   source folded into equal buckets, e.g.
+                                    'RAW_PT5M2.4S', 'HOURLY_PT1H4M48S'
+    AUTO also promotes RAW to HOURLY on a range too wide to read raw. So label
+    charts from this field (ui.jsx describeGranularity) and never test it for
+    equality with 'RAW' — folded five-minute buckets are not tick resolution,
+    and their queued value is an average rather than an instantaneous depth. */
 export const getChannelActivity = (channelId, opts) =>
     apiGet(`${BASE}/channels/${enc(channelId)}/activity`, opts || {});
 
@@ -203,3 +246,32 @@ export const getSettings = () => apiGet(`${BASE}/settings`);
 
 /** PUT /settings -> SentinelSettings (MANAGE-gated) */
 export const updateSettings = (settings) => apiPut(`${BASE}/settings`, settings);
+
+/* ---- Export / import ---------------------------------------------------- */
+
+/** GET /export -> portable configuration document
+    { schemaVersion, exportedAt, monitors[], actions[], maintenanceWindows[] }.
+
+    MANAGE-gated, not VIEW-gated like the other reads: it is the whole action
+    config surface in one downloadable file. Database ids and audit stamps are
+    stripped (the import matches on NAME — ids are per-install serials), a
+    monitor's suppression parent travels as `suppressedByMonitorName`, and an
+    action's MONITOR condition rows carry monitor names rather than ids.
+    Secrets leave as the "••••••••" marker and must be re-entered on the
+    target. */
+export const exportConfiguration = () => apiGet(`${BASE}/export`);
+
+/** POST /import?dryRun= (body: an export document) -> ImportResult
+    { dryRun, schemaVersion, exportedAt, created, updated, skipped,
+      secretsNotice,
+      entries: [{ entityType: 'MONITOR'|'ACTION'|'MAINTENANCE_WINDOW', name,
+                  outcome: 'CREATED'|'UPDATED'|'SKIPPED', reason,
+                  secretsKept: [], secretsRequired: [], secretsNote }] }
+
+    Identical shape for a dry run and a real run, so one component renders
+    both. Entities match on name: known name -> update, unknown -> create,
+    nothing is ever deleted, and an entity already matching the server is
+    skipped as unchanged. dryRun defaults to TRUE server-side, so a dropped or
+    mistyped flag previews rather than applies. */
+export const importConfiguration = (document_, dryRun) =>
+    apiPost(`${BASE}/import`, document_, { dryRun: !!dryRun });

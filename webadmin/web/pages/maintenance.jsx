@@ -5,10 +5,11 @@
 // scope resolved to names, human schedule summary, enabled toggle, server-
 // stamped activeNow indicator, per-row "Activate now" for one-time windows)
 // with a page-local WindowEditor sub-view (name, mode + scope segpills with
-// pickers, repeat type with weekly/monthly day inputs and HH:mm server-clock
-// times, datetime-local from/until — required for one-time, optional bounds
-// for recurring — and enabled). All mutations are canManageMaintenance()-gated; the
-// servlet's MANAGE permission is the real enforcement.
+// pickers, repeat type with weekly/monthly day inputs, HH:mm times plus the
+// time zone they are read on, datetime-local from/until — required for
+// one-time, optional bounds for recurring — and enabled). All mutations are
+// canManageMaintenance()-gated; the servlet's MANAGE permission is the real
+// enforcement.
 
 import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog, promptDialog } from '@oie/web-ui';
@@ -56,7 +57,51 @@ const DOW_SHORT = {
     FRIDAY: 'Fri', SATURDAY: 'Sat', SUNDAY: 'Sun',
 };
 
+// Offered when the runtime has no Intl.supportedValuesOf('timeZone') (added in
+// Chrome 99 / Firefox 93 / Safari 15.4 — the OIE Administrator shell can be
+// older than that). Deliberately short: the browser's own zone and the window's
+// stored zone are merged in on top, so the common cases still work, and an
+// operator who needs something else can be given a newer browser rather than
+// this file being turned into a hand-maintained copy of the IANA database.
+const FALLBACK_TIMEZONES = [
+    'UTC',
+    'America/Anchorage', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+    'America/New_York', 'America/Phoenix', 'America/Sao_Paulo', 'Pacific/Honolulu',
+    'Europe/Dublin', 'Europe/London', 'Europe/Madrid', 'Europe/Paris', 'Europe/Berlin',
+    'Africa/Johannesburg', 'Asia/Jerusalem', 'Asia/Dubai', 'Asia/Kolkata',
+    'Asia/Shanghai', 'Asia/Tokyo', 'Australia/Sydney', 'Pacific/Auckland',
+];
+
 /* ---- time helpers -------------------------------------------------------- */
+
+/** The browser's IANA zone id (e.g. "America/New_York"), or '' if the runtime
+    won't say. Used as the default for NEW windows only — changing an existing
+    window's zone is a schedule change and must be deliberate. */
+function browserTimezone() {
+    try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+/** Selectable zone ids: the runtime's full IANA list where available, else the
+    curated fallback — always merged with the browser's zone and `current`, so a
+    stored zone this runtime doesn't enumerate stays selected instead of
+    silently resetting to the server default on the next save. */
+function timezoneOptions(current) {
+    let zones = null;
+    try {
+        if (typeof Intl.supportedValuesOf === 'function') zones = Intl.supportedValuesOf('timeZone');
+    } catch (e) {
+        zones = null;
+    }
+    const set = new Set(Array.isArray(zones) && zones.length ? zones : FALLBACK_TIMEZONES);
+    const browser = browserTimezone();
+    if (browser) set.add(browser);
+    if (current) set.add(current);
+    return Array.from(set).sort();
+}
 
 /** ISO instant -> "YYYY-MM-DDTHH:mm" in the BROWSER's local zone (the value
     space of <input type="datetime-local">). Empty string when absent/invalid. */
@@ -115,18 +160,21 @@ function scopeLabel(w, channelNames, groupNames, tagNames) {
     return 'All channels';
 }
 
-/** Human summary of the window's schedule for the list. */
+/** Human summary of the window's schedule for the list. Recurring rows name
+    their zone: the daily times mean nothing without it, and a blank timezone
+    (every window created before schema v3) means the server's own zone. */
 function scheduleSummary(w) {
     const repeat = w.repeatType || 'NONE';
+    const zone = w.timezone ? ` ${w.timezone}` : ' server time';
     if (repeat === 'WEEKLY') {
         const days = String(w.daysOfWeek || '').split(',').map((s) => s.trim()).filter(Boolean);
         const ordered = DOW_ORDER.filter((d) => days.includes(d));
         const label = (ordered.length ? ordered : days).map((d) => DOW_SHORT[d] || d).join(', ');
-        return `Weekly ${label || '?'} ${w.startTime || '?'}–${w.endTime || '?'}`;
+        return `Weekly ${label || '?'} ${w.startTime || '?'}–${w.endTime || '?'}${zone}`;
     }
     if (repeat === 'MONTHLY') {
         const days = String(w.daysOfMonth || '').split(',').map((s) => s.trim()).filter(Boolean).join(', ');
-        return `Monthly ${days || '?'} ${w.startTime || '?'}–${w.endTime || '?'}`;
+        return `Monthly ${days || '?'} ${w.startTime || '?'}–${w.endTime || '?'}${zone}`;
     }
     return `One-time: ${fmtTime(w.activeFrom) || '?'} – ${fmtTime(w.activeUntil) || '?'}`;
 }
@@ -254,6 +302,14 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     const [daysOfMonth, setDaysOfMonth] = React.useState((win && win.daysOfMonth) || '');
     const [startTime, setStartTime] = React.useState((win && win.startTime) || '');
     const [endTime, setEndTime] = React.useState((win && win.endTime) || '');
+    // New windows default to the browser's zone — an operator building a
+    // schedule almost always means their own clock, and the DST-correctness
+    // this exists for only happens if a zone is actually set. Existing windows
+    // keep exactly what is stored, blank included: silently promoting a stored
+    // null (= server zone) to the zone of whoever happened to open the editor
+    // would move a live schedule on save.
+    const [timezone, setTimezone] = React.useState(() => (win ? (win.timezone || '') : browserTimezone()));
+    const zoneChoices = React.useMemo(() => timezoneOptions(win && win.timezone), [win]);
     const [from, setFrom] = React.useState(win ? isoToLocalInput(win.activeFrom) : '');
     const [until, setUntil] = React.useState(win ? isoToLocalInput(win.activeUntil) : '');
     const [enabled, setEnabled] = React.useState(win ? !!win.enabled : true);
@@ -280,6 +336,9 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
             daysOfMonth: null,
             startTime: null,
             endTime: null,
+            // Only recurring windows have a clock to read; one-time windows are
+            // absolute instants, and the server blanks this for them anyway.
+            timezone: null,
             activeFrom: null,
             activeUntil: null,
             enabled,
@@ -294,6 +353,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
             // End at or before start is legal — the window wraps past midnight.
             payload.startTime = timeInputToHHmm(startTime, 'Start time');
             payload.endTime = timeInputToHHmm(endTime, 'End time');
+            payload.timezone = timezone.trim() || null; // blank = the server's zone
             if (repeatType === 'WEEKLY') {
                 if (!daysOfWeek.length) throw new Error('Select at least one day of the week.');
                 payload.daysOfWeek = DOW_ORDER.filter((d) => daysOfWeek.includes(d)).join(',');
@@ -451,11 +511,28 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
                         ) : null}
                         {recurring ? (
                             <>
+                                <div className="field span-2">
+                                    <label>Time zone</label>
+                                    <select value={timezone} onChange={(e) => setTimezone(e.target.value)}>
+                                        <option value="">Server time zone</option>
+                                        {zoneChoices.map((z) => (
+                                            <option key={z} value={z}>{z}</option>
+                                        ))}
+                                    </select>
+                                    <div className="hint">
+                                        The clock the start/end times and the recurrence days are read on.
+                                        Pick the zone your on-call rotation lives in — the schedule then keeps
+                                        its length across daylight-saving changes there. Leave it on
+                                        &quot;Server time zone&quot; to follow the OIE server&#39;s own clock.
+                                    </div>
+                                </div>
                                 <div className="field">
                                     <label>Start time</label>
                                     <input type="time" value={startTime}
                                         onChange={(e) => setStartTime(e.target.value)} />
-                                    <div className="hint">Times are the server&#39;s local clock.</div>
+                                    <div className="hint">
+                                        In {timezone || 'the server’s time zone'}.
+                                    </div>
                                 </div>
                                 <div className="field">
                                     <label>End time</label>
@@ -595,6 +672,7 @@ export function MaintenancePage() {
                 daysOfMonth: w.daysOfMonth == null ? null : w.daysOfMonth,
                 startTime: w.startTime == null ? null : w.startTime,
                 endTime: w.endTime == null ? null : w.endTime,
+                timezone: w.timezone == null ? null : w.timezone,
                 activeFrom: w.activeFrom == null ? null : w.activeFrom,
                 activeUntil: w.activeUntil == null ? null : w.activeUntil,
                 enabled: !w.enabled,

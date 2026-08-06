@@ -5,12 +5,19 @@
 // already hidden without canManageSettings(), but checkTask fails open — the Save
 // button is gated again here and the servlet's MANAGE permission is the real
 // enforcement. Save success -> toast; validation failures (client pre-check or
-// server 400) -> errorModal. Also renders a read-only About panel.
+// server 400) -> errorModal.
+//
+// Also hosts the Export / Import panel over GET /export and POST /import. Those
+// two endpoints are MANAGE-gated rather than SETTINGS-gated (the export carries
+// the full action config surface), so their controls use canManage() while the
+// settings form above keeps canManageSettings(). Finally, a read-only About panel.
 
 import { platform } from '@oie/web-shell';
-import { errorModal } from '@oie/web-ui';
-import { getSettings, updateSettings, errText } from '../api.js';
-import { useApi, canManageSettings, toast } from '../ui.jsx';
+import { errorModal, confirmDialog } from '@oie/web-ui';
+import {
+    getSettings, updateSettings, exportConfiguration, importConfiguration, errText,
+} from '../api.js';
+import { useApi, canManage, canManageSettings, toast, fmtTime } from '../ui.jsx';
 
 const React = platform.React;
 
@@ -59,6 +66,216 @@ function toForm(settings) {
     return form;
 }
 
+/* ---- Export / import ----------------------------------------------------- */
+
+const ENTITY_LABELS = {
+    MONITOR: 'Monitor',
+    ACTION: 'Action',
+    MAINTENANCE_WINDOW: 'Maintenance window',
+};
+
+// One row style per outcome, with the dry-run wording in the same table so the
+// preview can never be mistaken for something that was written.
+const OUTCOME_META = {
+    CREATED: { label: 'Created', would: 'Would create', cls: 'tag accent' },
+    UPDATED: { label: 'Updated', would: 'Would update', cls: 'tag' },
+    SKIPPED: { label: 'Skipped', would: 'Would skip', cls: 'tag' },
+};
+
+/** sentinel-config-20260806-0915.json — sorts chronologically in a directory. */
+function exportFilename(now) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `sentinel-config-${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}`
+        + `-${p(now.getHours())}${p(now.getMinutes())}.json`;
+}
+
+function outcomeNode(outcome, dryRun) {
+    const meta = OUTCOME_META[outcome];
+    if (!meta) return <span className="sn-hint">{outcome || '—'}</span>;
+    return <span className={meta.cls}>{dryRun ? meta.would : meta.label}</span>;
+}
+
+/** Renders an ImportResult. The dry-run and applied payloads have the same
+    shape by server contract, so this is deliberately ONE component — only the
+    wording keys off result.dryRun. */
+function ImportResult({ result }) {
+    const entries = Array.isArray(result.entries) ? result.entries : [];
+    const dry = !!result.dryRun;
+    return (
+        <div style={{ marginTop: 12 }}>
+            <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
+                <span className={dry ? 'tag' : 'tag accent'}>
+                    {dry ? 'Dry run — nothing was written' : 'Applied'}
+                </span>
+                <span className="sn-hint">
+                    {dry ? 'Would create' : 'Created'} {result.created},
+                    {' '}{dry ? 'update' : 'updated'} {result.updated},
+                    {' '}skipped {result.skipped}
+                </span>
+                {result.exportedAt
+                    ? <span className="sn-hint">Document exported {fmtTime(result.exportedAt)}</span>
+                    : null}
+            </div>
+            {result.secretsNotice
+                ? <div className="sn-hint" style={{ marginTop: 6 }}>{result.secretsNotice}</div>
+                : null}
+            {entries.length === 0 ? (
+                <div className="sn-empty">The document defined no monitors, actions, or windows.</div>
+            ) : (
+                <table className="dt" style={{ marginTop: 8 }}>
+                    <thead>
+                        <tr><th>Type</th><th>Name</th><th>Outcome</th><th>Detail</th></tr>
+                    </thead>
+                    <tbody>
+                        {entries.map((e, i) => (
+                            <tr key={`${e.entityType}:${e.name}:${i}`}>
+                                <td>{ENTITY_LABELS[e.entityType] || e.entityType}</td>
+                                <td>{e.name || <span className="sn-hint">(unnamed)</span>}</td>
+                                <td>{outcomeNode(e.outcome, dry)}</td>
+                                <td>
+                                    {e.reason ? <div>{e.reason}</div> : null}
+                                    {e.secretsNote ? <div className="sn-hint">{e.secretsNote}</div> : null}
+                                    {!e.reason && !e.secretsNote ? <span className="sn-hint">—</span> : null}
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            )}
+        </div>
+    );
+}
+
+function ExportImportPanel() {
+    const manage = canManage();
+    const [busy, setBusy] = React.useState(null);   // null | 'export' | 'dryRun' | 'apply'
+    const [doc, setDoc] = React.useState(null);     // { name, parsed }
+    const [result, setResult] = React.useState(null);
+
+    const download = async () => {
+        setBusy('export');
+        try {
+            const exported = await exportConfiguration();
+            // Re-serialized with two-space indent rather than saved as the wire
+            // sent it: the point of the file is to live in a repository, and a
+            // single-line document makes every review diff useless.
+            const blob = new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            // Anchor must be in the document for click() to download in every
+            // browser, and the object URL must outlive the click — hence the
+            // append/click/remove/defer-revoke dance rather than a bare click.
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = exportFilename(new Date());
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 0);
+            toast('Configuration exported.', 'success');
+        } catch (e) {
+            errorModal('Export Failed', errText(e));
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const pick = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        setResult(null);
+        try {
+            setDoc({ name: file.name, parsed: JSON.parse(await file.text()) });
+        } catch (err) {
+            setDoc(null);
+            errorModal('Invalid File', `${file.name} is not valid JSON.`);
+        }
+    };
+
+    const run = async (dryRun) => {
+        if (!doc) return;
+        if (!dryRun) {
+            const ok = await confirmDialog('Apply Import',
+                `Apply ${doc.name} to this server? Entities are matched by name — a name already `
+                + 'here is overwritten, an unknown name is created, and nothing is deleted.',
+                { okLabel: 'Apply' });
+            if (!ok) return;
+        }
+        setBusy(dryRun ? 'dryRun' : 'apply');
+        try {
+            const applied = await importConfiguration(doc.parsed, dryRun);
+            setResult(applied);
+            if (!dryRun) {
+                toast(`Import applied: ${applied.created} created, ${applied.updated} updated, `
+                    + `${applied.skipped} skipped.`, 'success');
+            }
+        } catch (e) {
+            setResult(null);
+            errorModal(dryRun ? 'Dry Run Failed' : 'Import Failed', errText(e));
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const manageTitle = manage ? undefined : 'Requires the Manage Monitoring permission';
+
+    return (
+        <div className="panel mb-3">
+            <div className="panel-header">Export / Import</div>
+            <div className="panel-body">
+                <div className="sn-hint" style={{ marginBottom: 10, lineHeight: 1.55 }}>
+                    <div>
+                        The export carries every monitor, action, and maintenance window as one JSON
+                        document — promotable dev → test → prod like a channel, and reviewable in
+                        version control.
+                    </div>
+                    <div style={{ marginTop: 4 }}>
+                        Import matches entities by <b>name</b>, not id (ids are per-server serials):
+                        a known name is updated, an unknown name is created, an entity that already
+                        matches is skipped, and nothing is ever deleted. Every entity is validated
+                        exactly as the editors validate it. Secrets export as the redaction marker
+                        and must be re-entered here — the result names the fields per action.
+                    </div>
+                    <div style={{ marginTop: 4 }}>
+                        Dry run first: it reports the same result the apply would, without writing.
+                    </div>
+                </div>
+
+                <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
+                    <button type="button" className="btn"
+                        disabled={!manage || !!busy}
+                        title={manageTitle}
+                        onClick={download}>
+                        {busy === 'export' ? 'Exporting…' : 'Export configuration'}
+                    </button>
+                    <input type="file" accept="application/json,.json"
+                        disabled={!manage || !!busy}
+                        onChange={pick} />
+                </div>
+
+                <div className="flex items-center gap-2 mt-3">
+                    <button type="button" className="btn"
+                        disabled={!manage || !doc || !!busy}
+                        title={manage ? 'Reports what would change, without writing anything.' : manageTitle}
+                        onClick={() => run(true)}>
+                        {busy === 'dryRun' ? 'Checking…' : 'Dry run'}
+                    </button>
+                    <button type="button" className="btn btn-primary"
+                        disabled={!manage || !doc || !!busy}
+                        title={manageTitle}
+                        onClick={() => run(false)}>
+                        {busy === 'apply' ? 'Applying…' : 'Apply'}
+                    </button>
+                    {!doc ? <span className="sn-hint">Choose an export document to import.</span> : null}
+                </div>
+
+                {result ? <ImportResult result={result} /> : null}
+            </div>
+        </div>
+    );
+}
+
+/* ---- page ---------------------------------------------------------------- */
+
 export function SettingsPage() {
     const settings = useApi(getSettings, []);
     const [form, setForm] = React.useState(null);
@@ -104,63 +321,65 @@ export function SettingsPage() {
         }
     };
 
-    if (settings.error && !form) {
-        return (
-            <div className="panel">
-                <div className="panel-header">Settings</div>
-                <div className="panel-body">
-                    <span className="text-err">Could not load settings.</span>{' '}
-                    <span className="sn-hint">{settings.error}</span>{' '}
-                    <button type="button" className="btn btn-sm" onClick={settings.reload}>Retry</button>
+    // The settings form has its own load/error states, but Export / Import and
+    // About depend on neither — so the states are rendered as the Settings
+    // PANEL rather than as the whole page, and the panels below always mount.
+    const settingsPanel = settings.error && !form ? (
+        <div className="panel mb-3">
+            <div className="panel-header">Settings</div>
+            <div className="panel-body">
+                <span className="text-err">Could not load settings.</span>{' '}
+                <span className="sn-hint">{settings.error}</span>{' '}
+                <button type="button" className="btn btn-sm" onClick={settings.reload}>Retry</button>
+            </div>
+        </div>
+    ) : !form ? (
+        <div className="panel mb-3">
+            <div className="panel-header">Settings</div>
+            <div className="panel-body sn-hint">Loading…</div>
+        </div>
+    ) : (
+        <div className="panel mb-3">
+            <div className="panel-header">Settings</div>
+            <div className="panel-body">
+                <div className="form-grid">
+                    {SETTINGS_FIELDS.map((f) => (
+                        <div key={f.key} className="field">
+                            <label>{f.label}</label>
+                            <input type="number" min={f.min} max={f.max} step={1}
+                                value={form[f.key]}
+                                disabled={saving}
+                                onChange={(e) => setField(f.key, e.target.value)} />
+                            <div className="hint">{f.hint}</div>
+                        </div>
+                    ))}
+                </div>
+                <div className="sn-hint">
+                    Interval changes reschedule the collector and evaluator immediately on save;
+                    retention changes apply at the next nightly prune.
+                </div>
+                <div className="flex items-center gap-2 mt-3">
+                    <button type="button" className="btn btn-primary"
+                        disabled={!manage || saving}
+                        title={manage ? undefined : 'Requires the Manage Monitoring permission'}
+                        onClick={save}>
+                        {saving ? 'Saving…' : 'Save'}
+                    </button>
+                    <button type="button" className="btn"
+                        disabled={saving}
+                        onClick={() => setForm(toForm(baseline))}>
+                        Reset
+                    </button>
                 </div>
             </div>
-        );
-    }
-    if (!form) {
-        return (
-            <div className="panel">
-                <div className="panel-header">Settings</div>
-                <div className="panel-body sn-hint">Loading…</div>
-            </div>
-        );
-    }
+        </div>
+    );
 
     return (
         <div style={{ maxWidth: 760 }}>
-            <div className="panel mb-3">
-                <div className="panel-header">Settings</div>
-                <div className="panel-body">
-                    <div className="form-grid">
-                        {SETTINGS_FIELDS.map((f) => (
-                            <div key={f.key} className="field">
-                                <label>{f.label}</label>
-                                <input type="number" min={f.min} max={f.max} step={1}
-                                    value={form[f.key]}
-                                    disabled={saving}
-                                    onChange={(e) => setField(f.key, e.target.value)} />
-                                <div className="hint">{f.hint}</div>
-                            </div>
-                        ))}
-                    </div>
-                    <div className="sn-hint">
-                        Interval changes reschedule the collector and evaluator immediately on save;
-                        retention changes apply at the next nightly prune.
-                    </div>
-                    <div className="flex items-center gap-2 mt-3">
-                        <button type="button" className="btn btn-primary"
-                            disabled={!manage || saving}
-                            title={manage ? undefined : 'Requires the Manage Monitoring permission'}
-                            onClick={save}>
-                            {saving ? 'Saving…' : 'Save'}
-                        </button>
-                        <button type="button" className="btn"
-                            disabled={saving}
-                            onClick={() => setForm(toForm(baseline))}>
-                            Reset
-                        </button>
-                    </div>
-                </div>
-            </div>
+            {settingsPanel}
+
+            <ExportImportPanel />
 
             <div className="panel">
                 <div className="panel-header">About</div>

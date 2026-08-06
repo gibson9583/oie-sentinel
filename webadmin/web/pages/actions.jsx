@@ -2,11 +2,12 @@
 // Published under the terms of the Mozilla Public License 2.0.
 //
 // Actions page: list of alert-delivery rules + the ActionEditor (common
-// fields, ConditionBuilder, per-type EMAIL/CHANNEL/SNS config) and the
-// "Send test" flow. Wire shape per Action.java: conditionJson/configJson are
-// raw JSON strings the editor parses/serializes; the server redacts
-// configJson.secretAccessKey to the 8-bullet marker and treats an unchanged
-// marker on save as "keep the stored secret".
+// fields, ConditionBuilder, per-type EMAIL/CHANNEL/SNS/WEBHOOK config) and
+// the "Send test" flow. Wire shape per Action.java: conditionJson/configJson
+// are raw JSON strings the editor parses/serializes; the server redacts every
+// sensitive config value — the SNS credential fields and any webhook header
+// whose name looks like a credential — to the 8-bullet marker, and treats an
+// unchanged marker on save as "keep the stored secret".
 
 import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog } from '@oie/web-ui';
@@ -21,10 +22,10 @@ import {
 const React = platform.React;
 const { h } = platform.ui;
 
-/* Server-side redaction marker for configJson.secretAccessKey (8 bullets). */
+/* Server-side redaction marker for stored secrets (8 bullets). */
 const REDACTED = '••••••••';
 
-const ACTION_TYPES = ['EMAIL', 'CHANNEL', 'SNS'];
+const ACTION_TYPES = ['EMAIL', 'CHANNEL', 'SNS', 'WEBHOOK'];
 
 const ACTION_TYPE_META = {
     EMAIL: {
@@ -45,7 +46,21 @@ const ACTION_TYPE_META = {
             region: '', topicArn: '', assumeRoleArn: '', assumeRoleExternalId: '',
         },
     },
+    WEBHOOK: {
+        label: 'Webhook',
+        description: 'Posts the alert to an HTTPS endpoint (Slack, Teams, PagerDuty, Alertmanager…).',
+        // headers is an ARRAY of {name, value} rows in the editor draft and a
+        // JSON object on the wire — see normalizeConfig/pruneConfig. Rows keep
+        // the operator's order and let a name be edited a keystroke at a time,
+        // which an object keyed by header name cannot do.
+        defaultConfig: {
+            url: '', method: 'POST', headers: [], bodyTemplate: '',
+            timeoutSeconds: null, allowInsecure: false, allowPrivateNetwork: false,
+        },
+    },
 };
+
+const WEBHOOK_METHODS = ['POST', 'PUT', 'PATCH'];
 
 const OPERATION_MODES = ['ON_PROBLEM', 'ON_RESOLVE', 'BOTH'];
 const OPERATION_MODE_LABELS = {
@@ -71,6 +86,28 @@ function parseConfig(action) {
         return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
     } catch (e) { return {}; }
 }
+
+/* Wire shape -> editor draft shape. Only WEBHOOK differs: its headers arrive
+   as a JSON object and the editor needs ordered, individually-editable rows.
+   Object key order is insertion order in every engine the web client runs on,
+   so the round trip through pruneConfig preserves what the operator typed. */
+function normalizeConfig(actionType, c) {
+    if (actionType !== 'WEBHOOK') return c;
+    const headers = c.headers && typeof c.headers === 'object' && !Array.isArray(c.headers)
+        ? Object.keys(c.headers).map((name) => ({ name, value: String(c.headers[name] ?? '') }))
+        : [];
+    return { ...c, headers };
+}
+
+/* Mirrors WebhookAlertSender.SECRET_HEADER_NAME. Cosmetic only — it decides
+   whether the value renders as a password field with the "kept unless you
+   retype it" hint. The server is authoritative about what actually gets
+   encrypted, so a disagreement here shows the wrong widget, never the wrong
+   storage. */
+const SECRET_HEADER_RE =
+    /^(authorization|proxy-authorization|cookie)$|token|secret|password|passwd|signature|credential|api[-_]?key/i;
+
+const isSecretHeader = (name) => SECRET_HEADER_RE.test((name || '').trim());
 
 /** "Severity >= WARNING AND Channel = abc…" — one line, truncated. */
 function conditionsSummary(action) {
@@ -161,6 +198,12 @@ function SectionLabel({ children }) {
    EmailAlertSender.render() replaces. Anything else is left verbatim in the
    sent subject, so the chips offer only these. */
 const EMAIL_SUBJECT_TOKENS = ['monitorName', 'channelName', 'severity', 'status', 'message'];
+
+/* The same set plus the two WebhookAlertSender.render() adds: ${valueJson}
+   (the evaluator's measurement evidence, substituted as raw JSON so it embeds
+   unquoted) and ${alertEventId} (the correlation key a receiving system
+   dedupes repeat sends on). Header values accept the same tokens. */
+const WEBHOOK_BODY_TOKENS = [...EMAIL_SUBJECT_TOKENS, 'valueJson', 'alertEventId'];
 
 /* Chip drags carry a sentinel-specific MIME type (not text/plain) so tokens
    drop ONLY into inputs that opt in via TOKEN_TARGET_PROPS — other inputs
@@ -362,8 +405,128 @@ function SnsConfigFields({ config, setConfig }) {
     );
 }
 
+/* Header name/value rows. Kept out of WebhookConfigFields so the row logic
+   reads on its own; `rows` is the draft array, emit() replaces it wholesale
+   (React state, no in-place mutation). Values for credential-looking names
+   render as password fields carrying the same "unchanged marker = keep the
+   stored secret" contract as the SNS secret access key. */
+function HeaderRows({ rows, onChange }) {
+    const list = Array.isArray(rows) ? rows : [];
+    const setRow = (i, patch) => onChange(list.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    return (
+        <div className="sn-conds">
+            {list.map((row, i) => {
+                const secret = isSecretHeader(row.name);
+                return (
+                    <div key={i} className="sn-cond-row">
+                        <input value={row.name || ''} placeholder="Header name"
+                            autoComplete="off" style={{ flex: '0 0 220px' }}
+                            onChange={(e) => setRow(i, { name: e.target.value })} />
+                        <input value={row.value || ''} placeholder={secret ? 'Bearer …' : 'Value'}
+                            type={secret ? 'password' : 'text'}
+                            autoComplete={secret ? 'new-password' : 'off'}
+                            style={{ flex: '1 1 240px' }}
+                            onChange={(e) => setRow(i, { value: e.target.value })} />
+                        <button type="button" className="btn btn-sm" title="Remove header"
+                            onClick={() => onChange(list.filter((_, j) => j !== i))}>✕</button>
+                    </div>
+                );
+            })}
+            <button type="button" className="btn btn-sm"
+                onClick={() => onChange([...list, { name: '', value: '' }])}>
+                + Add header
+            </button>
+        </div>
+    );
+}
+
+function WebhookConfigFields({ config, setConfig }) {
+    const bodyRef = React.useRef(null);
+    const insecure = !!config.allowInsecure;
+    const privateNet = !!config.allowPrivateNetwork;
+    return (
+        <div className="form-grid">
+            <div className="field span-2">
+                <label>URL</label>
+                <input value={config.url || ''} placeholder="https://hooks.example.org/services/T000/B000/xxxx"
+                    autoComplete="off"
+                    onChange={(e) => setConfig({ url: e.target.value })} />
+                <div className="hint">
+                    Required. The path is never echoed back in a failure message — for many
+                    providers it is the credential.
+                </div>
+            </div>
+            <div className="field">
+                <label>Method</label>
+                <select value={config.method || 'POST'}
+                    onChange={(e) => setConfig({ method: e.target.value })}>
+                    {WEBHOOK_METHODS.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+            </div>
+            <div className="field">
+                <label>Timeout (seconds)</label>
+                <NullableNumberInput value={config.timeoutSeconds} min={1}
+                    placeholder="10" onChange={(v) => setConfig({ timeoutSeconds: v })} />
+                <div className="hint">Empty = 10. Maximum 30; the whole exchange is bounded by it.</div>
+            </div>
+
+            <div className="field span-2">
+                <label>Headers</label>
+                <HeaderRows rows={config.headers} onChange={(rows) => setConfig({ headers: rows })} />
+                <div className="hint">
+                    Values accept the same {'${…}'} tokens as the body. Authorization, Cookie and
+                    any name containing token/secret/password/signature/credential/api-key are
+                    stored encrypted and shown as {REDACTED} once saved — leave the marker
+                    unchanged to keep the stored value, or type a new one to replace it.
+                    Content-Length, Host, Connection, Expect and Upgrade are set by the HTTP
+                    client and cannot be overridden.
+                </div>
+            </div>
+
+            <div className="field span-2">
+                <label>Body template</label>
+                <textarea ref={bodyRef} rows={5} className="mono"
+                    value={config.bodyTemplate || ''}
+                    placeholder={'{"text": "[${severity}] ${monitorName} — ${channelName}: ${message}"}'}
+                    onChange={(e) => setConfig({ bodyTemplate: e.target.value })}
+                    {...TOKEN_TARGET_PROPS} />
+                <TokenChips tokens={WEBHOOK_BODY_TOKENS} inputRef={bodyRef}
+                    note={'Empty = the full alert payload as JSON. Values are JSON-escaped for a '
+                        + 'JSON body; ${valueJson} is inserted raw so it embeds unquoted.'} />
+            </div>
+
+            <div className="field span-2">
+                <label>Network</label>
+                <label className="check">
+                    <input type="checkbox" checked={insecure}
+                        onChange={(e) => setConfig({ allowInsecure: e.target.checked })} />
+                    Allow plaintext http
+                </label>
+                <label className="check">
+                    <input type="checkbox" checked={privateNet}
+                        onChange={(e) => setConfig({ allowPrivateNetwork: e.target.checked })} />
+                    Allow private network targets (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7)
+                </label>
+                <div className="hint">
+                    {insecure
+                        ? 'Plaintext sends the alert body and any Authorization header unencrypted. '
+                        : 'https is required unless you opt in. '}
+                    {privateNet
+                        ? 'Private targets are allowed for this action: it can reach anything on the '
+                            + 'engine’s LAN, including unauthenticated internal admin APIs. '
+                        : 'Private and internal targets are blocked. '}
+                    Link-local (169.254.0.0/16 — the cloud instance metadata service), loopback,
+                    wildcard and multicast addresses are always blocked and no setting permits them.
+                    The check runs against every address the host resolves to, at send time, and
+                    redirects are never followed.
+                </div>
+            </div>
+        </div>
+    );
+}
+
 /* Serialize the edited config to the exact per-type configJson shape; empty
-   optionals are omitted (server treats missing as null). The secret is sent
+   optionals are omitted (server treats missing as null). Secrets are sent
    verbatim — an untouched redaction marker means "keep the stored secret". */
 function pruneConfig(actionType, c) {
     const t = (s) => (s == null ? '' : String(s)).trim();
@@ -375,6 +538,30 @@ function pruneConfig(actionType, c) {
     }
     if (actionType === 'CHANNEL') {
         return { channelId: t(c.channelId) };
+    }
+    if (actionType === 'WEBHOOK') {
+        const out = {
+            url: t(c.url),
+            method: c.method || 'POST',
+            // Always explicit, never omitted: these two are the security
+            // opt-ins, and "absent" reading as false is a property of the
+            // server's defaults that this editor should not lean on.
+            allowInsecure: !!c.allowInsecure,
+            allowPrivateNetwork: !!c.allowPrivateNetwork,
+        };
+        // Rows back to the wire object. Name trimmed (a stray space makes an
+        // invalid header token); value NOT trimmed or coerced, because it may
+        // be the redaction marker and must round-trip byte for byte.
+        const headers = {};
+        (Array.isArray(c.headers) ? c.headers : []).forEach((row) => {
+            const name = t(row && row.name);
+            const value = row && row.value != null ? String(row.value) : '';
+            if (name && value) headers[name] = value;
+        });
+        if (Object.keys(headers).length) out.headers = headers;
+        if (t(c.bodyTemplate)) out.bodyTemplate = t(c.bodyTemplate);
+        if (c.timeoutSeconds != null) out.timeoutSeconds = c.timeoutSeconds;
+        return out;
     }
     const out = { authType: c.authType || 'DEFAULT', region: t(c.region), topicArn: t(c.topicArn) };
     if (out.authType === 'STATIC') {
@@ -390,7 +577,7 @@ function pruneConfig(actionType, c) {
 
 /* ---- editor -------------------------------------------------------------- */
 
-function ActionEditor({ action, manage, onClose, onSaved }) {
+function ActionEditor({ action, actions, manage, onClose, onSaved }) {
     const existing = action && action.id != null;
     const [name, setName] = React.useState(action ? action.name || '' : '');
     const [description, setDescription] = React.useState(action ? action.description || '' : '');
@@ -403,13 +590,22 @@ function ActionEditor({ action, manage, onClose, onSaved }) {
         action && action.repeatIntervalSeconds != null ? action.repeatIntervalSeconds : null);
     const [maxRepeats, setMaxRepeats] = React.useState(
         action && action.maxRepeats != null ? action.maxRepeats : null);
+    const [maxNotificationsPerWindow, setMaxNotificationsPerWindow] = React.useState(
+        action && action.maxNotificationsPerWindow != null ? action.maxNotificationsPerWindow : null);
+    const [rollupWindowSeconds, setRollupWindowSeconds] = React.useState(
+        action && action.rollupWindowSeconds != null ? action.rollupWindowSeconds : null);
+    const [escalateAfterSeconds, setEscalateAfterSeconds] = React.useState(
+        action && action.escalateAfterSeconds != null ? action.escalateAfterSeconds : null);
+    const [escalateToActionId, setEscalateToActionId] = React.useState(
+        action && action.escalateToActionId != null ? action.escalateToActionId : null);
     const [conditions, setConditions] = React.useState(() => parseConditions(action));
     // Per-type config drafts so switching Type and back keeps entered values.
     const [configs, setConfigs] = React.useState(() => {
         const base = {};
         for (const t of ACTION_TYPES) base[t] = { ...ACTION_TYPE_META[t].defaultConfig };
         if (action && base[action.actionType]) {
-            base[action.actionType] = { ...base[action.actionType], ...parseConfig(action) };
+            base[action.actionType] = normalizeConfig(action.actionType,
+                { ...base[action.actionType], ...parseConfig(action) });
         }
         return base;
     });
@@ -420,6 +616,28 @@ function ActionEditor({ action, manage, onClose, onSaved }) {
         ...all, [actionType]: { ...all[actionType], ...patch },
     }));
 
+    // Escalation targets: every OTHER action. Self is excluded because the
+    // dispatcher refuses a self-escalation anyway (it would be an immediate
+    // one-link cycle), so offering it would only let someone configure a
+    // no-op. A stored target that is no longer in the list — the id carries
+    // no foreign key, so the action it points at can simply have been
+    // deleted — is re-added below as a flagged option rather than silently
+    // dropped on the next save.
+    const escalationTargets = (Array.isArray(actions) ? actions : [])
+        .filter((a) => a && a.id != null && !(existing && a.id === action.id))
+        .slice()
+        .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    const targetMissing = escalateToActionId != null
+        && !escalationTargets.some((a) => a.id === escalateToActionId);
+
+    // Storm control needs both halves: a ceiling with no window has nothing
+    // to count against, and a window with no ceiling never trips. Same for
+    // escalation — a delay with no target, or a target with no delay, does
+    // nothing. Flagged rather than blocked: the server stores each column
+    // independently and treats a half-configured pair as "off".
+    const ceilingPartial = (maxNotificationsPerWindow == null) !== (rollupWindowSeconds == null);
+    const escalationPartial = (escalateAfterSeconds == null) !== (escalateToActionId == null);
+
     const buildAction = () => ({
         id: existing ? action.id : null,
         name: name.trim(),
@@ -429,6 +647,10 @@ function ActionEditor({ action, manage, onClose, onSaved }) {
         operationMode,
         repeatIntervalSeconds,
         maxRepeats,
+        maxNotificationsPerWindow,
+        rollupWindowSeconds,
+        escalateAfterSeconds,
+        escalateToActionId,
         conditionJson: conditions.length ? JSON.stringify(conditions) : null,
         configJson: JSON.stringify(pruneConfig(actionType, config)),
     });
@@ -540,6 +762,89 @@ function ActionEditor({ action, manage, onClose, onSaved }) {
                                 placeholder="unlimited" onChange={setMaxRepeats} />
                             <div className="hint">Empty = repeat until the problem resolves.</div>
                         </div>
+                        <div className="field">
+                            <label>Notification ceiling</label>
+                            <NullableNumberInput value={maxNotificationsPerWindow} min={1}
+                                placeholder="no ceiling" onChange={setMaxNotificationsPerWindow} />
+                            <div className="hint">
+                                Individual notifications this action may send per rollup window,
+                                across all problems. Empty = no ceiling.
+                            </div>
+                        </div>
+                        <div className="field">
+                            <label>Rollup window (seconds)</label>
+                            <NullableNumberInput value={rollupWindowSeconds} min={10}
+                                placeholder="no ceiling" onChange={setRollupWindowSeconds} />
+                            <div className="hint">
+                                {ceilingPartial ? (
+                                    <span className="text-err">
+                                        Set both the ceiling and the window — one without the other
+                                        does nothing.{' '}
+                                    </span>
+                                ) : null}
+                                The period the ceiling counts over and the rollup summarizes.
+                            </div>
+                        </div>
+                        <div className="field">
+                            <label>Escalate after (seconds)</label>
+                            <NullableNumberInput value={escalateAfterSeconds} min={60}
+                                placeholder="no escalation" onChange={setEscalateAfterSeconds} />
+                            <div className="hint">
+                                How long a problem may stay open before a different action is
+                                notified. Empty = never escalate.
+                            </div>
+                        </div>
+                        <div className="field">
+                            <label>Escalate to</label>
+                            <select value={escalateToActionId == null ? '' : String(escalateToActionId)}
+                                onChange={(e) => setEscalateToActionId(
+                                    e.target.value === '' ? null : Number(e.target.value))}>
+                                <option value="">No escalation target</option>
+                                {escalationTargets.map((a) => (
+                                    <option key={a.id} value={String(a.id)}>
+                                        {a.name || `#${a.id}`}{a.enabled ? '' : ' (disabled)'}
+                                    </option>
+                                ))}
+                                {targetMissing ? (
+                                    <option value={String(escalateToActionId)}>
+                                        {`#${escalateToActionId} — action no longer exists`}
+                                    </option>
+                                ) : null}
+                            </select>
+                            <div className="hint">
+                                {escalationPartial ? (
+                                    <span className="text-err">
+                                        Set both the delay and the target — one without the other
+                                        does nothing.{' '}
+                                    </span>
+                                ) : null}
+                                {targetMissing ? (
+                                    <span className="text-err">
+                                        The selected action has been deleted; escalation is skipped
+                                        with a log warning until you pick another.{' '}
+                                    </span>
+                                ) : null}
+                                A disabled target never fires. The target sends under its own
+                                conditions, repeat interval and ceiling.
+                            </div>
+                        </div>
+                        <div className="field span-2">
+                            <div className="hint">
+                                <b>Order these apply in.</b> For each notification: suppression
+                                first (maintenance window, dependency, acknowledgement, or a
+                                trigger detected as flapping) — a suppressed alert is not counted
+                                and not escalated. Then the ceiling: under it the notification is
+                                sent individually; over it the individual sends stop and one rollup
+                                naming the affected channels goes out per window. Then escalation,
+                                independently of what the ceiling decided — a problem still open
+                                past the delay reaches the target even if this action has gone
+                                quiet, which is usually exactly what you want. Repeat and escalation
+                                are separate: repeat re-notifies <i>this</i> action, escalation
+                                hands the problem to <i>another</i> one, and if the target also has
+                                an escalation the delays add up along the chain. Acknowledging a
+                                problem stops both.
+                            </div>
+                        </div>
                     </div>
 
                     <SectionLabel>Conditions</SectionLabel>
@@ -554,6 +859,7 @@ function ActionEditor({ action, manage, onClose, onSaved }) {
                     {actionType === 'EMAIL' ? <EmailConfigFields config={config} setConfig={setConfig} /> : null}
                     {actionType === 'CHANNEL' ? <ChannelConfigFields config={config} setConfig={setConfig} /> : null}
                     {actionType === 'SNS' ? <SnsConfigFields config={config} setConfig={setConfig} /> : null}
+                    {actionType === 'WEBHOOK' ? <WebhookConfigFields config={config} setConfig={setConfig} /> : null}
                 </fieldset>
 
                 <div className="form-row" style={{ marginTop: 14, gap: 8, alignItems: 'center' }}>
@@ -593,15 +899,18 @@ export function ActionsPage() {
     const { data, error, loading, reload } = useApi(listActions, []);
     const [editor, setEditor] = React.useState(null);   // null | { action: Action|null }
 
+    const rows = Array.isArray(data) ? data : [];
+
     if (editor) {
+        // The loaded list doubles as the escalation-target picker's options,
+        // so it is computed before this branch rather than after it.
         return (
-            <ActionEditor action={editor.action} manage={manage}
+            <ActionEditor action={editor.action} actions={rows} manage={manage}
                 onClose={() => setEditor(null)}
                 onSaved={() => { setEditor(null); reload(); }} />
         );
     }
 
-    const rows = Array.isArray(data) ? data : [];
     const showTable = !error && rows.length > 0;
 
     return (

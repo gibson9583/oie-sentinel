@@ -11,10 +11,11 @@ import { platform } from '@oie/web-shell';
 import { DataTable, fmtDate, fmtNumber } from '@oie/web-ui';
 import {
     ResponsiveContainer, LineChart, Line, XAxis, YAxis,
-    CartesianGrid, Tooltip, Legend,
+    CartesianGrid, Tooltip, Legend, ReferenceLine,
 } from 'recharts';
 import {
-    errText, getCoreChannels, getCoreChannelGroups, getCoreTags, getCoreUsers, listMonitors,
+    errText, getChannelActivity, getCoreChannels, getCoreChannelGroups, getCoreTags,
+    getCoreUsers, listMonitors,
 } from './api.js';
 
 const React = platform.React;
@@ -59,7 +60,8 @@ export function SeverityChip({ severity }) {
 
 /* ---- monitor types ------------------------------------------------------ */
 
-export const MONITOR_TYPE_ORDER = ['INACTIVITY', 'LOW_VOLUME', 'ANOMALY', 'CONNECTION_STATUS'];
+export const MONITOR_TYPE_ORDER = ['INACTIVITY', 'LOW_VOLUME', 'ANOMALY', 'CONNECTION_STATUS',
+    'ERROR_RATE', 'QUEUE_DEPTH'];
 
 // defaultConfig mirrors the configJson shapes in webadmin-contract.md; the
 // monitors page seeds new-monitor editors from it.
@@ -86,6 +88,22 @@ export const MONITOR_TYPE_META = {
         // are dropped as transient), so "connector down for 5 minutes" — the
         // headline use of this monitor type — is the natural seed.
         defaultConfig: { alertOnStates: ['DISCONNECTED'], minDurationSeconds: 300 },
+    },
+    ERROR_RATE: {
+        label: 'Error rate',
+        description: 'Alerts when the share of errored messages over a window reaches a percentage.',
+        // minMessages is the floor of statistical meaning, not a nicety: below
+        // it the evaluator returns INSUFFICIENT_DATA so one error on a quiet
+        // channel cannot read as 100%.
+        defaultConfig: { thresholdPercent: 10, windowSeconds: 3600, minMessages: 20 },
+    },
+    QUEUE_DEPTH: {
+        label: 'Queue depth',
+        description: 'Alerts when queued messages stay at or above a depth for a period.',
+        // Queue depth is an instantaneous gauge, so the evaluator reads the
+        // latest sample; minDurationSeconds separates a real backlog from the
+        // burst a destination clears on its next reconnect.
+        defaultConfig: { threshold: 1000, minDurationSeconds: 300 },
     },
 };
 
@@ -243,14 +261,28 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
  * received=var(--accent), sent=var(--ok), error=var(--err). Axis ticks are
  * HH:mm for spans <= 6h, else "MMM d HH:00"; the tooltip label uses fmtTime
  * (honours the TZ toggle — tick labels are browser-local, documented).
+ *
+ * `markers` draws labelled vertical rules for moments of interest (the alert
+ * open and resolve on the problem detail pane):
+ * [{ time: ISO string|Date|millis, label, color, position }]. Dashed, so they
+ * never read as the solid hairline grid, and their color should be a TEXT
+ * token — annotation is not data, and a rule in a series hue reads as that
+ * series. They use ifOverflow="extendDomain" so a marker just outside the
+ * drawn data — an inactivity alert has no samples at the open, which is the
+ * point — still appears instead of being silently discarded.
  */
-export function ActivityChart({ points, height = 260 }) {
+export function ActivityChart({ points, height = 260, markers }) {
     const data = React.useMemo(() => (points || []).map((p) => ({
         t: new Date(p.time).getTime(),
         received: Number(p.received) || 0,
         sent: Number(p.sent) || 0,
         error: Number(p.error) || 0,
     })).filter((p) => !isNaN(p.t)), [points]);
+
+    const marks = React.useMemo(() => (markers || []).map((m) => ({
+        ...m,
+        t: m.time instanceof Date ? m.time.getTime() : new Date(m.time).getTime(),
+    })).filter((m) => !isNaN(m.t)), [markers]);
 
     if (!data.length) return <div className="sn-empty">No activity in this range.</div>;
 
@@ -297,6 +329,17 @@ export function ActivityChart({ points, height = 260 }) {
                         distinguishable without color. */}
                     <Line name="Errors" dataKey="error" stroke="var(--err)" strokeDasharray="5 3"
                         strokeWidth={2} dot={false} activeDot={{ r: 3 }} isAnimationActive={false} />
+                    {/* After the series so the rules sit on top of them. */}
+                    {marks.map((m, i) => (
+                        <ReferenceLine key={`${m.t}-${i}`} x={m.t} ifOverflow="extendDomain"
+                            stroke={m.color || 'var(--text-dim)'} strokeDasharray="4 3" strokeWidth={1.5}
+                            label={m.label ? {
+                                value: m.label,
+                                position: m.position || 'insideTopLeft',
+                                fill: m.color || 'var(--text-dim)',
+                                fontSize: 10,
+                            } : undefined} />
+                    ))}
                 </LineChart>
             </ResponsiveContainer>
         </div>
@@ -333,6 +376,175 @@ export function TimeRangePicker({ value, onChange }) {
     );
 }
 
+/* ---- activity granularity ----------------------------------------------- */
+
+/**
+ * The three values the server accepts on ?granularity. AUTO is offered but is
+ * NOT the only useful setting, which is why the control exists at all: AUTO
+ * switches on RANGE WIDTH, not on what data survives — anything wider than 6
+ * hours resolves to the hourly rollup even though raw samples cover the whole
+ * sample-retention window. RAW is how an operator gets tick resolution over a
+ * 3 day incident.
+ */
+export const GRANULARITIES = [
+    { key: 'AUTO', label: 'Auto', title: 'Tick samples for ranges up to 6 hours, the hourly rollup beyond that.' },
+    { key: 'RAW', label: 'Raw', title: 'Collector tick samples, for as far back as sample retention keeps them.' },
+    { key: 'HOURLY', label: 'Hourly', title: 'The hourly rollup, which is kept far longer than raw samples.' },
+];
+
+/** RAW / HOURLY / AUTO segpill. value: a GRANULARITIES key; onChange(key). */
+export function GranularityPicker({ value, onChange }) {
+    return (
+        <div className="segpill sn-gran">
+            {GRANULARITIES.map((g) => (
+                <button key={g.key} type="button" title={g.title}
+                    className={value === g.key ? 'on' : ''}
+                    onClick={() => onChange && onChange(g.key)}>{g.label}</button>
+            ))}
+        </div>
+    );
+}
+
+// Java Duration.toString(): hours/minutes/seconds only (no day field), seconds
+// possibly fractional — "PT1H4M48S", "PT5M2.4S", "PT0.108S".
+const ISO_DURATION_RE = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/;
+
+/** "PT1H4M48S" -> "1h5m" (two units, smaller one rounded). Null if unreadable. */
+function fmtIsoDuration(text) {
+    const m = ISO_DURATION_RE.exec(String(text || ''));
+    if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined)) return null;
+    const total = Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+    if (!isFinite(total)) return null;
+    if (total < 60) return total < 0.5 ? '<1s' : `${Math.round(total)}s`;
+    if (total < 3600) {
+        let mins = Math.floor(total / 60);
+        let secs = Math.round(total % 60);
+        if (secs === 60) { mins += 1; secs = 0; }
+        if (mins === 60) return '1h';
+        return secs ? `${mins}m${secs}s` : `${mins}m`;
+    }
+    let hours = Math.floor(total / 3600);
+    let mins = Math.round((total % 3600) / 60);
+    if (mins === 60) { hours += 1; mins = 0; }
+    return mins ? `${hours}h${mins}m` : `${hours}h`;
+}
+
+const GRANULARITY_SOURCE_LABELS = { RAW: 'tick samples', HOURLY: 'hourly rollup' };
+
+/**
+ * Human text for the granularity the SERVER reported, which is the only one
+ * worth showing: it promotes an over-wide RAW request to the hourly rollup and
+ * folds either source into at most 2000 buckets, so the requested value is a
+ * guess and the response is the fact.
+ *
+ * A one-for-one read is the bare source name ("RAW"); a folded series is
+ * "<SOURCE>_<ISO-8601 bucket width>" ("HOURLY_PT1H4M48S"), which renders as
+ * "hourly rollup, 1h5m buckets". Purely presentational, and deliberately so —
+ * ANY value it cannot parse falls through to the server's own text rather than
+ * being guessed at, and nothing in the UI branches on granularity for
+ * behaviour (an equality test against 'RAW' would call folded five-minute
+ * buckets tick resolution, which is exactly the lie the compound label exists
+ * to prevent).
+ */
+export function describeGranularity(resolved) {
+    const text = resolved == null ? '' : String(resolved).trim();
+    if (!text) return 'unknown';
+    const cut = text.indexOf('_');
+    const source = cut < 0 ? text : text.slice(0, cut);
+    const label = GRANULARITY_SOURCE_LABELS[source];
+    if (cut < 0) return label || text;
+    const bucket = fmtIsoDuration(text.slice(cut + 1));
+    return label && bucket ? `${label}, ${bucket} buckets` : text;
+}
+
+/**
+ * Panel around ActivityChart that owns the GET /channels/{id}/activity fetch,
+ * the RAW/HOURLY/AUTO control and the resolved-granularity caption. Shared so
+ * the problem detail pane and the dashboard cannot drift on how a series is
+ * requested or labelled.
+ *
+ * Props:
+ *   channelId    channel to chart; falsy renders `unavailable` and fetches nothing
+ *   from, to     epoch millis. MEMOISE THESE — they are useApi deps, so a
+ *                fresh Date.now() per render refetches on every render
+ *   markers      passed through to ActivityChart
+ *   tools        extra header controls (channel/range pickers), left of the
+ *                granularity segpill
+ *   hint         note rendered under the caption
+ *   unavailable  message to show instead of the chart (no channel, no range)
+ *
+ * Load failures stay inline with a Retry, never a toast: 'warn' toasts are
+ * acknowledge-to-dismiss modals on this host, and the dashboard re-renders
+ * this panel on a 30s cadence.
+ */
+export function ChannelActivityPanel({
+    channelId, from, to, markers, tools, hint, height,
+    title = 'Channel activity',
+    unavailable,
+}) {
+    const [granularity, setGranularity] = React.useState('AUTO');
+    const ready = !!channelId && from != null && to != null && !unavailable;
+    const api = useApi(
+        () => (ready ? getChannelActivity(channelId, { from, to, granularity }) : Promise.resolve(null)),
+        [ready, channelId, from, to, granularity],
+    );
+    const activity = api.data;
+    const points = activity && Array.isArray(activity.points) ? activity.points : [];
+
+    return (
+        <div className="panel mb-3">
+            {/* .panel-header is a nowrap flex row; the pickers plus a long
+                channel name overflow a narrow viewport without this. */}
+            <div className="panel-header" style={{ flexWrap: 'wrap', rowGap: 6 }}>
+                <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {title}
+                </span>
+                <div className="panel-tools" style={{ flexWrap: 'wrap', rowGap: 6 }}>
+                    {tools}
+                    <GranularityPicker value={granularity} onChange={setGranularity} />
+                </div>
+            </div>
+            <div className="panel-body">
+                {!ready ? (
+                    <>
+                        <div className="sn-empty">{unavailable || 'No channel to chart.'}</div>
+                        {/* Also shown here, not just under a drawn chart: a note
+                            explaining what the picker contains is most useful
+                            before the operator has picked anything. */}
+                        {hint ? <div className="sn-hint" style={{ marginTop: 6 }}>{hint}</div> : null}
+                    </>
+                ) : (
+                    <>
+                        {api.error ? (
+                            <div style={{ marginBottom: 8 }}>
+                                <span className="text-err">Could not load activity.</span>{' '}
+                                <span className="text-text-dim">{api.error}</span>{' '}
+                                <button type="button" className="btn btn-sm" onClick={api.reload}>Retry</button>
+                            </div>
+                        ) : null}
+                        {!activity && !api.error ? (
+                            <div className="sn-empty">Loading activity…</div>
+                        ) : null}
+                        {activity ? <ActivityChart points={points} height={height} markers={markers} /> : null}
+                        {activity ? (
+                            <div className="sn-hint" style={{ marginTop: 6 }}>
+                                {/* The response's value verbatim in the tooltip: the prose
+                                    above it is a rendering, this is the record. */}
+                                <span title={`Server-reported granularity: ${activity.granularity || '(none)'}`}>
+                                    Resolution: {describeGranularity(activity.granularity)}
+                                </span>
+                                {' · '}{fmtNum(points.length)} point{points.length === 1 ? '' : 's'}
+                                {api.loading ? ' · updating…' : ''}
+                                {hint ? <> · {hint}</> : null}
+                            </div>
+                        ) : null}
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
 /* ---- channel / group pickers ------------------------------------------- */
 
 function multiValue(e) {
@@ -350,6 +562,69 @@ function PickerShell({ loading, error, reload, children }) {
     }
     if (loading) return <select disabled><option>Loading…</option></select>;
     return children;
+}
+
+/**
+ * Narrows a channel list to the channels at least one enabled monitor
+ * actually covers — the set a trend chart is worth offering, since an
+ * unmonitored channel is the one case where the chart is guaranteed to have
+ * nothing interesting to say.
+ *
+ * <p>Coverage is resolved exactly rather than guessed: CHANNEL scope names
+ * its channel, and GROUP/TAG scopes are expanded through the membership the
+ * {@code /core/channelGroups} and {@code /core/tags} payloads already carry,
+ * so this agrees with what the evaluator will actually do. A single enabled
+ * ALL-scoped monitor covers everything, in which case no filtering happens
+ * at all.</p>
+ *
+ * <p>Falls back to the unfiltered list whenever filtering would leave the
+ * picker empty or the lookups have not loaded — a picker with nothing in it
+ * is worse than one showing too much, and this is a convenience filter, not
+ * an access control.</p>
+ *
+ * @param channels the full channel list (from GET /core/channels)
+ * @returns { channels, filtered, total } — `filtered` is false when the list
+ *          was passed through untouched, so callers can say so in the UI
+ */
+export function useMonitoredChannels(channels) {
+    const monitors = useApi(listMonitors, []);
+    const groups = useApi(getCoreChannelGroups, []);
+    const tags = useApi(getCoreTags, []);
+
+    return React.useMemo(() => {
+        const list = Array.isArray(channels) ? channels : [];
+        const all = { channels: list, filtered: false, total: list.length };
+        const defined = Array.isArray(monitors.data) ? monitors.data.filter((m) => m && m.enabled) : null;
+        // Still loading, failed, or nothing to narrow by: show everything.
+        if (!defined || !defined.length || !list.length) return all;
+        if (defined.some((m) => m.scopeType === 'ALL')) return all;
+
+        const members = (rows, key) => {
+            const map = {};
+            (Array.isArray(rows) ? rows : []).forEach((r) => {
+                if (r && r[key]) map[r[key]] = Array.isArray(r.channelIds) ? r.channelIds : [];
+            });
+            return map;
+        };
+        const groupMembers = members(groups.data, 'id');
+        const tagMembers = members(tags.data, 'id');
+
+        const covered = new Set();
+        defined.forEach((m) => {
+            if (m.scopeType === 'CHANNEL') {
+                if (m.scopeId) covered.add(m.scopeId);
+            } else if (m.scopeType === 'GROUP') {
+                (groupMembers[m.scopeId] || []).forEach((id) => covered.add(id));
+            } else if (m.scopeType === 'TAG') {
+                (tagMembers[m.scopeId] || []).forEach((id) => covered.add(id));
+            }
+        });
+
+        const narrowed = list.filter((c) => covered.has(c.channelId));
+        return narrowed.length
+            ? { channels: narrowed, filtered: narrowed.length < list.length, total: list.length }
+            : all;
+    }, [channels, monitors.data, groups.data, tags.data]);
 }
 
 /**

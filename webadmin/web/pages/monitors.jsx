@@ -10,14 +10,18 @@
 import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog, detailModal } from '@oie/web-ui';
 import {
+    ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis,
+    CartesianGrid, Tooltip,
+} from 'recharts';
+import {
     listMonitors, createMonitor, updateMonitor, deleteMonitor,
-    setMonitorEnabled, testMonitor, getCoreChannels, getCoreChannelGroups,
-    getCoreTags, errText,
+    setMonitorEnabled, testMonitor, getMonitorHistory, getCoreChannels,
+    getCoreChannelGroups, getCoreTags, errText,
 } from '../api.js';
 import {
     canManage, toast, useApi, useDataTable, SeverityChip, SEVERITY_ORDER,
     SEVERITY_META, MONITOR_TYPE_ORDER, MONITOR_TYPE_META, ChannelPicker,
-    ChannelGroupPicker, TagPicker, fmtTime, fmtAgo,
+    ChannelGroupPicker, TagPicker, fmtNum, fmtTime, fmtAgo,
 } from '../ui.jsx';
 
 const React = platform.React;
@@ -37,6 +41,15 @@ const SCOPE_TYPES = [
 const CONNECTION_STATES = [
     'IDLE', 'READING', 'WRITING', 'POLLING', 'RECEIVING', 'SENDING',
     'WAITING_FOR_RESPONSE', 'CONNECTED', 'CONNECTING', 'DISCONNECTED',
+];
+
+// CONNECTION_STATUS `rollup`: how many problems (and therefore how many
+// notifications) one channel's connectors may open at once. The server's enum
+// also reserves SCOPE, which it rejects until scope-level rollup ships, so it
+// is deliberately not offered here.
+const ROLLUP_MODES = [
+    { value: 'CONNECTOR', label: 'Alert per connector' },
+    { value: 'CHANNEL', label: 'Alert once per channel' },
 ];
 
 /** "WAITING_FOR_RESPONSE" -> "Waiting for response". */
@@ -164,6 +177,7 @@ function normalizeTypeConfig(type, cfg, keepUnknownStates) {
         out.alertOnStates = keepUnknownStates
             ? names
             : names.filter((s) => CONNECTION_STATES.includes(s));
+        if (typeof out.rollup === 'string') out.rollup = out.rollup.trim().toUpperCase();
     }
     return out;
 }
@@ -202,6 +216,7 @@ function buildConfig(type, cfg) {
         if (!isFinite(n)) throw new Error(`${label} must be a number.`);
         if (opts.integer && !Number.isInteger(n)) throw new Error(`${label} must be a whole number.`);
         if (opts.min != null && n < opts.min) throw new Error(`${label} must be at least ${opts.min}.`);
+        if (opts.max != null && n > opts.max) throw new Error(`${label} must be at most ${opts.max}.`);
         out[key] = n;
     };
     switch (type) {
@@ -239,8 +254,24 @@ function buildConfig(type, cfg) {
             }
             out.alertOnStates = states;
             num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
+            // Always written, like compareTo/direction: the server rejects an
+            // out-of-enum rollup rather than defaulting it, so sending the
+            // editor's own value keeps a monitor saved before rollup existed
+            // from quietly acquiring a mode nobody chose.
+            out.rollup = String(cfg.rollup || 'CONNECTOR').toUpperCase();
             break;
         }
+        case 'ERROR_RATE':
+            num('windowSeconds', 'Window (seconds)', { min: 1, integer: true });
+            // The server rejects anything outside 0–100 rather than clamping,
+            // so bound it here too and fail with the friendlier message.
+            num('thresholdPercent', 'Error rate threshold (%)', { min: 0, max: 100 });
+            num('minMessages', 'Minimum messages', { min: 0, integer: true });
+            break;
+        case 'QUEUE_DEPTH':
+            num('threshold', 'Queue depth threshold', { min: 0, integer: true });
+            num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
+            break;
         default:
             break;
     }
@@ -249,12 +280,12 @@ function buildConfig(type, cfg) {
 
 /* ---- small form pieces --------------------------------------------------- */
 
-function NumField({ label, value, onChange, hint, min, step }) {
+function NumField({ label, value, onChange, hint, min, max, step }) {
     return (
         <div className="field">
             <label>{label}</label>
             <input type="number" value={value == null ? '' : value}
-                min={min} step={step == null ? 1 : step}
+                min={min} max={max} step={step == null ? 1 : step}
                 onChange={(e) => onChange(e.target.value)} />
             {hint ? <div className="hint">{hint}</div> : null}
         </div>
@@ -387,9 +418,55 @@ function ConfigFields({ type, cfg, setCfg }) {
                     <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
                         onChange={(v) => setCfg({ minDurationSeconds: v })}
                         hint="The state must persist at least this long before it counts as a breach." />
+                    <SelectField label="Alerting" value={String(cfg.rollup || 'CONNECTOR').toUpperCase()}
+                        options={ROLLUP_MODES} onChange={(v) => setCfg({ rollup: v })}
+                        hint={'Per connector opens one problem, and fires every matching action, for '
+                            + 'each failing connector — one channel losing its upstream then pages '
+                            + 'once per destination. Once per channel opens a single problem naming '
+                            + 'the failing connectors, but it clears only after every connector '
+                            + 'recovers.'} />
                 </div>
             );
         }
+        case 'ERROR_RATE':
+            return (
+                <div className="form-grid">
+                    <NumField label="Error rate threshold (%)" value={cfg.thresholdPercent}
+                        min={0} max={100} step={0.5}
+                        onChange={(v) => setCfg({ thresholdPercent: v })}
+                        hint="Breach when errored messages reach this share of received messages in the window." />
+                    <NumField label="Window (seconds)" value={cfg.windowSeconds} min={1}
+                        onChange={(v) => setCfg({ windowSeconds: v })}
+                        hint="Sliding window the error and received counts are summed over." />
+                    <NumField label="Minimum messages" value={cfg.minMessages} min={0}
+                        onChange={(v) => setCfg({ minMessages: v })}
+                        hint={'Windows that received fewer messages than this are reported as '
+                            + 'insufficient data, never OK. One error on a quiet channel is not a '
+                            + '100% error rate, and a channel too quiet to measure is not a channel '
+                            + 'proven healthy — an open problem stays open until a window with real '
+                            + 'traffic can clear it.'} />
+                </div>
+            );
+        case 'QUEUE_DEPTH':
+            return (
+                <div className="form-grid">
+                    <NumField label="Queue depth threshold" value={cfg.threshold} min={0}
+                        onChange={(v) => setCfg({ threshold: v })}
+                        hint="Breach when the channel's queued-message count is at or above this." />
+                    <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
+                        onChange={(v) => setCfg({ minDurationSeconds: v })}
+                        hint={'The depth must hold for at least this long — a queue that spikes for '
+                            + 'one collector tick while a destination reconnects is normal.'} />
+                    <div className="field span-2">
+                        <div className="hint">
+                            Queue depth is read from the latest activity sample, not summed over the
+                            window: it is a level, not a flow. If the collector has left no recent
+                            sample the monitor reports insufficient data rather than treating a stale
+                            reading as the current depth.
+                        </div>
+                    </div>
+                </div>
+            );
         default:
             return null;
     }
@@ -416,12 +493,263 @@ function showTestResult(name, result) {
     });
 }
 
+/* ---- alerting history panel ---------------------------------------------- */
+
+/* Ranges the history chart offers. Days, not hours: the server buckets by
+   calendar day, so anything under a couple of weeks is a handful of bars. 1y
+   sits just inside the server's 366-day ceiling. */
+const HISTORY_RANGES = [
+    { key: '7d', label: '7d', days: 7 },
+    { key: '30d', label: '30d', days: 30 },
+    { key: '90d', label: '90d', days: 90 },
+    { key: '1y', label: '1y', days: 365 },
+];
+
+const HISTORY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/* Both charts share these so their plot areas line up pixel-for-pixel under one
+   x-axis — a fixed y-axis width is what makes that true regardless of how wide
+   the tick labels happen to render. */
+const HISTORY_AXIS_WIDTH = 52;
+const HISTORY_MARGIN = { top: 6, right: 12, bottom: 0, left: 0 };
+
+/* Local twin of ui.jsx's chart tooltip style (not exported from there). */
+const HISTORY_TOOLTIP_STYLE = {
+    background: 'var(--bg2)',
+    border: '1px solid var(--line)',
+    borderRadius: 'var(--radius)',
+    color: 'var(--text)',
+    fontSize: 11,
+    padding: '6px 9px',
+};
+
+/** Seconds -> "45s" / "12m" / "3h 20m" / "2d 4h". Two units at most. */
+function fmtSeconds(seconds) {
+    const s = Number(seconds);
+    if (!isFinite(s) || s < 0) return '—';
+    if (s < 60) return `${Math.round(s)}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    if (s < 86400) {
+        const hours = Math.floor(s / 3600);
+        const mins = Math.round((s % 3600) / 60);
+        return mins ? `${hours}h ${mins}m` : `${hours}h`;
+    }
+    const days = Math.floor(s / 86400);
+    const hours = Math.round((s % 86400) / 3600);
+    return hours ? `${days}d ${hours}h` : `${days}d`;
+}
+
+/* Bucket instants are server-local midnights; the labels render in the
+   browser's zone, the same documented compromise ui.jsx's ActivityChart ticks
+   make. The tooltip carries the fuller label. */
+function dayTick(t) {
+    const d = new Date(t);
+    return `${HISTORY_MONTHS[d.getMonth()]} ${d.getDate()}`;
+}
+
+function dayLabel(t) {
+    const d = new Date(t);
+    return `${HISTORY_MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+
+/**
+ * A monitor's alerting history: alerts opened per day, and mean time to
+ * resolve per day.
+ *
+ * <p>Two stacked single-series charts sharing one x-axis, never one chart with
+ * two y-scales. A count and a duration have no common unit, so plotting them
+ * against two axes would let the arbitrary alignment of those axes invent a
+ * correlation that is not in the data — the classic way a monitoring chart
+ * lies. Stacked, the reader compares the two by looking down a column, which is
+ * the comparison they actually want ("we fired a lot AND took a long time").
+ *
+ * <p>The MTTR line deliberately breaks wherever a day has no resolve time:
+ * either nothing fired, or everything that fired is still open. The server
+ * sends null for both cases and this passes it straight through with
+ * connectNulls off, because the alternative — substituting 0 — draws a dive to
+ * the floor that reads as "we resolved everything instantly" on precisely the
+ * days when either nothing happened or nothing has been fixed yet.
+ *
+ * <p>Fetch/label/error idiom follows ui.jsx's ChannelActivityPanel: failures
+ * stay inline with a Retry rather than becoming toasts (host 'warn' toasts are
+ * acknowledge-to-dismiss modals), and the range control sits once in the panel
+ * header above everything it scopes.
+ */
+function MonitorHistoryPanel({ monitorId }) {
+    const [rangeKey, setRangeKey] = React.useState('30d');
+    // Memoised: these are useApi deps, so a fresh Date.now() per render would
+    // refetch on every render.
+    const window_ = React.useMemo(() => {
+        const range = HISTORY_RANGES.find((r) => r.key === rangeKey) || HISTORY_RANGES[1];
+        const to = Date.now();
+        return { from: to - range.days * 86400000, to };
+    }, [rangeKey]);
+
+    const api = useApi(() => getMonitorHistory(monitorId, window_), [monitorId, window_]);
+    const history = api.data;
+
+    const data = React.useMemo(() => {
+        const points = history && Array.isArray(history.points) ? history.points : [];
+        return points
+            .map((p) => ({
+                t: new Date(p.bucket).getTime(),
+                alerts: Number(p.alertCount) || 0,
+                // Null, never 0 — see the component doc. `== null` also catches
+                // the key being absent entirely.
+                mttr: p.avgResolveSeconds == null ? null : Number(p.avgResolveSeconds),
+            }))
+            .filter((p) => !isNaN(p.t));
+    }, [history]);
+
+    const totals = React.useMemo(() => {
+        let alerts = 0;
+        let activeDays = 0;
+        let worstMttr = null;
+        data.forEach((p) => {
+            alerts += p.alerts;
+            if (p.alerts > 0) activeDays += 1;
+            if (p.mttr != null && (worstMttr == null || p.mttr > worstMttr)) worstMttr = p.mttr;
+        });
+        return { alerts, activeDays, worstMttr };
+    }, [data]);
+
+    const hasMttr = data.some((p) => p.mttr != null);
+
+    return (
+        <div className="panel mb-3">
+            <div className="panel-header" style={{ flexWrap: 'wrap', rowGap: 6 }}>
+                Alerting history
+                <div className="panel-tools" style={{ flexWrap: 'wrap', rowGap: 6 }}>
+                    <div className="segpill">
+                        {HISTORY_RANGES.map((r) => (
+                            <button key={r.key} type="button"
+                                className={rangeKey === r.key ? 'on' : ''}
+                                onClick={() => setRangeKey(r.key)}>{r.label}</button>
+                        ))}
+                    </div>
+                </div>
+            </div>
+            <div className="panel-body">
+                {api.error ? (
+                    <div style={{ marginBottom: 8 }}>
+                        <span className="text-err">Could not load history.</span>{' '}
+                        <span className="text-text-dim">{api.error}</span>{' '}
+                        <button type="button" className="btn btn-sm" onClick={api.reload}>Retry</button>
+                    </div>
+                ) : null}
+                {!history && !api.error ? <div className="sn-empty">Loading history…</div> : null}
+                {history && totals.alerts === 0 ? (
+                    <div className="sn-empty">
+                        This monitor opened no alerts in the selected range.
+                    </div>
+                ) : null}
+                {history && totals.alerts > 0 ? (
+                    <>
+                        <div className="sn-tile-label" style={{ marginBottom: 2 }}>Alerts opened per day</div>
+                        <div className="sn-chart" style={{ width: '100%', height: 150 }}>
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={data} margin={HISTORY_MARGIN} barCategoryGap="8%">
+                                    <CartesianGrid stroke="var(--line)" strokeOpacity={0.6} vertical={false} />
+                                    {/* Tick labels live on the lower chart only —
+                                        one shared axis for the pair. scale is pinned
+                                        rather than left to the default so both charts
+                                        place a day at the same x; recharts would
+                                        otherwise band-scale the bars and point-scale
+                                        the line, offsetting them by half a day. */}
+                                    <XAxis dataKey="t" scale="band" tick={false} height={6}
+                                        stroke="var(--line-strong)" />
+                                    <YAxis allowDecimals={false} width={HISTORY_AXIS_WIDTH}
+                                        stroke="var(--line-strong)"
+                                        tick={{ fill: 'var(--text-dim)', fontSize: 10 }}
+                                        tickFormatter={(v) => fmtNum(v)} />
+                                    <Tooltip
+                                        labelFormatter={dayLabel}
+                                        formatter={(value) => [fmtNum(value), 'Alerts opened']}
+                                        contentStyle={HISTORY_TOOLTIP_STYLE}
+                                        labelStyle={{ color: 'var(--text-dim)', marginBottom: 4 }}
+                                        itemStyle={{ color: 'var(--text)', padding: 0 }}
+                                        cursor={{ fill: 'var(--line)', fillOpacity: 0.35 }}
+                                        isAnimationActive={false} />
+                                    {/* maxBarSize keeps a 7-day range from rendering
+                                        as seven fat slabs; the percentage gap is what
+                                        survives a 365-day range, where a fixed pixel
+                                        gap would consume the whole band. */}
+                                    <Bar dataKey="alerts" fill="var(--accent)" radius={[3, 3, 0, 0]}
+                                        maxBarSize={28} isAnimationActive={false} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+
+                        <div className="sn-tile-label" style={{ margin: '8px 0 2px' }}>
+                            Mean time to resolve
+                        </div>
+                        {hasMttr ? (
+                            <div className="sn-chart" style={{ width: '100%', height: 150 }}>
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <LineChart data={data} margin={HISTORY_MARGIN}>
+                                        <CartesianGrid stroke="var(--line)" strokeOpacity={0.6} vertical={false} />
+                                        <XAxis dataKey="t" scale="band" tickFormatter={dayTick}
+                                            interval="preserveStartEnd" minTickGap={28}
+                                            stroke="var(--line-strong)"
+                                            tick={{ fill: 'var(--text-dim)', fontSize: 10 }} />
+                                        <YAxis width={HISTORY_AXIS_WIDTH}
+                                            stroke="var(--line-strong)"
+                                            tick={{ fill: 'var(--text-dim)', fontSize: 10 }}
+                                            tickFormatter={fmtSeconds} />
+                                        <Tooltip
+                                            labelFormatter={dayLabel}
+                                            formatter={(value) => [fmtSeconds(value), 'Mean time to resolve']}
+                                            contentStyle={HISTORY_TOOLTIP_STYLE}
+                                            labelStyle={{ color: 'var(--text-dim)', marginBottom: 4 }}
+                                            itemStyle={{ color: 'var(--text)', padding: 0 }}
+                                            cursor={{ stroke: 'var(--line-strong)' }}
+                                            isAnimationActive={false} />
+                                        {/* connectNulls stays off: the gap is the
+                                            statement. See the component doc. */}
+                                        <Line dataKey="mttr" stroke="var(--accent)" strokeWidth={2}
+                                            dot={{ r: 2 }} activeDot={{ r: 4 }} connectNulls={false}
+                                            isAnimationActive={false} />
+                                    </LineChart>
+                                </ResponsiveContainer>
+                            </div>
+                        ) : (
+                            <div className="sn-empty">
+                                None of this range's alerts have been resolved, so there is no
+                                mean time to resolve yet.
+                            </div>
+                        )}
+                    </>
+                ) : null}
+                {history ? (
+                    <div className="sn-hint" style={{ marginTop: 6 }}>
+                        {fmtNum(totals.alerts)} alert{totals.alerts === 1 ? '' : 's'}
+                        {' over '}{fmtNum(data.length)} day{data.length === 1 ? '' : 's'}
+                        {totals.activeDays ? ` · ${fmtNum(totals.activeDays)} day${totals.activeDays === 1 ? '' : 's'} with alerts` : ''}
+                        {totals.worstMttr != null ? ` · worst daily MTTR ${fmtSeconds(totals.worstMttr)}` : ''}
+                        {api.loading ? ' · updating…' : ''}
+                        {history.truncated ? (
+                            <>
+                                {' · '}
+                                <span className="text-err" title={'More matching alerts exist than this view '
+                                    + 'counts, so the earliest days understate.'}>
+                                    partial: too many alerts to count in full
+                                </span>
+                            </>
+                        ) : null}
+                    </div>
+                ) : null}
+            </div>
+        </div>
+    );
+}
+
 /* ---- editor sub-view ----------------------------------------------------- */
 
 function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
     const isNew = !monitor;
     const [name, setName] = React.useState(monitor ? monitor.name : '');
     const [description, setDescription] = React.useState((monitor && monitor.description) || '');
+    const [runbookUrl, setRunbookUrl] = React.useState((monitor && monitor.runbookUrl) || '');
     const [monitorType, setMonitorType] = React.useState((monitor && monitor.monitorType) || 'INACTIVITY');
     const [scopeType, setScopeType] = React.useState((monitor && monitor.scopeType) || 'ALL');
     const [scopeId, setScopeId] = React.useState((monitor && monitor.scopeId) || '');
@@ -452,10 +780,21 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
         if (!Number.isInteger(breaches) || breaches < 1) {
             throw new Error('Minimum consecutive breaches must be a whole number of at least 1.');
         }
+        /* MonitorService is the authority and rejects anything that is not an
+           absolute http/https URL — this mirror exists to say so before the
+           round trip, and because the reason the server refuses ("this link is
+           opened in an operator's browser") is worth stating where the value is
+           typed. */
+        const runbook = runbookUrl.trim();
+        if (runbook && !/^https?:\/\/[^\s/?#]+[^\s]*$/i.test(runbook)) {
+            throw new Error('Runbook URL must be an absolute http:// or https:// link, '
+                + 'e.g. https://wiki.example.org/runbooks/adt-inactivity.');
+        }
         return {
             id: monitor ? monitor.id : undefined,
             name: trimmed,
             description: description.trim() || null,
+            runbookUrl: runbook || null,
             monitorType,
             scopeType,
             scopeId: scopeType === 'ALL' ? null : scopeId,
@@ -519,7 +858,8 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
     };
 
     return (
-        <div className="panel">
+        <>
+        <div className="panel mb-3">
             <div className="panel-header">
                 {isNew ? 'New monitor' : `Edit monitor — ${monitor.name}`}
                 <div className="panel-tools">
@@ -552,6 +892,19 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                             <label>Description</label>
                             <input value={description} onChange={(e) => setDescription(e.target.value)}
                                 placeholder="Optional operator notes" />
+                        </div>
+                        <div className="field span-2">
+                            <label>Runbook URL</label>
+                            <input type="url" value={runbookUrl}
+                                onChange={(e) => setRunbookUrl(e.target.value)}
+                                placeholder="https://wiki.example.org/runbooks/adt-inactivity" />
+                            <div className="hint">
+                                Optional. Shown as a link on every problem this monitor raises, and
+                                carried into every notification it sends — as a line in the email
+                                body, as the {'${runbookUrl}'} template token for email subjects and
+                                webhooks, and as a field of the payload routed to channel and SNS
+                                actions. Must be an absolute http:// or https:// link.
+                            </div>
                         </div>
                         <div className="field span-2">
                             <label>Scope</label>
@@ -656,6 +1009,10 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                 ) : null}
             </div>
         </div>
+        {/* Only for a saved monitor: an unsaved draft has no id to query, and
+            no history to have. */}
+        {!isNew ? <MonitorHistoryPanel monitorId={monitor.id} /> : null}
+        </>
     );
 }
 

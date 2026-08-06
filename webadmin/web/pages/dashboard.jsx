@@ -2,8 +2,10 @@
 // Published under the terms of the Mozilla Public License 2.0.
 //
 // Dashboard page: KPI tiles from GET /dashboard/summary, recent problems,
-// top problem channels with 1h sparklines (GET /activity/summary), and a
-// collector/evaluator health footnote. Auto-refreshes every 30s while the
+// top problem channels with 1h sparklines (GET /activity/summary), a
+// per-channel trend chart (GET /channels/{id}/activity, defaulted to the
+// channel with the most open problems), and a collector/evaluator health
+// footnote. Auto-refreshes every 30s while the
 // Sentinel view is visible (gated on the session user and the current route,
 // so the poll never outlives the view or resets the session timeout).
 //
@@ -19,12 +21,19 @@ import {
 } from '../api.js';
 import {
     StatTile, SeverityChip, Sparkline, useApi, useUsernames, toast,
+    ChannelActivityPanel, ChannelPicker, TimeRangePicker, rangeWindow, useMonitoredChannels,
     fmtAgo, fmtTime, fmtNum, SEVERITY_ORDER, SEVERITY_META, MONITOR_TYPE_META,
 } from '../ui.jsx';
 
 const React = platform.React;
 
 const REFRESH_MS = 30000;
+
+// Stable identity while /core/channels loads — ChannelPicker's useApi keys off
+// the prop identity, so a fresh [] per render would refetch every render.
+const NO_CHANNELS = [];
+
+const DEFAULT_CHART_RANGE = '6h';
 
 // GET /settings is MANAGE-gated, so a VIEW-only dashboard cannot learn the
 // configured collector/evaluator intervals to compute a "3x interval" lag
@@ -227,6 +236,40 @@ export function DashboardPage() {
     }, [channelsApi.data, summary]);
     const channelNameOf = (id) => channelNames[id] || id || '—';
 
+    /* Trend chart selection. The window is recomputed only when the range key
+       or a successful summary refresh changes — rangeWindow() is Date.now()
+       based, and from/to are fetch deps in ChannelActivityPanel, so computing
+       it inline would refetch on every render. Keying it to lastUpdated slides
+       the chart forward on the same 30s cadence as the rest of the page. */
+    const [chartChannel, setChartChannel] = React.useState('');
+    const [chartRange, setChartRange] = React.useState(DEFAULT_CHART_RANGE);
+
+    /* Offer only channels an enabled monitor actually covers: charting an
+       unmonitored channel is the one case guaranteed to be uninteresting, and
+       on a server with hundreds of channels the unfiltered list buries the
+       handful being watched. Falls back to the full list when nothing would
+       be left (see useMonitoredChannels). */
+    const chartChannels = useMonitoredChannels(channelsApi.data);
+    const chartWindow = React.useMemo(
+        () => rangeWindow(chartRange),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [chartRange, lastUpdated],
+    );
+
+    /* Default to the channel with the most open problems: topChannels is
+       already ranked worst-first (DashboardService ranks by open count, ties
+       broken by max severity). Once only — a 30s refresh must not stomp the
+       operator's own pick, and neither must clearing the picker re-seed it. */
+    const chartSeededRef = React.useRef(false);
+    React.useEffect(() => {
+        if (chartSeededRef.current) return;
+        const top = ((summary && summary.topChannels) || [])[0];
+        if (top && top.channelId) {
+            chartSeededRef.current = true;
+            setChartChannel(top.channelId);
+        }
+    }, [summary]);
+
     // mode: 'initial' (inline error) | 'background' (toast once per streak)
     //     | 'manual' (errorModal — user pressed Refresh).
     const load = React.useCallback(async (mode) => {
@@ -415,6 +458,32 @@ export function DashboardPage() {
                     </div>
                 </div>
             )}
+
+            {/* Outside the selected/list swap above: opening a recent problem
+                inline should not take the trend chart away with it. */}
+            <div style={{ marginTop: 12 }}>
+                <ChannelActivityPanel
+                    title="Channel trend"
+                    channelId={chartChannel}
+                    from={chartWindow.from}
+                    to={chartWindow.to}
+                    unavailable={chartChannel ? null : 'Pick a channel to chart its throughput.'}
+                    hint={chartChannels.filtered
+                        ? `Showing the ${chartChannels.channels.length} of ${chartChannels.total} channels covered by an enabled monitor.`
+                        : null}
+                    tools={(
+                        <>
+                            {/* Host selects are width:100%; the wrapper is what
+                                keeps the picker off the rest of the header. */}
+                            <span style={{ display: 'inline-block', width: 200 }}>
+                                <ChannelPicker value={chartChannel} onChange={setChartChannel}
+                                    channels={chartChannels.channels.length ? chartChannels.channels : NO_CHANNELS}
+                                    emptyLabel="Select a channel…" />
+                            </span>
+                            <TimeRangePicker value={chartRange} onChange={setChartRange} />
+                        </>
+                    )} />
+            </div>
 
             <HealthFootnote summary={summary} />
         </div>
