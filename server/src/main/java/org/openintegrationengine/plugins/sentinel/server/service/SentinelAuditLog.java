@@ -249,6 +249,26 @@ public final class SentinelAuditLog {
         }
     }
 
+    /**
+     * Records a bulk resolve as one event with a count, for the same reason
+     * {@link #problemBulkAcknowledged} does — and separately from it, because
+     * "who closed these fifty problems" is a materially different question
+     * from "who silenced them" when someone reads this log back later.
+     */
+    public static void problemBulkResolved(int userId, int count, String comment) {
+        try {
+            Map<String, String> attributes = new LinkedHashMap<>();
+            attributes.put("Action", "Bulk-resolved Sentinel problems");
+            attributes.put("Count", String.valueOf(count));
+            if (comment != null && !comment.isBlank()) {
+                attributes.put("Comment", comment);
+            }
+            dispatch(userId, attributes);
+        } catch (Exception e) {
+            log.warn("Failed to audit bulk resolve of {} problems", count, e);
+        }
+    }
+
     /** Shared body for the single-problem verbs: phrase, event fields, channel attribution. */
     private static void dispatchProblemEvent(int userId, String actionPhrase, AlertEvent event, String comment) {
         try {

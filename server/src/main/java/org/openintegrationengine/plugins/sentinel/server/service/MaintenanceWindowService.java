@@ -5,7 +5,9 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.service;
 
+import java.time.DateTimeException;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -169,7 +171,9 @@ public final class MaintenanceWindowService {
      * start/end times ({@code WindowSchedule} treats malformed stored rows
      * as drift and alarms in the log, so nothing incoherent may get in
      * here). Null mode/repeat normalize to SUPPRESS/NONE so pre-v2 clients
-     * keep working unchanged.
+     * keep working unchanged; a recurring window's timezone is normalized and
+     * validated by {@link #normalizeTimezone}, and null keeps meaning "the
+     * server's zone" so pre-v3 clients do too.
      */
     private static void validate(MaintenanceWindow window) {
         if (window == null) {
@@ -200,11 +204,14 @@ public final class MaintenanceWindowService {
                         "Both activeFrom and activeUntil are required for a one-time window");
             }
             // A one-time window carries no recurrence fields; blank them so a
-            // stored row never mixes schedule vocabularies.
+            // stored row never mixes schedule vocabularies. Timezone included:
+            // a one-time window is two absolute instants, so a zone on it would
+            // read as meaningful when nothing consumes it.
             window.setDaysOfWeek(null);
             window.setDaysOfMonth(null);
             window.setStartTime(null);
             window.setEndTime(null);
+            window.setTimezone(null);
         } else {
             if (WindowSchedule.parseTime(window.getStartTime()) == null
                     || WindowSchedule.parseTime(window.getEndTime()) == null) {
@@ -226,11 +233,40 @@ public final class MaintenanceWindowService {
                 }
                 window.setDaysOfWeek(null);
             }
+            normalizeTimezone(window);
         }
 
         if (window.getActiveFrom() != null && window.getActiveUntil() != null
                 && !window.getActiveFrom().isBefore(window.getActiveUntil())) {
             throw new IllegalArgumentException("activeFrom must be before activeUntil");
         }
+    }
+
+    /**
+     * Normalizes a recurring window's timezone: blank becomes {@code null}
+     * ("evaluate on the server's zone", the pre-v3 behavior every existing
+     * row keeps), anything else must be a zone id {@code ZoneId} accepts.
+     *
+     * <p>Rejecting a bad id here rather than at evaluation time is the point:
+     * {@code WindowSchedule} falls back to the server zone for a stored row it
+     * cannot parse, which keeps a broken row harmless but also silent, and an
+     * operator who fat-fingers a zone in the editor deserves a 400 rather than
+     * a schedule that quietly runs on the wrong clock.</p>
+     */
+    private static void normalizeTimezone(MaintenanceWindow window) {
+        String zone = window.getTimezone();
+        if (zone == null || zone.isBlank()) {
+            window.setTimezone(null);
+            return;
+        }
+        String trimmed = zone.trim();
+        try {
+            ZoneId.of(trimmed);
+        } catch (DateTimeException e) {
+            throw new IllegalArgumentException(
+                    "timezone '" + trimmed + "' is not a recognized time zone id (e.g. America/New_York);"
+                            + " leave it empty to use the server's time zone");
+        }
+        window.setTimezone(trimmed);
     }
 }

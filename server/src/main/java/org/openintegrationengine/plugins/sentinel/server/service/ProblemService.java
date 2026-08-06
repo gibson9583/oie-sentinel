@@ -259,14 +259,7 @@ public final class ProblemService {
         if (event.getStatus() != AlertStatus.PROBLEM) {
             throw new IllegalArgumentException("Problem " + id + " is already resolved");
         }
-        Instant now = Instant.now();
-        event.setStatus(AlertStatus.RESOLVED);
-        event.setResolvedTime(now);
-        if (event.getAcknowledgedBy() == null) {
-            applyAck(event, comment, userId);
-        }
-        AlertEventRepository.updateAlertEvent(event);
-        resetTriggerState(event, now);
+        applyResolve(event, comment, userId);
         SentinelAuditLog.problemResolved(userId, event, comment);
         return event;
     }
@@ -319,6 +312,67 @@ public final class ProblemService {
     }
 
     /**
+     * Resolves a batch of problems, skipping (rather than failing on) ids that
+     * are missing or already resolved — the resolve-side mirror of
+     * {@link #bulkAcknowledge(List, String, int)}, and skipping for the same
+     * reason: after a storm an operator sweeps a multi-select selection that
+     * the evaluator is concurrently clearing underneath them, and "resolve
+     * whatever is still open" is what they mean.
+     *
+     * <p>Each resolved event takes the full single-resolve treatment
+     * ({@link #applyResolve}), trigger-state reset included — a bulk resolve
+     * that skipped the reset would leave every swept trigger stuck in PROBLEM,
+     * silently unable to open a new alert on the next genuine breach, which is
+     * precisely the failure mode a post-storm sweep must not create.</p>
+     *
+     * <p><b>Audited as one event with a count</b> via
+     * {@code SentinelAuditLog.problemBulkResolved}, mirroring bulk
+     * acknowledge — per-event entries would flood the System Events log,
+     * which is exactly what that pairing exists to prevent. Recorded under
+     * its own verb rather than reusing the acknowledge one because "who
+     * closed these fifty problems" and "who silenced them" are different
+     * questions when the log is read back.</p>
+     *
+     * @param ids     the alert-event ids to resolve
+     * @param comment optional operator note applied to each
+     * @param userId  the resolving user
+     * @return how many events were newly resolved
+     * @throws IllegalArgumentException if the comment is too long — validated
+     *                                  up front so the whole batch 400s
+     *                                  cleanly instead of every row being
+     *                                  silently "skipped" by the per-row
+     *                                  catch below
+     */
+    public static int bulkResolve(List<Long> ids, String comment, int userId) {
+        validateComment(comment);
+        if (ids == null || ids.isEmpty()) {
+            return 0;
+        }
+        int resolved = 0;
+        for (Long id : ids) {
+            if (id == null) {
+                continue;
+            }
+            try {
+                AlertEvent event = AlertEventRepository.getAlertEvent(id);
+                if (event == null || event.getStatus() != AlertStatus.PROBLEM) {
+                    continue;
+                }
+                applyResolve(event, comment, userId);
+                resolved++;
+            } catch (Exception e) {
+                // One bad row must not abort the batch; the count tells the
+                // client how many actually took.
+                log.warn("Bulk resolve skipped problem {}", id, e);
+            }
+        }
+        if (resolved > 0) {
+            SentinelAuditLog.problemBulkResolved(userId, resolved, comment);
+        }
+        return resolved;
+    }
+
+    /**
      * Fetches one alert event by id, without the display-context assembly of
      * {@link #getDetail(long)}. Exists for callers that only need the raw
      * event — notably the servlet's channel-restriction guard, which must
@@ -357,6 +411,30 @@ public final class ProblemService {
         if (comment != null && !comment.isBlank()) {
             event.setAckComment(comment.trim());
         }
+    }
+
+    /**
+     * Performs one manual resolve end to end — stamp, persist, reset the
+     * owning trigger — shared by {@link #resolve(long, String, int)} and
+     * {@link #bulkResolve(List, String, int)} so the two can never drift on
+     * the part that matters. The callers keep only what genuinely differs
+     * between them: how a non-open event is handled (throw vs. skip) and
+     * whether an audit event is written.
+     *
+     * <p>The resolver's identity doubles as the acknowledgment when none was
+     * recorded — a manual resolve is the strongest possible form of "a human
+     * has seen this" — and the trigger reset is mandatory, not optional; see
+     * the class Javadoc.</p>
+     */
+    private static void applyResolve(AlertEvent event, String comment, int userId) {
+        Instant now = Instant.now();
+        event.setStatus(AlertStatus.RESOLVED);
+        event.setResolvedTime(now);
+        if (event.getAcknowledgedBy() == null) {
+            applyAck(event, comment, userId);
+        }
+        AlertEventRepository.updateAlertEvent(event);
+        resetTriggerState(event, now);
     }
 
     /**

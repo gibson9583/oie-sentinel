@@ -39,7 +39,11 @@ import io.swagger.v3.oas.annotations.tags.Tag;
  * keeps Sentinel's types out of that pipeline entirely and hands the web
  * frontend clean, predictable JSON. Even void-shaped mutations return a
  * {@code String} ({@code "{}"} or the updated entity) so the client can treat
- * every call uniformly.</p>
+ * every call uniformly. The single exception is {@link #getMetrics()}, which
+ * overrides the class-level {@code @Produces} to serve Prometheus's text
+ * exposition format — it is consumed by a scraper, not by the dashboard, and
+ * its content type is dictated by that ecosystem rather than by this
+ * contract.</p>
  *
  * <p><b>Permissions.</b> Five tiers, wider than the usual view/manage pair
  * so RBAC roles can mirror real operational roles: {@link #PERMISSION_VIEW}
@@ -226,6 +230,53 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @Operation(summary = "Evaluates a monitor definition against its target channels without saving it")
     @MirthOperation(name = "sentinelTestMonitor", display = "Test Sentinel monitor", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC, auditable = false)
     String testMonitor(@Param(value = "body", excludeFromAudit = true) String monitorJson) throws ClientException;
+
+    /**
+     * Returns one monitor's alerting history as a daily series: how many alerts
+     * it opened each day, and their mean time to resolve. Answers "is this rule
+     * earning its keep?", which no amount of looking at the monitor's own
+     * configuration can.
+     *
+     * <p><b>The series is continuous.</b> One point per calendar day across the
+     * whole requested range, oldest first, whether or not that day had any
+     * alerts — the underlying aggregate emits nothing for a quiet day, and a
+     * chart fed only the days that had alerts would space them evenly and draw a
+     * fortnight of silence as a straight line between two spikes. A filled day
+     * carries {@code alertCount} 0 and {@code avgResolveSeconds} {@code null},
+     * and that asymmetry is deliberate: zero alerts is a measurement worth
+     * drawing, while an MTTR of zero would claim every problem that day was
+     * resolved instantly on a day that had nothing to resolve. The same
+     * {@code null} appears for a populated day whose alerts are all still open.
+     * Days are the server's calendar days, at midnight in the server's zone.</p>
+     *
+     * <p><b>Channel-redacted like the aggregate reads.</b> A monitor's history
+     * looks like a property of the monitor, but every alert counted into it
+     * belongs to a channel, and a monitor scoped to a group, a tag, or all
+     * channels aggregates across channels a restricted caller may not see. Their
+     * series is therefore computed only over channels they are authorized for,
+     * the same rule {@code /dashboard/summary} applies to its own
+     * channel-attributed numbers. The monitor's existence is not hidden —
+     * monitor definitions are not channel-filtered anywhere in this contract.</p>
+     *
+     * <p>Read-only and polled by an open editor, so {@code auditable = false}
+     * like the other reads, and gated at {@link #PERMISSION_VIEW}: this is alert
+     * history, not monitor authoring.</p>
+     *
+     * @param id   database id of the monitor
+     * @param from range start as epoch millis, or null for 30 days before {@code to}
+     * @param to   range end as epoch millis, or null for now
+     * @return JSON {@code {monitorId, from, to, bucket: "DAY", truncated,
+     *         points: [{bucket, alertCount, avgResolveSeconds}]}}
+     * @throws ClientException if no monitor exists with that id, the range is
+     *                         inverted or wider than 366 days, or persistence fails
+     */
+    @GET
+    @Path("/monitors/{id}/history")
+    @Operation(summary = "Returns a monitor's daily alert count and mean time to resolve")
+    @MirthOperation(name = "sentinelGetMonitorHistory", display = "Get Sentinel monitor history", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getMonitorHistory(@Param("id") @PathParam("id") int id,
+            @Param("from") @QueryParam("from") Long from,
+            @Param("to") @QueryParam("to") Long to) throws ClientException;
 
     // ========== Actions ==========
 
@@ -511,6 +562,25 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @MirthOperation(name = "sentinelBulkAcknowledgeProblems", display = "Bulk acknowledge Sentinel problems", permission = PERMISSION_ACKNOWLEDGE, type = ExecuteType.ASYNC)
     String bulkAcknowledgeProblems(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
 
+    /**
+     * Resolves a batch of problems in one call — the resolve-side companion to
+     * {@link #bulkAcknowledgeProblems(String)}, for the sweep that follows a
+     * storm. Already-resolved and unknown ids are skipped silently. Gated at
+     * {@link #PERMISSION_ACKNOWLEDGE} like every other acknowledge/resolve
+     * operation, and like the single resolve it also resets each problem's
+     * owning trigger state so the evaluator starts the affected triggers
+     * clean.
+     *
+     * @param bodyJson JSON {@code {"ids": [1, 2, ...], "comment": "..."}}
+     * @return JSON {@code {"resolved": n}} — how many were newly resolved
+     * @throws ClientException on malformed body or persistence failure
+     */
+    @POST
+    @Path("/problems/_bulkResolve")
+    @Operation(summary = "Resolves a batch of alert events")
+    @MirthOperation(name = "sentinelBulkResolveProblems", display = "Bulk resolve Sentinel problems", permission = PERMISSION_ACKNOWLEDGE, type = ExecuteType.ASYNC)
+    String bulkResolveProblems(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
+
     // ========== Dashboard & activity ==========
 
     /**
@@ -567,6 +637,42 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String getActivitySummary(@Param("channelIds") @QueryParam("channelIds") String channelIds,
             @Param("windowSeconds") @QueryParam("windowSeconds") @DefaultValue("3600") int windowSeconds,
             @Param("buckets") @QueryParam("buckets") @DefaultValue("20") int buckets) throws ClientException;
+
+    // ========== Metrics ==========
+
+    /**
+     * Returns Sentinel's state as a Prometheus exposition document so an SRE
+     * team can scrape it into dashboards they already run, rather than
+     * Sentinel's own UI competing with them: open problems by severity,
+     * per-channel cumulative throughput, and collector/evaluator heartbeat
+     * ages.
+     *
+     * <p><b>The one non-JSON endpoint.</b> The interface-level
+     * {@code @Produces(APPLICATION_JSON)} is overridden with
+     * {@link MediaType#TEXT_PLAIN} here — Prometheus's exposition format is a
+     * line-oriented text format, not JSON, and the returned {@code String} is
+     * the document itself rather than a serialized DTO. Plain {@code
+     * text/plain} without the {@code version=0.0.4} parameter is deliberate:
+     * a parameterized media type risks JAX-RS content negotiation against a
+     * scraper's {@code Accept} header, and Prometheus already falls back to
+     * the 0.0.4 text parser when the version parameter is absent.</p>
+     *
+     * <p><b>Not auditable.</b> A scrape lands every 15 seconds forever; the
+     * default {@code auditable = true} would bury every real operator action
+     * in the System Events log under 5,760 daily reads. Gated at
+     * {@link #PERMISSION_VIEW} like the other reads, and channel-level series
+     * honor channel restrictions exactly as {@code /dashboard/summary} and
+     * {@code /problems} do.</p>
+     *
+     * @return the exposition document in Prometheus text format 0.0.4
+     * @throws ClientException on persistence failure
+     */
+    @GET
+    @Path("/metrics")
+    @Produces(MediaType.TEXT_PLAIN)
+    @Operation(summary = "Returns Sentinel metrics in Prometheus text exposition format")
+    @MirthOperation(name = "sentinelGetMetrics", display = "Get Sentinel metrics", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getMetrics() throws ClientException;
 
     // ========== Core passthrough ==========
 
@@ -657,4 +763,92 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @Operation(summary = "Updates Sentinel scheduler and retention settings")
     @MirthOperation(name = "sentinelUpdateSettings", display = "Update Sentinel settings", permission = PERMISSION_SETTINGS, type = ExecuteType.ASYNC)
     String updateSettings(@Param(value = "body", excludeFromAudit = true) String settingsJson) throws ClientException;
+
+    // ========== Export / import ==========
+
+    /**
+     * Returns every monitor, alert action, and maintenance window as one
+     * portable JSON document, so a monitor set can be promoted dev → test →
+     * prod the way channels are and kept under version control alongside the
+     * infrastructure it watches.
+     *
+     * <p>Shape: {@code {schemaVersion, exportedAt, monitors[], actions[],
+     * maintenanceWindows[]}}. The schema version and the export timestamp are
+     * present so a future import can reason about format drift rather than
+     * guessing at a document's age and vintage. Database ids and audit stamps
+     * are omitted — they are per-install facts, and the import matches on name
+     * (see {@link #importConfiguration}).</p>
+     *
+     * <p><b>Gated at {@link #PERMISSION_MANAGE}, not {@link #PERMISSION_VIEW},
+     * unlike every other read.</b> The document is the full action
+     * configuration surface in one file that leaves the server: SNS topic ARNs
+     * and regions, mail recipient lists, target channel ids, every condition
+     * row. Each of those is individually readable at View Monitoring, but
+     * handing a viewer one downloadable copy of the entire alerting
+     * configuration is a different act, and the permission that authors that
+     * configuration is the right one to gate re-materializing it elsewhere.
+     * Secrets are excluded regardless — they leave as the redaction marker,
+     * because export reads actions through the same redacting service path the
+     * other reads use.</p>
+     *
+     * <p><b>Auditable, unlike the other reads.</b> The interface-wide rule
+     * makes reads {@code auditable = false} to keep the event log
+     * signal-bearing, and this endpoint is the deliberate exception: an export
+     * happens at promotion time, not on a dashboard poll, so it adds a handful
+     * of records a year — and "who took a copy of the alerting configuration,
+     * and when" is exactly the kind of record an audit log exists for.</p>
+     *
+     * @return JSON export document
+     * @throws ClientException if the underlying persistence call fails
+     */
+    @GET
+    @Path("/export")
+    @Operation(summary = "Returns all monitors, actions, and maintenance windows as one portable JSON document")
+    @MirthOperation(name = "sentinelExportConfiguration", display = "Export Sentinel configuration", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC)
+    String exportConfiguration() throws ClientException;
+
+    /**
+     * Applies an export document to this server, or previews the application
+     * when {@code dryRun} is set.
+     *
+     * <p><b>Entities are matched by name, never by id</b>, because ids are
+     * per-install serials and a promoted document cannot mean anything by
+     * them. A name already on this server is updated; a name that is not is
+     * created; nothing is ever deleted, so an entity absent from the document
+     * is left alone. Every write goes through the same service-layer
+     * validation the editors use, so an import cannot introduce a monitor the
+     * UI would reject, and a rejected entity is reported as skipped carrying
+     * the validation message rather than failing the whole document.</p>
+     *
+     * <p><b>The dry-run and real responses have the same shape</b> —
+     * {@code {dryRun, schemaVersion, exportedAt, created, updated, skipped,
+     * entries[], secretsNotice}}, where each entry is {@code {entityType,
+     * name, outcome, reason, secretsKept[], secretsRequired[], secretsNote}} —
+     * so one client component renders the preview and the outcome.</p>
+     *
+     * <p><b>Secrets must be re-entered here.</b> The export carries them as
+     * the redaction marker, so a marker backed by a value already stored on
+     * this server is kept (reported as {@code secretsKept}) and a marker with
+     * nothing behind it is reported as {@code secretsRequired}, per action,
+     * naming the exact fields to go enter. Import never invents a credential.</p>
+     *
+     * <p>{@code dryRun} defaults to {@code true}. Query parameters are
+     * case-sensitive, so a mistyped {@code ?dryrun=true} binds nothing and
+     * falls back to the default — which must therefore be the harmless one.
+     * Applying requires saying so.</p>
+     *
+     * @param bodyJson an export document as produced by {@link #exportConfiguration()}
+     * @param dryRun   {@code true} (default) to report what would change
+     *                 without writing; {@code false} to apply
+     * @return JSON ImportResult
+     * @throws ClientException if the body is absent, is not JSON, is not an
+     *                         export document, or declares a schema version
+     *                         this server does not understand
+     */
+    @POST
+    @Path("/import")
+    @Operation(summary = "Applies an export document, matching entities by name; dry run by default")
+    @MirthOperation(name = "sentinelImportConfiguration", display = "Import Sentinel configuration", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC)
+    String importConfiguration(@Param(value = "body", excludeFromAudit = true) String bodyJson,
+            @Param("dryRun") @QueryParam("dryRun") @DefaultValue("true") boolean dryRun) throws ClientException;
 }

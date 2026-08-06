@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.UUID;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.core.Context;
@@ -34,7 +35,10 @@ import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
 import org.openintegrationengine.plugins.sentinel.server.service.DashboardService;
+import org.openintegrationengine.plugins.sentinel.server.service.ExportImportService;
 import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWindowService;
+import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
+import org.openintegrationengine.plugins.sentinel.server.service.MonitorHistoryService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorService;
 import org.openintegrationengine.plugins.sentinel.server.service.ProblemService;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
@@ -73,10 +77,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.UserInfo;
  * {@link IllegalArgumentException} and missing entities with
  * {@link NoSuchElementException}; {@link #translate} maps those to HTTP 400
  * and 404 with the human message as a plain-text entity (the web client
- * surfaces the response body as the error message), and wraps anything else
- * in a logged {@link MirthApiException} so an unexpected failure still
- * reaches the client as a structured 500 rather than a Jersey stack
- * trace.</li>
+ * surfaces the response body as the error message), and turns anything else
+ * into a 500 whose entity is nothing but a logged reference id — an
+ * unexpected failure reaches the client as a structured, actionable error
+ * without carrying its internal text along with it.</li>
  * <li><b>Channel-restriction redaction.</b> The engine only protects
  * channel-restricted users where a servlet opts in, so every endpoint that
  * exposes or mutates per-channel data enforces it here: {@code /core/channels}
@@ -85,12 +89,16 @@ import org.openintegrationengine.plugins.sentinel.shared.model.UserInfo;
  * 403, {@code /problems} + {@code /activity/summary} constrain their
  * channel filter to the caller's authorized set — including the subtle case
  * where the caller sent <i>no</i> channel filter, which must become "your
- * authorized channels", never "all channels" — {@code /dashboard/summary}
- * passes the authorized set into the dashboard build (its recent-problems
- * feed and per-channel numbers would otherwise leak what the list endpoints
- * hide), and the per-problem endpoints (get/acknowledge/resolve, plus each
- * id of a bulk acknowledge) 404 redacted problems so sequential alert ids
- * cannot be enumerated around the {@code /problems} redaction.</li>
+ * authorized channels", never "all channels" — {@code /dashboard/summary},
+ * {@code /metrics} and {@code /monitors/{id}/history} pass the authorized set
+ * into their aggregate build (their recent-problems feed, per-channel numbers,
+ * per-channel series, and per-monitor alert counts would otherwise leak what
+ * the list endpoints hide; a scrape is a read like any other, and an aggregate
+ * over channels stays an aggregate <i>of</i> those channels however few of
+ * them it names), and the per-problem endpoints (get/acknowledge/resolve, plus
+ * each id of a bulk acknowledge or bulk resolve) 404 redacted problems so
+ * sequential alert ids cannot be enumerated around the {@code /problems}
+ * redaction.</li>
  * </ol>
  */
 public class SentinelServlet extends MirthServlet implements SentinelServletInterface {
@@ -219,6 +227,32 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             return Json.write(MonitorService.test(readBody(monitorJson, Monitor.class)));
         } catch (Exception e) {
             throw translate("testMonitor", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>Delegates to
+     * {@link MonitorHistoryService#build(int, Long, Long, java.util.Set)},
+     * passing the caller's authorized channel set ({@code null} for unrestricted
+     * users) — the same argument and the same contract as
+     * {@link #getDashboardSummary()}. Every alert counted into a monitor's
+     * history belongs to a channel, and a monitor scoped to a group, a tag, or
+     * all channels aggregates across channels a restricted caller cannot see, so
+     * an unconstrained series would report daily alert volume and resolve times
+     * for exactly what {@code /problems} and the activity endpoints redact.</p>
+     *
+     * <p>Not a 403 or a 404 like the per-channel and per-problem endpoints: the
+     * monitor itself is legitimately readable (monitor definitions are not
+     * channel-filtered), so the narrowing belongs to the data rather than to the
+     * lookup.</p>
+     */
+    @Override
+    public String getMonitorHistory(int id, Long from, Long to) {
+        try {
+            return Json.write(MonitorHistoryService.build(id, from, to, authorizedChannelIds(null)));
+        } catch (Exception e) {
+            throw translate("getMonitorHistory", e);
         }
     }
 
@@ -491,22 +525,33 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     public String bulkAcknowledgeProblems(String bodyJson) {
         try {
             JsonNode root = readBodyTree(bodyJson);
-            JsonNode idsNode = root.path("ids");
-            if (!idsNode.isArray()) {
-                throw new IllegalArgumentException("Body must contain an 'ids' array");
-            }
-            List<Long> ids = new ArrayList<>();
-            for (JsonNode idNode : idsNode) {
-                if (!idNode.canConvertToLong()) {
-                    throw new IllegalArgumentException("'ids' must contain only numeric alert event ids");
-                }
-                ids.add(idNode.asLong());
-            }
-            ids = dropRedactedProblemIds(ids);
+            List<Long> ids = dropRedactedProblemIds(parseProblemIds(root));
             int acknowledged = ProblemService.bulkAcknowledge(ids, textOrNull(root, "comment"), getCurrentUserId());
             return Json.write(Map.of("acknowledged", acknowledged));
         } catch (Exception e) {
             throw translate("bulkAcknowledgeProblems", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>The exact shape of {@link #bulkAcknowledgeProblems(String)}, sharing
+     * both its body parsing and — critically — its
+     * {@link #dropRedactedProblemIds} pass. Redaction matters more here, not
+     * less: a bulk resolve closes problems <i>and</i> resets their trigger
+     * states, so an unfiltered batch would let a channel-restricted caller
+     * silence monitoring on channels they are not entrusted with, and would
+     * let the returned count reveal which of a sweep of guessed ids exist.</p>
+     */
+    @Override
+    public String bulkResolveProblems(String bodyJson) {
+        try {
+            JsonNode root = readBodyTree(bodyJson);
+            List<Long> ids = dropRedactedProblemIds(parseProblemIds(root));
+            int resolved = ProblemService.bulkResolve(ids, textOrNull(root, "comment"), getCurrentUserId());
+            return Json.write(Map.of("resolved", resolved));
+        } catch (Exception e) {
+            throw translate("bulkResolveProblems", e);
         }
     }
 
@@ -573,6 +618,30 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    // ========== Metrics ==========
+
+    /**
+     * {@inheritDoc}
+     * <p>Delegates to {@link MetricsService#render(Set)}, passing the caller's
+     * authorized channel set ({@code null} for unrestricted users) — the same
+     * argument and the same contract as {@link #getDashboardSummary()}. A
+     * scrape is a read like any other, so a channel-restricted user must not
+     * be able to recover per-channel throughput or problem counts here that
+     * {@code /problems} and the activity endpoints redact.</p>
+     *
+     * <p>The response is Prometheus text, not JSON, so it is returned as-is
+     * rather than through {@code Json.write} — see the interface method for
+     * why this one endpoint overrides the class-level {@code @Produces}.</p>
+     */
+    @Override
+    public String getMetrics() {
+        try {
+            return MetricsService.render(authorizedChannelIds(null));
+        } catch (Exception e) {
+            throw translate("getMetrics", e);
+        }
+    }
+
     // ========== Core passthrough ==========
 
     /**
@@ -605,8 +674,8 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     /**
      * {@inheritDoc}
      * <p>Delegates to {@link ScopeResolver#listGroups()}. Groups are not
-     * channel-filtered: the contract scopes redaction to the four
-     * channel-data endpoints, and group membership is needed intact for
+     * channel-filtered: the contract scopes redaction to the channel-data
+     * endpoints, and group membership is needed intact for
      * group-scope pickers to make sense.</p>
      */
     @Override
@@ -621,7 +690,7 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     /**
      * {@inheritDoc}
      * <p>Delegates to {@link ScopeResolver#listTags()}. Like groups, tags
-     * are not channel-filtered: the redaction contract covers the four
+     * are not channel-filtered: the redaction contract covers the
      * channel-data endpoints, and tag membership is needed intact for
      * tag-scope pickers to make sense.</p>
      */
@@ -687,6 +756,46 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    // ========== Export / import ==========
+
+    /**
+     * {@inheritDoc}
+     * <p>Delegates to {@link ExportImportService#export()}. No channel
+     * filtering: the document is the union of {@code /monitors},
+     * {@code /actions}, and {@code /maintenanceWindows}, none of which is
+     * channel-filtered (the redaction contract covers per-channel <i>data</i>,
+     * not the definitions that reference channels), and this endpoint sits at
+     * {@code PERMISSION_MANAGE} while those three sit at {@code
+     * PERMISSION_VIEW} — so it exposes nothing a caller reaching it cannot
+     * already read one list at a time.</p>
+     */
+    @Override
+    public String exportConfiguration() {
+        try {
+            return Json.write(ExportImportService.export());
+        } catch (Exception e) {
+            throw translate("exportConfiguration", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>Parses the body with the shared {@link #readBodyTree} helper — "a
+     * body is required" and "the body is not JSON" are wire concerns this
+     * layer owns, exactly as for the bulk endpoints — and delegates the
+     * document's own validity, the name matching, and every write to
+     * {@link ExportImportService#importDocument(JsonNode, boolean, int)}.</p>
+     */
+    @Override
+    public String importConfiguration(String bodyJson, boolean dryRun) {
+        try {
+            return Json.write(ExportImportService.importDocument(
+                    readBodyTree(bodyJson), dryRun, getCurrentUserId()));
+        } catch (Exception e) {
+            throw translate("importConfiguration", e);
+        }
+    }
+
     // ========== Boundary helpers ==========
 
     /**
@@ -694,11 +803,23 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * {@link IllegalArgumentException} (validation / bad input) → 400,
      * {@link NoSuchElementException} (missing entity) → 404, an already-built
      * {@link MirthApiException} passes through untouched (e.g. the 403 from
-     * channel redaction), and anything else is logged here — the only place
-     * with full request context — and wrapped so the client receives a
-     * structured 500 instead of a container stack trace. Returned rather than
-     * thrown so call sites read {@code throw translate(...)} and the compiler
-     * knows the catch block never falls through.
+     * channel redaction), and anything unexpected → an opaque 500. Returned
+     * rather than thrown so call sites read {@code throw translate(...)} and
+     * the compiler knows the catch block never falls through.
+     *
+     * <p><b>Why the 500 says nothing:</b> wrapping the cause
+     * ({@code new MirthApiException(e)}) serializes it to the client, and the
+     * web client digs the {@code detailMessage} out of that payload and renders
+     * it verbatim in the browser. A repository failure's cause chain carries
+     * SQL text, constraint names, and vendor error codes, so that wrapping put
+     * database internals in front of anyone holding nothing more than View
+     * Monitoring. Instead a random reference id is minted, the full cause is
+     * logged against it here — the only place with full request context — and
+     * the client is told just the id. Support correlates the browser message to
+     * the server log by that id without the caller ever learning why the call
+     * failed. The 400 and 404 messages skip this treatment because the service
+     * layer hand-writes them for the operator to read; they contain no
+     * internals by construction.</p>
      */
     private RuntimeException translate(String operationName, Exception e) {
         if (e instanceof MirthApiException) {
@@ -710,8 +831,11 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         if (e instanceof NoSuchElementException) {
             return apiError(Status.NOT_FOUND, e.getMessage());
         }
-        log.error("Sentinel operation '{}' failed unexpectedly", operationName, e);
-        return new MirthApiException(e);
+        // Operation name + ref id + full stack on one record: everything
+        // support needs to answer "what was ref 4f3c...?" from the log alone.
+        String ref = UUID.randomUUID().toString();
+        log.error("Sentinel operation '{}' failed unexpectedly (ref: {})", operationName, ref, e);
+        return apiError(Status.INTERNAL_SERVER_ERROR, "Sentinel operation failed (ref: " + ref + ")");
     }
 
     /**
@@ -754,6 +878,35 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("Invalid JSON body: " + e.getOriginalMessage(), e);
         }
+    }
+
+    /**
+     * Extracts the {@code ids} array shared by the two bulk endpoints. The
+     * shape is validated here rather than in the service because a malformed
+     * body is a wire concern (400), while what happens to a
+     * well-formed-but-uninteresting id — missing, already acknowledged,
+     * already resolved — is a business rule the service owns and answers by
+     * skipping. Kept in one place so bulk acknowledge and bulk resolve cannot
+     * drift into accepting different bodies.
+     *
+     * @param root the parsed request body
+     * @return the requested ids, in body order
+     * @throws IllegalArgumentException if {@code ids} is missing, not an
+     *                                  array, or holds a non-numeric element
+     */
+    private static List<Long> parseProblemIds(JsonNode root) {
+        JsonNode idsNode = root.path("ids");
+        if (!idsNode.isArray()) {
+            throw new IllegalArgumentException("Body must contain an 'ids' array");
+        }
+        List<Long> ids = new ArrayList<>();
+        for (JsonNode idNode : idsNode) {
+            if (!idNode.canConvertToLong()) {
+                throw new IllegalArgumentException("'ids' must contain only numeric alert event ids");
+            }
+            ids.add(idNode.asLong());
+        }
+        return ids;
     }
 
     /**

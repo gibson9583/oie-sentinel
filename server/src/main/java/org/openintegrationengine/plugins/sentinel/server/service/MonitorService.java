@@ -5,6 +5,8 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.service;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -21,9 +23,11 @@ import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.AnomalyEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ConnectionStatusEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.ErrorRateEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.InactivityEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelTestOutcome;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -43,6 +47,15 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
  * input → 400, {@link NoSuchElementException} for a missing entity → 404.</p>
  */
 public final class MonitorService {
+
+    /**
+     * Longest runbook URL accepted, matching {@code sentinel_monitor.runbook_url}'s
+     * {@code VARCHAR(1024)}. Checked here so an over-long value fails as a
+     * readable 400 rather than as a vendor-specific truncation or constraint
+     * violation from the driver — and truncation is the worse of those two,
+     * since a silently shortened URL is a link that quietly 404s at 3 a.m.
+     */
+    private static final int MAX_RUNBOOK_URL_LENGTH = 1024;
 
     private MonitorService() {
     }
@@ -218,9 +231,17 @@ public final class MonitorService {
                     case CONNECTION_STATUS:
                         for (ConnectionStatusEvaluator.ConnectorEvaluation evaluation
                                 : ConnectionStatusEvaluator.evaluate(monitor, target.channelId, now)) {
+                            // A null metadata id is the channel-level rollup
+                            // outcome. Prefixing it would both read as
+                            // "connector null" and imply a per-connector
+                            // fan-out this monitor will never produce — the
+                            // dry run has to show the same one-problem-per-
+                            // channel shape production will.
                             outcomes.add(outcome(target, evaluation.outcome.getResult().name(),
-                                    "[connector " + evaluation.metadataId + "] "
-                                            + summarize(evaluation.outcome)));
+                                    evaluation.metadataId != null
+                                            ? "[connector " + evaluation.metadataId + "] "
+                                                    + summarize(evaluation.outcome)
+                                            : summarize(evaluation.outcome)));
                         }
                         break;
                     case INACTIVITY:
@@ -231,6 +252,12 @@ public final class MonitorService {
                         break;
                     case ANOMALY:
                         addOutcome(outcomes, target, AnomalyEvaluator.evaluate(monitor, target.channelId, now));
+                        break;
+                    case ERROR_RATE:
+                        addOutcome(outcomes, target, ErrorRateEvaluator.evaluate(monitor, target.channelId, now));
+                        break;
+                    case QUEUE_DEPTH:
+                        addOutcome(outcomes, target, QueueDepthEvaluator.evaluate(monitor, target.channelId, now));
                         break;
                 }
             } catch (Exception e) {
@@ -289,9 +316,86 @@ public final class MonitorService {
         if (monitor.getMinConsecutiveBreaches() < 1) {
             monitor.setMinConsecutiveBreaches(1);
         }
+        monitor.setRunbookUrl(validateRunbookUrl(monitor.getRunbookUrl()));
         validateConfig(monitor);
         requireValidSuppression(monitor.getSuppressedByMonitorId(), selfId);
         requireUniqueName(monitor.getName(), selfId);
+    }
+
+    /**
+     * Normalizes and validates the optional runbook URL, returning the value to
+     * store: {@code null} for absent (missing, empty, or whitespace), otherwise
+     * the trimmed original.
+     *
+     * <p><b>This is a security control, not a typo check.</b> The stored value is
+     * rendered as an {@code <a href>} in the problem detail pane and travels
+     * verbatim into email bodies, SNS messages, and webhook templates. An
+     * unvalidated scheme therefore makes this column a stored-XSS vector: a
+     * monitor saved with {@code javascript:fetch('…'+document.cookie)} would
+     * become a one-click script execution in the browser of every operator who
+     * opened a problem it raised, under the permission of whoever clicked rather
+     * than whoever authored the monitor. {@code data:} URLs are the same attack
+     * with a different prefix. Rejecting at save time is the right layer: it is
+     * the one place with an operator to show the message to, and it means every
+     * consumer downstream can treat the value as a real http(s) URL without each
+     * re-deriving this rule (and eventually disagreeing about it).</p>
+     *
+     * <p>The rule is deliberately narrow — an absolute {@code http} or
+     * {@code https} URI with a host. "Absolute" excludes {@code //host/path} and
+     * {@code /wiki/runbook}, which a browser would resolve against the admin
+     * origin rather than against the operator's intent. The host requirement
+     * rejects the syntactically legal but useless {@code http:runbooks}, which
+     * parses as an opaque URI and would render as a dead link. Everything past
+     * the authority — path, query, fragment — is left exactly as typed: a
+     * runbook link commonly carries a deep-link anchor or a ticket query
+     * parameter, and normalizing those is not this method's business.</p>
+     *
+     * <p>Not checked, on purpose: whether the URL resolves, or what is behind it.
+     * The plugin never fetches this value (see {@code Monitor#getRunbookUrl}) —
+     * a save-time HTTP request would hold an admin API thread on a slow wiki and
+     * would turn the monitor editor into an SSRF primitive, which is exactly the
+     * hazard {@code WebhookTargetGuard} exists to contain for the one transport
+     * that genuinely needs to dial out.</p>
+     *
+     * @param rawUrl the operator-supplied value; may be {@code null} or blank
+     * @return the trimmed URL, or {@code null} when none was supplied
+     * @throws IllegalArgumentException if a value is present but is not an
+     *                                  absolute http/https URL with a host, or
+     *                                  is longer than the storage column
+     */
+    private static String validateRunbookUrl(String rawUrl) {
+        if (isBlank(rawUrl)) {
+            return null;
+        }
+        String url = rawUrl.trim();
+        if (url.length() > MAX_RUNBOOK_URL_LENGTH) {
+            throw new IllegalArgumentException("Runbook URL must be at most "
+                    + MAX_RUNBOOK_URL_LENGTH + " characters (got " + url.length() + ")");
+        }
+        URI uri;
+        try {
+            uri = new URI(url);
+        } catch (URISyntaxException e) {
+            // getReason() is the parser's own short diagnosis ("Illegal character
+            // in path"); the full message would repeat the whole URL back, which
+            // the operator is already looking at in the field.
+            throw new IllegalArgumentException("Runbook URL is not a valid URL"
+                    + (e.getReason() != null ? ": " + e.getReason() : ""), e);
+        }
+        if (!uri.isAbsolute()) {
+            throw new IllegalArgumentException(
+                    "Runbook URL must be absolute, starting with http:// or https://");
+        }
+        String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            throw new IllegalArgumentException("Runbook URL must use the http or https scheme; '"
+                    + scheme + ":' is not allowed because this link is opened in an operator's browser");
+        }
+        if (isBlank(uri.getHost())) {
+            throw new IllegalArgumentException("Runbook URL must include a host, "
+                    + "e.g. https://wiki.example.org/runbooks/adt-inactivity");
+        }
+        return url;
     }
 
     /**
@@ -335,7 +439,41 @@ public final class MonitorService {
             case CONNECTION_STATUS:
                 requireNonNegativeIfPresent(config, "minDurationSeconds");
                 validateAlertOnStates(config);
+                validateRollup(config);
                 break;
+            case ERROR_RATE:
+                requirePositiveIfPresent(config, "windowSeconds");
+                requirePercentIfPresent(config, "thresholdPercent");
+                requireNonNegativeIfPresent(config, "minMessages");
+                break;
+            case QUEUE_DEPTH:
+                // Non-negative, not positive: a threshold of 0 is degenerate
+                // (queue depth is never negative, so every sample breaches)
+                // but it is a coherent instruction, and rejecting it would
+                // also reject the honest "alert on anything queued at all"
+                // reading of it. Negative is the incoherent case.
+                requireNonNegativeIfPresent(config, "threshold");
+                requireNonNegativeIfPresent(config, "minDurationSeconds");
+                break;
+        }
+    }
+
+    /**
+     * Requires a present field to be a percentage in {@code [0, 100]}.
+     *
+     * <p>Rejects rather than clamps, in both directions. Above 100 the monitor
+     * would be unreachable for any channel whose errors cannot exceed its
+     * receives — a threshold that can never fire is a monitor an operator
+     * believes is protecting them. At exactly 0 it fires on every measurable
+     * window, error or not, which is the opposite failure and just as
+     * misleading, but it is a coherent instruction ("tell me about any error
+     * at all") so it stays legal; a negative percentage is not, and is the
+     * only low-end value refused here.</p>
+     */
+    private static void requirePercentIfPresent(JsonNode config, String field) {
+        Double value = numericValue(config, field);
+        if (value != null && (value < 0 || value > 100)) {
+            throw new IllegalArgumentException(field + " must be between 0 and 100");
         }
     }
 
@@ -362,6 +500,49 @@ public final class MonitorService {
                         + "' in alertOnStates");
             }
         }
+    }
+
+    /**
+     * Validates {@code rollup} against the CONNECTION_STATUS rollup enum.
+     *
+     * <p>This one rejects rather than normalizes, which is a deliberate
+     * departure from how the evaluator treats the same key. The evaluator
+     * must not abort a tick, so it degrades anything that is not
+     * {@code CHANNEL} to per-connector evaluation. That makes a typo
+     * ({@code "channell"} from a hand-edited config) silently revert a
+     * monitor to paging once per connector — the precise noise problem the
+     * operator selected {@code CHANNEL} to fix, failing in the direction
+     * where nothing looks broken until the next incident. Save time is the
+     * only place that mistake can be caught while the operator is still
+     * looking at it.</p>
+     *
+     * <p>The accepted spelling is trimmed and case-insensitive, matching the
+     * evaluator's read exactly. Accepting a form the evaluator would not
+     * honour would recreate the same silent revert one layer down.</p>
+     *
+     * <p>{@code SCOPE} is a reserved value with no implementation yet, so it
+     * gets its own message: "not a valid value" would be misleading for a
+     * name that is in the documented enum and will start working later.</p>
+     */
+    private static void validateRollup(JsonNode config) {
+        JsonNode node = config.get("rollup");
+        if (node == null || node.isNull()) {
+            return; // absent → evaluator defaults to CONNECTOR
+        }
+        String value = node.asText("").trim().toUpperCase(Locale.ROOT);
+        if (ConnectionStatusEvaluator.ROLLUP_CONNECTOR.equals(value)
+                || ConnectionStatusEvaluator.ROLLUP_CHANNEL.equals(value)) {
+            return;
+        }
+        if (ConnectionStatusEvaluator.ROLLUP_SCOPE.equals(value)) {
+            throw new IllegalArgumentException("rollup '" + ConnectionStatusEvaluator.ROLLUP_SCOPE
+                    + "' is reserved for a future release; use "
+                    + ConnectionStatusEvaluator.ROLLUP_CONNECTOR + " or "
+                    + ConnectionStatusEvaluator.ROLLUP_CHANNEL);
+        }
+        throw new IllegalArgumentException("rollup must be one of "
+                + ConnectionStatusEvaluator.ROLLUP_CONNECTOR + ", "
+                + ConnectionStatusEvaluator.ROLLUP_CHANNEL);
     }
 
     /**

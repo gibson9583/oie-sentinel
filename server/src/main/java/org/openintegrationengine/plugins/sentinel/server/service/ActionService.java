@@ -7,6 +7,7 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.NoSuchElementException;
@@ -15,27 +16,52 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
+import org.openintegrationengine.plugins.sentinel.server.alert.WebhookAlertSender;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionTestResult;
-import org.openintegrationengine.plugins.sentinel.shared.model.ActionType;
 
 /**
  * Business rules for notification-action CRUD, including the secret
- * round-trip that keeps the SNS {@code secretAccessKey} out of every read
- * path.
+ * round-trip that keeps credential-bearing config out of every read path.
  *
- * <p><b>The secret lifecycle:</b> a plaintext secret arrives exactly once —
- * in the create/update body — and is encrypted with the engine's encryptor
- * ({@link SettingsCrypto}) before it is persisted. Every read
- * ({@link #list()}, {@link #get(int)}, and the entity echoed back by
- * create/update) returns a {@linkplain #redact(Action) redacted copy} whose
- * secret is replaced by the {@link #REDACTED} marker. On update, a client
- * that never saw the plaintext simply sends the marker back, which means
- * "keep the stored secret" — so the plaintext never round-trips through the
- * browser, and the generic REST audit (which excludes bodies anyway) can
- * never capture it.</p>
+ * <p><b>The secret lifecycle:</b> the {@linkplain #secretSlots(JsonNode)
+ * sensitive config values} arrive exactly once — in the create/update body —
+ * and are persisted, with the true credentials encrypted first using the
+ * engine's encryptor ({@link SettingsCrypto}). Every read ({@link #list()},
+ * {@link #get(int)}, and the entity echoed back by create/update) returns a
+ * {@linkplain #redact(Action) redacted copy} in which each of those values is
+ * replaced by the {@link #REDACTED} marker. On update, a client that never
+ * saw the real values simply sends the marker back, which means "keep the
+ * stored value" — so nothing sensitive round-trips through the browser, and
+ * the generic REST audit (which excludes bodies anyway) can never capture
+ * it.</p>
+ *
+ * <p><b>What counts as sensitive.</b> Reads are gated at View Monitoring, the
+ * plugin's most widely granted permission, so the read path is the boundary
+ * that matters. Two families of value qualify, and both flow through the same
+ * {@linkplain SecretSlot slot} machinery rather than through parallel
+ * code paths — a second mechanism is a second place to forget a field:</p>
+ * <ul>
+ *   <li><b>The three SNS fields</b> ({@link #SNS_SECRET_FIELDS}). Only
+ *       {@code secretAccessKey} is a credential in the cryptographic sense
+ *       and only it is encrypted at rest, but {@code accessKeyId} names a
+ *       specific IAM principal and {@code assumeRoleArn} embeds the AWS
+ *       account number — infrastructure detail a read-only monitoring user
+ *       has no reason to see. {@code region} and {@code topicArn} are
+ *       deliberately <em>not</em> masked: they are not sensitive and the
+ *       editor renders them directly.</li>
+ *   <li><b>Credential-shaped WEBHOOK headers</b> — every entry of the config's
+ *       {@code headers} object whose <em>name</em> matches
+ *       {@link org.openintegrationengine.plugins.sentinel.server.alert.WebhookAlertSender#isSecretHeaderName(String)}
+ *       ({@code Authorization} and friends). Unlike the SNS fields these are
+ *       not a fixed key list — the operator names them — so the slot for a
+ *       header is discovered from the document being processed. All of them
+ *       are encrypted at rest: a webhook bearer token has no non-credential
+ *       component to preserve, so there is no reason to store one in
+ *       plaintext.</li>
+ * </ul>
  *
  * <p>Errors follow the plugin-wide convention: {@link IllegalArgumentException}
  * → 400, {@link NoSuchElementException} → 404 (mapped in the servlet).</p>
@@ -45,19 +71,35 @@ public final class ActionService {
     /**
      * The wire marker standing in for a stored secret: eight bullet
      * characters, chosen to render like a masked password field. Receiving
-     * this exact value on update means "keep the existing stored secret".
+     * this exact value on update means "keep the existing stored value".
      */
     public static final String REDACTED = "••••••••";
 
-    /** Config key holding the SNS secret inside {@code configJson}. */
-    private static final String SECRET_FIELD = "secretAccessKey";
+    /**
+     * Config key holding the SNS secret access key inside {@code configJson}
+     * — the only one of the {@link #SNS_SECRET_FIELDS} encrypted at rest, and
+     * the only one the SNS sender has to decrypt on the way out.
+     */
+    private static final String SECRET_ACCESS_KEY = "secretAccessKey";
+
+    /**
+     * Top-level config keys masked on every read and kept-on-marker on write.
+     * All three are SNS-only, so non-SNS configs simply never contain them
+     * and pass through both paths untouched — which is why the slot builder
+     * does not need to branch on action type for them.
+     */
+    private static final List<String> SNS_SECRET_FIELDS =
+            List.of("accessKeyId", SECRET_ACCESS_KEY, "assumeRoleArn");
+
+    /** Config key holding the WEBHOOK request headers object. */
+    private static final String HEADERS = "headers";
 
     private ActionService() {
     }
 
     /**
      * Lists every action as redacted copies — the grid never needs the
-     * secret, so it never receives it.
+     * credential fields, so it never receives them.
      *
      * @return redacted copies of all actions; never {@code null}
      */
@@ -88,8 +130,10 @@ public final class ActionService {
      * @param userId the acting user, stamped and audited
      * @return a redacted copy of the created action, with its generated id
      * @throws IllegalArgumentException if validation fails, including a
-     *                                  {@link #REDACTED} secret on create
-     *                                  (there is no stored secret to keep)
+     *                                  {@link #REDACTED} value in any
+     *                                  {@linkplain #secretSlots(JsonNode)
+     *                                  sensitive slot} on create (there is no
+     *                                  stored value to keep)
      */
     public static Action create(Action action, int userId) {
         prepareSecrets(action, null);
@@ -106,12 +150,14 @@ public final class ActionService {
     }
 
     /**
-     * Validates and updates an action. A {@link #REDACTED} secret in the
-     * incoming config is replaced with the stored (already encrypted) secret
-     * before validation, so editing an SNS action without re-entering its
-     * key "just works"; any other non-blank secret is treated as a new
-     * plaintext and encrypted. Creation stamps are preserved from the stored
-     * row.
+     * Validates and updates an action. Each {@link #REDACTED} value among
+     * the {@linkplain #secretSlots(JsonNode) sensitive slots} is replaced
+     * with the stored value before validation, so editing an SNS action
+     * without re-entering its key pair or role ARN — or a webhook without
+     * re-entering its {@code Authorization} header — "just works"; any other
+     * non-blank value is treated as newly supplied (and, where the slot is
+     * encrypted at rest, encrypted). Creation stamps are preserved from the
+     * stored row.
      *
      * @param id     database id of the action to update
      * @param action the new definition
@@ -151,10 +197,10 @@ public final class ActionService {
 
     /**
      * Sends a real test notification through the stored action — SMTP mail,
-     * channel dispatch, or SNS publish with a synthetic payload. The
-     * <em>unredacted</em> stored action is handed to the dispatcher: its
-     * secret is the encrypted-at-rest form, which the SNS sender decrypts
-     * just-in-time.
+     * channel dispatch, SNS publish or webhook request with a synthetic
+     * payload. The <em>unredacted</em> stored action is handed to the
+     * dispatcher: its secrets are the encrypted-at-rest form, which the SNS
+     * and webhook senders decrypt just-in-time.
      *
      * @param id database id of the action to test
      * @return the delivery outcome (success flag + human message)
@@ -165,10 +211,11 @@ public final class ActionService {
     }
 
     /**
-     * Returns a deep-enough copy of an action with any config secret
-     * replaced by {@link #REDACTED}. Always a copy — redacting the caller's
-     * instance in place would corrupt the encrypted secret of an entity
-     * that is about to be persisted or dispatched.
+     * Returns a deep-enough copy of an action with every populated
+     * {@linkplain #secretSlots(JsonNode) sensitive config value} replaced by
+     * {@link #REDACTED}. Always a copy — redacting the caller's instance in
+     * place would corrupt the encrypted secret of an entity that is about to
+     * be persisted or dispatched.
      *
      * @param action the stored action
      * @return a copy safe to serialize to any client
@@ -180,9 +227,17 @@ public final class ActionService {
         }
         try {
             JsonNode config = Json.mapper().readTree(copy.getConfigJson());
-            if (config.isObject() && config.hasNonNull(SECRET_FIELD)
-                    && !config.get(SECRET_FIELD).asText("").isBlank()) {
-                ((ObjectNode) config).put(SECRET_FIELD, REDACTED);
+            if (!config.isObject()) {
+                return copy;
+            }
+            boolean masked = false;
+            for (SecretSlot slot : secretSlots(config)) {
+                if (!slot.read(config).isBlank()) {
+                    slot.write(config, REDACTED);
+                    masked = true;
+                }
+            }
+            if (masked) {
                 copy.setConfigJson(Json.write(config));
             }
         } catch (Exception e) {
@@ -195,19 +250,122 @@ public final class ActionService {
     // ========== Secret handling ==========
 
     /**
-     * Normalizes the incoming config's secret before validation/persist:
-     * substitutes the stored secret for the {@link #REDACTED} marker on
-     * update, or encrypts a newly supplied plaintext. Runs before
-     * {@link #validate} so the STATIC-auth "secret required" check sees the
-     * post-substitution reality.
+     * One place in a config document holding a sensitive value: either a
+     * top-level field ({@code owner} null) or a field of a nested object
+     * ({@code owner} = {@link #HEADERS}). Two levels is all the shape needs
+     * and all it should have — a general JSON-pointer walker here would be
+     * more machinery than the two real cases justify.
+     *
+     * <p>{@code encrypted} says whether the value is stored as ciphertext.
+     * It is false for the SNS identifiers (an access key id and a role ARN
+     * are masked from readers but not credentials to protect at rest) and
+     * true for the SNS secret access key and every webhook secret header.</p>
+     */
+    private static final class SecretSlot {
+
+        private final String owner;
+        private final String field;
+        private final boolean encrypted;
+
+        private SecretSlot(String owner, String field, boolean encrypted) {
+            this.owner = owner;
+            this.field = field;
+            this.encrypted = encrypted;
+        }
+
+        /** The object actually holding the field, or {@code null} if absent from this document. */
+        private ObjectNode container(JsonNode config) {
+            if (owner == null) {
+                return config.isObject() ? (ObjectNode) config : null;
+            }
+            JsonNode nested = config.get(owner);
+            return nested != null && nested.isObject() ? (ObjectNode) nested : null;
+        }
+
+        /** The stored value, or {@code ""} when the slot is absent/null/blank. */
+        private String read(JsonNode config) {
+            ObjectNode container = container(config);
+            if (container == null || !container.hasNonNull(field)) {
+                return "";
+            }
+            return container.get(field).asText("");
+        }
+
+        /** Replaces the value in place; a no-op when the slot's container is absent. */
+        private void write(JsonNode config, String value) {
+            ObjectNode container = container(config);
+            if (container != null) {
+                container.put(field, value);
+            }
+        }
+    }
+
+    /**
+     * Every sensitive slot in one config document.
+     *
+     * <p>Derived from the document rather than from the action type on
+     * purpose. The SNS keys appear in no other transport's config, so
+     * scanning for them unconditionally is free and — more importantly —
+     * keeps redaction working for a row whose {@code action_type} is null or
+     * unrecognized, which is exactly the row a leak would hide behind. The
+     * webhook header slots <em>have</em> to be discovered this way regardless:
+     * their names are chosen by the operator, so there is no fixed list to
+     * consult.</p>
+     *
+     * <p>Header secrecy is decided by
+     * {@link org.openintegrationengine.plugins.sentinel.server.alert.WebhookAlertSender#isSecretHeaderName(String)}
+     * rather than by a copy of the pattern here, so the sender's just-in-time
+     * decrypt and this redaction can never disagree about which headers are
+     * ciphertext.</p>
+     *
+     * @param config a config document already known to be a JSON object
+     * @return the slots present in this document; never {@code null}
+     */
+    private static List<SecretSlot> secretSlots(JsonNode config) {
+        List<SecretSlot> slots = new ArrayList<>();
+        for (String field : SNS_SECRET_FIELDS) {
+            slots.add(new SecretSlot(null, field, SECRET_ACCESS_KEY.equals(field)));
+        }
+        JsonNode headers = config.get(HEADERS);
+        if (headers != null && headers.isObject()) {
+            Iterator<String> names = headers.fieldNames();
+            while (names.hasNext()) {
+                String name = names.next();
+                if (WebhookAlertSender.isSecretHeaderName(name)) {
+                    slots.add(new SecretSlot(HEADERS, name, true));
+                }
+            }
+        }
+        return slots;
+    }
+
+    /**
+     * Normalizes the incoming config's {@linkplain #secretSlots(JsonNode)
+     * sensitive slots} before validation/persist: each one that still carries
+     * the {@link #REDACTED} marker is swapped for the stored value (the exact
+     * inverse of {@link #redact(Action)}, which is what makes a GET → PUT
+     * round trip lossless), and every newly supplied value in an
+     * {@linkplain SecretSlot#encrypted encrypted} slot is encrypted. Newly
+     * supplied values in the other slots — the SNS access key id and role ARN
+     * — are persisted verbatim.
+     *
+     * <p>Because slots are matched by position in the document, renaming a
+     * secret header while leaving its value as the marker is correctly
+     * rejected: there is no stored value at the new name to keep, and
+     * silently carrying the old header's token onto a differently-named
+     * header would be worse than an error message.</p>
+     *
+     * <p>Runs before {@link #validate} so the per-type "required field"
+     * checks see the post-substitution reality.</p>
      *
      * @param action   the incoming definition (its {@code configJson} is
      *                 rewritten in place)
      * @param existing the stored action on update, {@code null} on create
+     * @throws IllegalArgumentException if a slot carries the marker but has
+     *                                  no stored value behind it
      */
     private static void prepareSecrets(Action action, Action existing) {
-        if (action == null || action.getActionType() != ActionType.SNS
-                || action.getConfigJson() == null || action.getConfigJson().isBlank()) {
+        if (action == null || action.getConfigJson() == null || action.getConfigJson().isBlank()) {
             return;
         }
         JsonNode config;
@@ -219,39 +377,49 @@ public final class ActionService {
         if (!config.isObject()) {
             return; // likewise rejected by validate()
         }
-        String secret = config.hasNonNull(SECRET_FIELD) ? config.get(SECRET_FIELD).asText("") : "";
-        if (secret.isBlank()) {
-            return;
-        }
 
-        if (REDACTED.equals(secret)) {
-            String stored = storedSecret(existing);
-            if (stored == null) {
-                throw new IllegalArgumentException(
-                        "secretAccessKey is the redaction marker but there is no stored secret to keep");
+        JsonNode storedConfig = storedConfig(existing);
+        boolean rewritten = false;
+        for (SecretSlot slot : secretSlots(config)) {
+            String incoming = slot.read(config);
+            if (incoming.isBlank()) {
+                continue;
             }
-            ((ObjectNode) config).put(SECRET_FIELD, stored);
-        } else {
-            ((ObjectNode) config).put(SECRET_FIELD, SettingsCrypto.encrypt(secret));
+            if (REDACTED.equals(incoming)) {
+                String stored = storedConfig == null ? "" : slot.read(storedConfig);
+                if (stored.isBlank()) {
+                    throw new IllegalArgumentException(slot.field
+                            + " is the redaction marker but there is no stored value to keep");
+                }
+                slot.write(config, stored);
+                rewritten = true;
+            } else if (slot.encrypted) {
+                slot.write(config, SettingsCrypto.encrypt(incoming));
+                rewritten = true;
+            }
+            // Any other newly supplied value is persisted verbatim.
         }
-        action.setConfigJson(Json.write(config));
+        if (rewritten) {
+            action.setConfigJson(Json.write(config));
+        }
     }
 
-    /** Extracts the stored (encrypted) secret from an existing action's config, or {@code null}. */
-    private static String storedSecret(Action existing) {
+    /**
+     * The existing action's stored config as a JSON object — the source of
+     * the "keep the stored value" side of the marker round trip — or
+     * {@code null} on create and for an unparsable stored document (treated
+     * as "nothing stored to keep").
+     */
+    private static JsonNode storedConfig(Action existing) {
         if (existing == null || existing.getConfigJson() == null || existing.getConfigJson().isBlank()) {
             return null;
         }
         try {
             JsonNode config = Json.mapper().readTree(existing.getConfigJson());
-            if (config.isObject() && config.hasNonNull(SECRET_FIELD)) {
-                String stored = config.get(SECRET_FIELD).asText("");
-                return stored.isBlank() ? null : stored;
-            }
+            return config.isObject() ? config : null;
         } catch (Exception e) {
-            // treat unparsable stored config as "no stored secret"
+            return null;
         }
-        return null;
     }
 
     // ========== Validation ==========
@@ -336,6 +504,15 @@ public final class ActionService {
                 requireField(config, "topicArn", "SNS actions require a 'topicArn'");
                 validateSnsAuth(config);
                 break;
+            case WEBHOOK:
+                // Delegated rather than reimplemented here: the URL scheme
+                // rules, the allowed verbs, the timeout bounds and the legal
+                // header names are all properties of the transport, and a
+                // second copy in this class is a second thing to forget when
+                // one of them changes. It throws IllegalArgumentException, so
+                // it maps to a 400 exactly like the checks above.
+                WebhookAlertSender.validateConfig(action.getName(), config);
+                break;
         }
     }
 
@@ -355,7 +532,7 @@ public final class ActionService {
                 break;
             case "STATIC":
                 requireField(config, "accessKeyId", "SNS STATIC auth requires an 'accessKeyId'");
-                requireField(config, SECRET_FIELD, "SNS STATIC auth requires a 'secretAccessKey'");
+                requireField(config, SECRET_ACCESS_KEY, "SNS STATIC auth requires a 'secretAccessKey'");
                 break;
             case "ROLE":
                 requireField(config, "assumeRoleArn", "SNS ROLE auth requires an 'assumeRoleArn'");
