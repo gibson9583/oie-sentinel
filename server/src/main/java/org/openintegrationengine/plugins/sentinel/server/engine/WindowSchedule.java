@@ -5,6 +5,7 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
+import java.time.DateTimeException;
 import java.time.DayOfWeek;
 import java.time.Instant;
 import java.time.LocalTime;
@@ -14,6 +15,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,10 +26,14 @@ import org.openintegrationengine.plugins.sentinel.shared.model.WindowRepeat;
 /**
  * The "is this window active right now" schedule math, shared by the
  * evaluator's suppression check and the service layer's {@code activeNow}
- * stamping. Recurring windows are evaluated on the <em>server's</em> local
- * clock ({@link ZoneId#systemDefault()}) — the same clock an operator setting
- * "business hours" schedules reasons about — while one-time windows compare
- * absolute instants.
+ * stamping. Recurring windows are evaluated on the clock of the window's own
+ * {@link MaintenanceWindow#getTimezone()} — so a 22:00–06:00 schedule stays
+ * eight hours across both DST transitions in the zone the on-call rotation
+ * lives in, rather than becoming 23 or 25 because the server sits elsewhere —
+ * falling back to the <em>server's</em> zone ({@link ZoneId#systemDefault()})
+ * when the window carries none, which is what every row written before schema
+ * v3 carries. One-time windows compare absolute instants and need no zone at
+ * all.
  *
  * <p>{@link #isActiveNow} returns a nullable {@link Boolean} on purpose:
  * {@code null} means the stored schedule is malformed (unparseable days or
@@ -44,6 +50,20 @@ public final class WindowSchedule {
     private static final Logger log = LoggerFactory.getLogger(WindowSchedule.class);
     private static final DateTimeFormatter HH_MM = DateTimeFormatter.ofPattern("HH:mm");
 
+    /**
+     * Ids of windows whose stored timezone failed to parse and have already
+     * been warned about. {@link #isActiveNow} runs on every evaluation tick
+     * for every enabled window, so an unguarded warn would emit thousands of
+     * identical lines an hour and bury everything else in the log; one line
+     * per window per JVM start is enough to get the row fixed. Concurrent set
+     * because the evaluator thread and servlet request threads both land here.
+     * Unbounded in principle, bounded in practice by the number of windows.
+     */
+    private static final Set<Integer> WARNED_BAD_TIMEZONE_WINDOW_IDS = ConcurrentHashMap.newKeySet();
+
+    /** Stand-in key for an unsaved window (null id) in {@link #WARNED_BAD_TIMEZONE_WINDOW_IDS}. */
+    private static final Integer UNSAVED_WINDOW_KEY = Integer.valueOf(-1);
+
     private WindowSchedule() {
     }
 
@@ -53,7 +73,8 @@ public final class WindowSchedule {
      * bounds apply to every repeat type (for one-time windows they ARE the
      * schedule; for recurring windows they are optional outer bounds, null =
      * unbounded). Recurring windows then match their day set and daily
-     * start/end times; an end time at or before the start wraps past
+     * start/end times <em>on the window's own timezone</em> (see
+     * {@link #resolveZone}); an end time at or before the start wraps past
      * midnight, attributed to the start day — a MONDAY 22:00–06:00 window is
      * active Tuesday 05:00.
      *
@@ -94,7 +115,7 @@ public final class WindowSchedule {
             return null;
         }
 
-        ZonedDateTime local = now.atZone(ZoneId.systemDefault());
+        ZonedDateTime local = now.atZone(resolveZone(window));
         LocalTime time = local.toLocalTime();
         boolean overnight = !end.isAfter(start);
 
@@ -124,6 +145,41 @@ public final class WindowSchedule {
         }
         return (days.contains(local.getDayOfMonth()) && !time.isBefore(start))
                 || (days.contains(local.minusDays(1).getDayOfMonth()) && time.isBefore(end));
+    }
+
+    /**
+     * The zone a recurring window's daily times and day set are read on:
+     * the window's stored {@code timezone}, or {@link ZoneId#systemDefault()}
+     * when it is absent (every pre-v3 row) or unparseable.
+     *
+     * <p>Falling back rather than failing is deliberate and matches the rest
+     * of this class's drift handling: a bad zone id is a broken row, and the
+     * server's zone is the behavior that row had before v3 existed — much
+     * safer than treating the whole window as malformed and handing the
+     * caller a {@code null} that, for an ACTIVE alerting schedule, mutes
+     * every channel it covers. The bad value is warned about exactly once per
+     * window per JVM start (see
+     * {@link #WARNED_BAD_TIMEZONE_WINDOW_IDS}).</p>
+     *
+     * @param window the window whose zone to resolve
+     * @return a usable zone; never {@code null}
+     */
+    private static ZoneId resolveZone(MaintenanceWindow window) {
+        String zone = window.getTimezone();
+        if (zone == null || zone.isBlank()) {
+            return ZoneId.systemDefault();
+        }
+        try {
+            return ZoneId.of(zone.trim());
+        } catch (DateTimeException e) {
+            Integer key = window.getId() != null ? window.getId() : UNSAVED_WINDOW_KEY;
+            if (WARNED_BAD_TIMEZONE_WINDOW_IDS.add(key)) {
+                log.warn("Window {} has an unparseable timezone ('{}'); evaluating its schedule on the "
+                        + "server zone {} instead (this warning is logged once per window per start)",
+                        window.getId(), zone, ZoneId.systemDefault());
+            }
+            return ZoneId.systemDefault();
+        }
     }
 
     /**

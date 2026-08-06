@@ -107,6 +107,15 @@ public final class BaselineResolver {
      * Sunday where the server (and its message sources) live, not UTC.
      * Weekend = Saturday/Sunday.</p>
      *
+     * <p>This stays on the server zone deliberately, and the asymmetry with
+     * maintenance windows (which carry their own {@code timezone} as of
+     * schema v3) is not an oversight: a window is an operator-facing schedule
+     * someone reads off a rota, so it has to run on that rota's clock, while a
+     * baseline is a statistical grouping — it only needs a consistent notion
+     * of "the same hour last week", and any fixed zone gives it one. A
+     * per-monitor baseline zone would add configuration surface for no
+     * behavioral gain.</p>
+     *
      * @param channelId          the OIE channel id (a UUID string) whose
      *                           trend history is consulted
      * @param referenceHourStart start of the hour bucket being evaluated;

@@ -40,6 +40,16 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * most sites, and offset from the engine's own Data Pruner default so the
  * two bulk-delete jobs don't contend for the database at the same moment.</p>
  *
+ * <p>Leadership-gated, like the collector and the rollup: every node of a
+ * multi-node engine fires this cron, and only the holder of the Sentinel
+ * leader lease runs it. Two nodes pruning together would be correct — the
+ * cutoffs only move forward, so the second run finds nothing — but they would
+ * be issuing overlapping bulk deletes over the same rows at 03:30, which is
+ * the one time of night this job is trying to keep off the database's back.
+ * A night on which the leader is down is simply covered by the next
+ * night's run, since the cutoffs are recomputed from {@code now} each
+ * time.</p>
+ *
  * <p>{@code @DisallowConcurrentExecution} for consistency with the interval
  * jobs: a prune that runs long must never overlap a second bulk delete over
  * the same rows.</p>
@@ -50,12 +60,16 @@ public class RetentionPruneJob implements Job {
     private static final Logger log = LoggerFactory.getLogger(RetentionPruneJob.class);
 
     /**
-     * Runs one prune pass. Never throws — the schedule must survive a bad
+     * Runs one prune pass, unless another node holds the Sentinel leader lease
+     * (see class Javadoc). Never throws — the schedule must survive a bad
      * night (transient DB outage); rows that escape tonight's prune are
      * caught by tomorrow's, since the cutoffs only move forward.
      */
     @Override
     public void execute(JobExecutionContext context) {
+        if (!SentinelLeadership.isLeader()) {
+            return;
+        }
         try {
             SentinelSettings settings = SettingsService.get();
             Instant now = Instant.now();

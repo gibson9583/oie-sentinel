@@ -45,6 +45,15 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * final partial bucket — acceptable, since its monitors and charts are gone
  * with it.</p>
  *
+ * <p>Leadership-gated, like the collector: every node of a multi-node engine
+ * fires this cron, and only the holder of the Sentinel leader lease runs it.
+ * The replacement write is idempotent, so a second node's run would not
+ * duplicate buckets — but it would have both nodes deleting and re-inserting
+ * the same rows at the same instant, which is contention and lock waiting on
+ * the engine's operational database for no gain. Which node rolls the hour up
+ * does not matter: the samples being folded are already in the database,
+ * whoever wrote them.</p>
+ *
  * <p>{@code @DisallowConcurrentExecution} for consistency with the interval
  * jobs: a rollup stalled past the next cron fire would otherwise run its
  * delete-then-insert replacement concurrently with itself.</p>
@@ -55,13 +64,17 @@ public class ActivityRollupJob implements Job {
     private static final Logger log = LoggerFactory.getLogger(ActivityRollupJob.class);
 
     /**
-     * Rolls up the previous completed hour for every channel. Never throws —
+     * Rolls up the previous completed hour for every channel, unless another
+     * node holds the Sentinel leader lease (see class Javadoc). Never throws —
      * the schedule must keep firing (see collector job for the rationale);
      * a failed hour is recoverable because a later manual replay of
      * {@code replaceActivityTrendForHour} is idempotent.
      */
     @Override
     public void execute(JobExecutionContext context) {
+        if (!SentinelLeadership.isLeader()) {
+            return;
+        }
         try {
             // Hour bucket = the previous completed hour, truncated on the
             // Instant (UTC-aligned). This MUST match how the evaluators

@@ -42,6 +42,17 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * tick overlapping the collector and a cron job, without ever competing
  * with message processing for more threads.</p>
  *
+ * <p>Multi-node engines: every node builds this same scheduler and fires its
+ * own ticks. Exclusivity is enforced one level down, by the
+ * {@link SentinelLeadership} check each job body opens with, so a non-leader
+ * node ticks and returns immediately. That is deliberate — the alternative,
+ * a clustered Quartz {@code JDBCJobStore}, would couple Sentinel's scheduling
+ * to the engine's database configuration (Quartz's own DDL, per-vendor
+ * delegate classes, cluster clock requirements) to buy an exclusivity that a
+ * single lease row already provides. Note the corollary: the scheduler knows
+ * nothing about leadership, so nothing here changes when it moves — the
+ * triggers keep firing on every node either way.</p>
+ *
  * <p>Stateful singleton (like {@link CollectorState}) because the scheduler
  * handle must be shared between the plugin lifecycle
  * ({@code SentinelServicePlugin.start()/stop()}) and the settings service,
