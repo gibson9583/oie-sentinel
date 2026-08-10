@@ -172,7 +172,8 @@ public class TriggerEvaluatorJob implements Job {
      * its correct order and only the cycle members are appended in natural
      * order with a warning.
      */
-    private static List<Monitor> orderByDependency(List<Monitor> monitors) {
+    // Package-private (not private) purely so tests can exercise the ordering rule directly.
+    static List<Monitor> orderByDependency(List<Monitor> monitors) {
         Map<Integer, Monitor> byId = new HashMap<>();
         for (Monitor monitor : monitors) {
             byId.put(monitor.getId(), monitor);

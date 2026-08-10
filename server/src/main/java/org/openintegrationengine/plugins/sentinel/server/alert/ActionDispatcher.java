@@ -399,7 +399,8 @@ public final class ActionDispatcher {
      * matters twice over: an escaping {@link Throwable} would kill the pool
      * worker as well as losing the check.
      */
-    private static void runRepeatCheck(AlertEvent event, AlertPayload payload) {
+    // Package-private (not private) purely so tests can drive the check synchronously.
+    static void runRepeatCheck(AlertEvent event, AlertPayload payload) {
         try {
             if (event == null || event.getId() == null) {
                 log.warn("Repeat check invoked without a persisted alert event; ignoring");
