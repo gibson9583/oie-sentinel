@@ -329,6 +329,28 @@ public final class ActivityRepository {
     }
 
     /**
+     * Returns the hour bucket of the most recent trend row across all
+     * channels, or {@code null} when the trend table is empty. This is the
+     * rollup job's resume point: each run rolls forward from the hour after
+     * the last bucket any leader wrote, so hours missed to a restart,
+     * failover or thread-starved trigger are backfilled instead of skipped.
+     *
+     * @return the latest {@code hour_bucket}, or {@code null} when no trend
+     *         rows exist
+     * @throws RepositoryException on persistence failure
+     */
+    public static Instant getLatestTrendHourBucket() {
+        try {
+            Timestamp latest = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectOne(stmt("getLatestTrendHourBucket"));
+            return latest != null ? latest.toInstant() : null;
+        } catch (Exception e) {
+            log.error("Failed to read the latest activity trend hour bucket", e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
      * Deletes trend buckets older than a cutoff.
      *
      * <p>Chunked like the raw-sample prune ({@link ChunkedDelete}). Smaller

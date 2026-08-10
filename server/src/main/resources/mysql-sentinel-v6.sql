@@ -1,0 +1,1 @@
+CREATE INDEX idx_sentinel_connector_status_time ON sentinel_connector_status_event (changed_time)

@@ -555,6 +555,10 @@
         )
     </delete>
 
+    <select id="getLatestTrendHourBucket" resultType="java.sql.Timestamp">
+        SELECT MAX(hour_bucket) FROM sentinel_channel_activity_trend
+    </select>
+
     <!-- ========== CONNECTOR_STATUS_EVENT (sentinel_connector_status_event) ========== -->
 
     <insert id="insertConnectorStatusEvent" parameterType="map">
@@ -578,6 +582,15 @@
         WHERE channel_id = #{channelId} AND changed_time &gt;= #{from} AND changed_time &lt;= #{to}
         ORDER BY changed_time
     </select>
+
+    <delete id="deleteConnectorStatusEventsOlderThan" parameterType="map">
+        DELETE FROM sentinel_connector_status_event
+        WHERE id IN (
+            SELECT id FROM sentinel_connector_status_event
+            WHERE changed_time &lt; #{cutoff}
+            FETCH FIRST ${chunkSize} ROWS ONLY
+        )
+    </delete>
 
     <!-- ========== ACTION (sentinel_action) ========== -->
 

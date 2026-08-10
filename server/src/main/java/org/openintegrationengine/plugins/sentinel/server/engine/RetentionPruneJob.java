@@ -16,14 +16,23 @@ import org.slf4j.LoggerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 /**
- * Daily retention pruning: keeps the three unbounded-growth Sentinel tables
- * (raw activity samples, hourly trend buckets, resolved alert history)
- * within the operator-configured retention windows. Without this job a busy
- * server accretes a sample row per channel every collector tick forever.
+ * Daily retention pruning: keeps the four unbounded-growth Sentinel tables
+ * (raw activity samples, hourly trend buckets, resolved alert history, and
+ * connector status transitions) within the operator-configured retention
+ * windows. Without this job a busy server accretes a sample row per channel
+ * every collector tick — and a status row per connector transition —
+ * forever.
+ *
+ * <p>Connector status events share {@code sampleRetentionDays} rather than
+ * getting a knob of their own: nothing in the plugin reads them back (the
+ * CONNECTION_STATUS evaluator works from in-memory collector state), so the
+ * rows only serve ad-hoc operator diagnosis, the same freshness class as the
+ * raw samples they sit beside.</p>
  *
  * <p>Retention values are re-read from {@link SettingsService} on every run
  * rather than captured at schedule time, so a settings change takes effect
@@ -83,14 +92,18 @@ public class RetentionPruneJob implements Job {
             Instant alertCutoff = now.minus(Duration.ofDays(settings.getResolvedAlertRetentionDays()));
             int alertsDeleted = AlertEventRepository.deleteResolvedAlertEventsOlderThan(alertCutoff);
 
+            int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff);
+
             // Counts at info: pruning is destructive, so the log should
             // always answer "what did last night's run delete" without the
             // operator having to enable debug logging first.
             log.info("Retention prune complete: {} activity sample(s) older than {}d, "
-                            + "{} trend bucket(s) older than {}d, {} resolved alert(s) older than {}d",
+                            + "{} trend bucket(s) older than {}d, {} resolved alert(s) older than {}d, "
+                            + "{} connector status event(s) older than {}d",
                     samplesDeleted, settings.getSampleRetentionDays(),
                     trendsDeleted, settings.getTrendRetentionDays(),
-                    alertsDeleted, settings.getResolvedAlertRetentionDays());
+                    alertsDeleted, settings.getResolvedAlertRetentionDays(),
+                    statusDeleted, settings.getSampleRetentionDays());
         } catch (Throwable t) {
             log.error("Retention prune run failed", t);
         }

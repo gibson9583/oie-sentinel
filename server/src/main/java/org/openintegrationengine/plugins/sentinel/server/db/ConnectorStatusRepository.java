@@ -99,6 +99,20 @@ public final class ConnectorStatusRepository {
     }
 
     /**
+     * Deletes connector status events older than a cutoff, in chunks (see
+     * {@link ChunkedDelete}). This table gains a row on every connector
+     * state transition — a flapping connector writes tens of thousands a day
+     * — so the nightly prune covers it like the other growth tables.
+     *
+     * @param cutoff rows with {@code changed_time} before this are removed
+     * @return the number of rows deleted across all passes
+     * @throws RepositoryException on persistence failure
+     */
+    public static int deleteConnectorStatusEventsOlderThan(Instant cutoff) {
+        return ChunkedDelete.run(stmt("deleteConnectorStatusEventsOlderThan"), cutoff, "connector status events");
+    }
+
+    /**
      * Lists connector status events for a channel within a time range,
      * ordered by {@code changed_time}.
      *

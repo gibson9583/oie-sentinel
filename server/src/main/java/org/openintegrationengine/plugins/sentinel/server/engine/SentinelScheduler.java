@@ -38,9 +38,13 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * Sentinel follows suit with instance name "SentinelScheduler", the default
  * in-memory RAMJobStore (job state is rebuilt from settings at every plugin
  * start, so persistence would only preserve stale schedules), and a small
- * fixed thread pool of 3 — enough for the worst case of a slow evaluator
- * tick overlapping the collector and a cron job, without ever competing
- * with message processing for more threads.</p>
+ * fixed thread pool of 4 — one per job, because the worst case is real: a
+ * long retention prune (chunked delete after an operator lowers retention)
+ * still running at :05 while the collector and a slow evaluator tick are
+ * both busy would otherwise leave no thread for the rollup trigger, and a
+ * missed rollup fire is the exact gap the backfill exists to cover. Four
+ * threads means no Sentinel job can starve another, without ever competing
+ * with message processing for more.</p>
  *
  * <p>Multi-node engines: every node builds this same scheduler and fires its
  * own ticks. Exclusivity is enforced one level down, by the
@@ -68,9 +72,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * catch-up ticks — a burst of collector ticks would write near-zero-delta
  * samples that distort volume baselines. The cron triggers use
  * {@code withMisfireHandlingInstructionDoNothing} for the same reason:
- * a missed rollup hour is recovered naturally (the rollup is idempotent and
- * the raw samples outlive it by days), and a missed prune night is covered
- * by the next night's run.</p>
+ * a missed rollup hour is backfilled by the next run's resume-from-latest-
+ * bucket scan (see {@link ActivityRollupJob}), and a missed prune night is
+ * covered by the next night's run.</p>
  */
 public final class SentinelScheduler {
 
@@ -130,7 +134,7 @@ public final class SentinelScheduler {
         try {
             Properties properties = new Properties();
             properties.setProperty("org.quartz.scheduler.instanceName", "SentinelScheduler");
-            properties.setProperty("org.quartz.threadPool.threadCount", "3");
+            properties.setProperty("org.quartz.threadPool.threadCount", "4");
             properties.setProperty("org.quartz.scheduler.skipUpdateCheck", "true");
 
             StdSchedulerFactory factory = new StdSchedulerFactory();
@@ -253,7 +257,7 @@ public final class SentinelScheduler {
                 .build();
     }
 
-    /** Builds a cron trigger with the do-nothing misfire policy (missed runs are recovered naturally). */
+    /** Builds a cron trigger with the do-nothing misfire policy (missed runs are backfilled or re-covered by the next run). */
     private static Trigger cronTrigger(String name, JobDetail job, String cronExpression) {
         return TriggerBuilder.newTrigger()
                 .withIdentity(name, GROUP)

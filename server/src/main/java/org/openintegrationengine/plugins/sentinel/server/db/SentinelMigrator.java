@@ -84,6 +84,12 @@ import org.slf4j.LoggerFactory;
  *       {@code idx_sentinel_activity_trend_hour} and
  *       {@code idx_sentinel_alert_event_resolved (status, resolved_time)}.
  *       Index-only, so nothing about existing rows changes.</li>
+ *   <li><b>6</b> — Connector-status prune index. v5 covered the three tables
+ *       the nightly prune deleted from at the time; the prune now also covers
+ *       {@code sentinel_connector_status_event}, whose only index leads with
+ *       {@code channel_id} and cannot serve a bare {@code changed_time}
+ *       cutoff. Adds {@code idx_sentinel_connector_status_time
+ *       (changed_time)}. Index-only, like v5.</li>
  * </ul>
  *
  * <h3>Backfill</h3>
@@ -100,7 +106,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 5;
+    public static final int LATEST_VERSION = 6;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -147,6 +153,9 @@ public class SentinelMigrator extends Migrator {
         if (current < 5) {
             applyV5();
         }
+        if (current < 6) {
+            applyV6();
+        }
         writeSchemaVersion(LATEST_VERSION);
         log.info("Sentinel schema at version {}", LATEST_VERSION);
     }
@@ -159,7 +168,8 @@ public class SentinelMigrator extends Migrator {
      * @return the detected current version (0 = fresh install, 1 = all nine
      *         tables present, 2 = window mode/recurrence columns present,
      *         3 = window timezone column present, 4 = monitor runbook column
-     *         present, 5 = retention-prune indexes present)
+     *         present, 5 = retention-prune indexes present, 6 =
+     *         connector-status prune index present)
      */
     private int detectAndAlignSchemaVersion() throws MigrationException {
         int detected = detectFromState();
@@ -218,8 +228,12 @@ public class SentinelMigrator extends Migrator {
             // it would report a v4 that stopped halfway as a v3 and re-run the ALTERs,
             // which fail on the columns that already exist. Probing the first statement's
             // column keeps "detected version" monotonic with script progress.
-            // v5 adds no columns, only indexes, so it is index-detected — on the FIRST
-            // index its script creates, for the same monotonicity reason as v4's column.
+            // v5 and v6 add no columns, only indexes, so they are index-detected — on
+            // the FIRST index each script creates, for the same monotonicity reason as
+            // v4's column. v6 is a single statement, so it cannot be partial.
+            if (indexExists("sentinel_connector_status_event", "idx_sentinel_connector_status_time")) {
+                return 6;
+            }
             if (indexExists("sentinel_channel_activity_sample", "idx_sentinel_activity_sample_time")) {
                 return 5;
             }
@@ -250,6 +264,12 @@ public class SentinelMigrator extends Migrator {
     private void applyV5() throws MigrationException {
         log.info("Applying Sentinel schema v5 (retention prune indexes)");
         executeScript("/" + getDatabaseType() + "-sentinel-v5.sql");
+    }
+
+    /** Creates the connector-status prune index (see class Javadoc). */
+    private void applyV6() throws MigrationException {
+        log.info("Applying Sentinel schema v6 (connector-status prune index)");
+        executeScript("/" + getDatabaseType() + "-sentinel-v6.sql");
     }
 
     /** Adds the maintenance-window mode/recurrence columns (see class Javadoc). */
