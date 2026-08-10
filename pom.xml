@@ -14,8 +14,16 @@
     <packaging>pom</packaging>
 
     <properties>
-        <revision>1.0.0</revision>
+        <revision>1.0.1</revision>
 
+        <!-- The engine's compatibility check (ExtensionLoader.isExtensionCompatible)
+             splits plugin.xml's <mirthVersion> on commas and compares each entry to
+             the server version by EXACT string equality — there is no "4.6.0 and
+             newer" semantics. This property is therefore the definitive list of
+             engine versions the plugin will load on. After verifying a new engine
+             release (build against its jars, run the engine-jar drift guard, smoke
+             test), append it here: e.g. 4.6.0,4.6.1. Keep oie.json's
+             min/maxEngineVersion and the README compatibility line in step. -->
         <plugin.supported.mc.versions>${mc.version}</plugin.supported.mc.versions>
 
         <mc.version>4.6.0</mc.version>

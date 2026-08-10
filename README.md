@@ -107,8 +107,9 @@ a day but only 24 hourly ones. A year of history for 200 channels is about 1.75 
 ### Pruning
 
 A nightly job at 03:30 (leadership-gated, so one node in a cluster) removes raw samples, hourly
-buckets and resolved alerts past their retention. Open problems are never pruned regardless of age,
-and dispatch history follows its alert out by cascade. Retention values are re-read on every run, so
+buckets, resolved alerts and connector status transitions past their retention (connector status
+events share the raw-sample retention). Open problems are never pruned regardless of age, and
+dispatch history follows its alert out by cascade. Retention values are re-read on every run, so
 a settings change takes effect that night with no restart.
 
 Deletes run in bounded passes of 5,000 rows rather than one statement, each its own transaction.
@@ -128,7 +129,9 @@ next night.
 
 ## Requirements
 
-- OIE engine **4.6.0+** (`minEngineVersion` in `oie.json`)
+- OIE engine **4.6.0** — the engine loads a plugin only on the exact versions listed in its
+  descriptor, so each new engine release needs a Sentinel release that has been verified against
+  it (see `plugin.supported.mc.versions` in `pom.xml`)
 - [oie-web-client](https://github.com/gibson9583/oie-web-client) (OIE Web Administrator) to host
   the dashboard UI
 - Server restart after install/upgrade
@@ -237,7 +240,7 @@ oie-sentinel/
 ## Releasing
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.1 && git push origin v1.0.1
 ```
 
 The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
