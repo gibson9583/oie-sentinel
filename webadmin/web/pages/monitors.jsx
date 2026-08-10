@@ -402,7 +402,7 @@ function ConfigFields({ type, cfg, setCfg }) {
                             ))}
                             {extras.map((s) => (
                                 <label key={s} className="check"
-                                    title="Not a recorded connection state — this entry never matches live connector state.">
+                                    title="Not a recorded connection state — never matches.">
                                     <input type="checkbox" checked
                                         onChange={(e) => toggle(s, e.target.checked)} />
                                     {stateLabel(s)} (transient)
@@ -410,9 +410,7 @@ function ConfigFields({ type, cfg, setCfg }) {
                             ))}
                         </div>
                         <div className="hint">
-                            Breach while any connector of the channel sits in a selected state
-                            for at least the minimum duration. DISCONNECTED catches a downed
-                            connection; CONNECTING catches one stuck reconnecting.
+                            Breach while any connector sits in a selected state for the minimum duration.
                         </div>
                     </div>
                     <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
@@ -420,11 +418,9 @@ function ConfigFields({ type, cfg, setCfg }) {
                         hint="The state must persist at least this long before it counts as a breach." />
                     <SelectField label="Alerting" value={String(cfg.rollup || 'CONNECTOR').toUpperCase()}
                         options={ROLLUP_MODES} onChange={(v) => setCfg({ rollup: v })}
-                        hint={'Per connector opens one problem, and fires every matching action, for '
-                            + 'each failing connector — one channel losing its upstream then pages '
-                            + 'once per destination. Once per channel opens a single problem naming '
-                            + 'the failing connectors, but it clears only after every connector '
-                            + 'recovers.'} />
+                        hint={'Per connector opens one problem per failing connector; once per '
+                            + 'channel opens a single problem that clears only when every '
+                            + 'connector recovers.'} />
                 </div>
             );
         }
@@ -440,11 +436,7 @@ function ConfigFields({ type, cfg, setCfg }) {
                         hint="Sliding window the error and received counts are summed over." />
                     <NumField label="Minimum messages" value={cfg.minMessages} min={0}
                         onChange={(v) => setCfg({ minMessages: v })}
-                        hint={'Windows that received fewer messages than this are reported as '
-                            + 'insufficient data, never OK. One error on a quiet channel is not a '
-                            + '100% error rate, and a channel too quiet to measure is not a channel '
-                            + 'proven healthy — an open problem stays open until a window with real '
-                            + 'traffic can clear it.'} />
+                        hint="Windows with fewer received messages than this report insufficient data, never OK." />
                 </div>
             );
         case 'QUEUE_DEPTH':
@@ -455,14 +447,11 @@ function ConfigFields({ type, cfg, setCfg }) {
                         hint="Breach when the channel's queued-message count is at or above this." />
                     <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
                         onChange={(v) => setCfg({ minDurationSeconds: v })}
-                        hint={'The depth must hold for at least this long — a queue that spikes for '
-                            + 'one collector tick while a destination reconnects is normal.'} />
+                        hint="The depth must hold at least this long before it counts as a breach." />
                     <div className="field span-2">
                         <div className="hint">
-                            Queue depth is read from the latest activity sample, not summed over the
-                            window: it is a level, not a flow. If the collector has left no recent
-                            sample the monitor reports insufficient data rather than treating a stale
-                            reading as the current depth.
+                            Depth is read from the latest sample; with no recent sample the monitor
+                            reports insufficient data.
                         </div>
                     </div>
                 </div>
@@ -488,7 +477,7 @@ function showTestResult(name, result) {
             }))
             : [{
                 label: 'No channels',
-                text: 'No started channels matched this monitor\'s scope — nothing was evaluated.',
+                text: 'No started channels matched this monitor\'s scope.',
             }],
     });
 }
@@ -640,7 +629,7 @@ function MonitorHistoryPanel({ monitorId }) {
                 {!history && !api.error ? <div className="sn-empty">Loading history…</div> : null}
                 {history && totals.alerts === 0 ? (
                     <div className="sn-empty">
-                        This monitor opened no alerts in the selected range.
+                        No alerts opened in the selected range.
                     </div>
                 ) : null}
                 {history && totals.alerts > 0 ? (
@@ -714,8 +703,7 @@ function MonitorHistoryPanel({ monitorId }) {
                             </div>
                         ) : (
                             <div className="sn-empty">
-                                None of this range's alerts have been resolved, so there is no
-                                mean time to resolve yet.
+                                No alerts in this range have been resolved yet.
                             </div>
                         )}
                     </>
@@ -730,8 +718,8 @@ function MonitorHistoryPanel({ monitorId }) {
                         {history.truncated ? (
                             <>
                                 {' · '}
-                                <span className="text-err" title={'More matching alerts exist than this view '
-                                    + 'counts, so the earliest days understate.'}>
+                                <span className="text-err"
+                                    title="More alerts exist than this view counts — the earliest days undercount.">
                                     partial: too many alerts to count in full
                                 </span>
                             </>
@@ -899,11 +887,8 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                                 onChange={(e) => setRunbookUrl(e.target.value)}
                                 placeholder="https://wiki.example.org/runbooks/adt-inactivity" />
                             <div className="hint">
-                                Optional. Shown as a link on every problem this monitor raises, and
-                                carried into every notification it sends — as a line in the email
-                                body, as the {'${runbookUrl}'} template token for email subjects and
-                                webhooks, and as a field of the payload routed to channel and SNS
-                                actions. Must be an absolute http:// or https:// link.
+                                Optional. Linked on every problem and carried into every
+                                notification; must be an absolute http:// or https:// link.
                             </div>
                         </div>
                         <div className="field span-2">
@@ -951,7 +936,7 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                             <input type="number" min="1" step="1" value={minBreaches}
                                 onChange={(e) => setMinBreaches(e.target.value)} />
                             <div className="hint">
-                                Evaluator ticks that must breach in a row before a problem opens (hysteresis).
+                                Ticks the condition must hold before a problem opens.
                             </div>
                         </div>
                         <div className="field">

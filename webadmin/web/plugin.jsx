@@ -8,7 +8,7 @@
 // state.
 
 import { platform } from '@oie/web-shell';
-import { canManage } from './ui.jsx';
+import { canManage, canManageSettings } from './ui.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
@@ -86,8 +86,10 @@ const TABS = [
 function SentinelView() {
     const [tab, setTab] = React.useState('dashboard');
     // checkTask is synchronous and fails open without RBAC; hidden-tab decision
-    // is cosmetic — the servlet's MANAGE permission is the real gate.
-    const visible = TABS.filter((t) => !t.manageOnly || canManage());
+    // is cosmetic — the servlet's permissions are the real gate. Settings is
+    // reachable by either tier: Manage Settings is a standalone permission, so
+    // a user holding it without full Manage must still see the tab.
+    const visible = TABS.filter((t) => !t.manageOnly || canManage() || canManageSettings());
     const active = visible.find((t) => t.key === tab) || visible[0];
     const Page = active.component;
     return (

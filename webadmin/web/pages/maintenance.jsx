@@ -36,11 +36,11 @@ const SCOPE_TYPES = [
 const MODES = [
     {
         key: 'SUPPRESS', label: 'Suppress alerts',
-        hint: 'Classic maintenance: alerts born while the window is active are suppressed.',
+        hint: 'Alerts opened while the window is active are suppressed.',
     },
     {
         key: 'ACTIVE', label: 'Alerting schedule',
-        hint: 'Alerts on covered channels notify only while the window is active; outside its times they are suppressed.',
+        hint: 'Alerts notify only while the window is active; outside it they are suppressed.',
     },
 ];
 
@@ -520,10 +520,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
                                         ))}
                                     </select>
                                     <div className="hint">
-                                        The clock the start/end times and the recurrence days are read on.
-                                        Pick the zone your on-call rotation lives in — the schedule then keeps
-                                        its length across daylight-saving changes there. Leave it on
-                                        &quot;Server time zone&quot; to follow the OIE server&#39;s own clock.
+                                        The clock the start/end times and recurrence days are read on.
                                     </div>
                                 </div>
                                 <div className="field">
@@ -547,17 +544,14 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
                                     <input type="datetime-local" value={from}
                                         onChange={(e) => setFrom(e.target.value)} />
                                     <div className="hint">
-                                        The schedule never runs before this. Blank = unbounded.
-                                        Entered in your browser&#39;s local time zone.
+                                        Blank = unbounded. Entered in your browser&#39;s local time zone.
                                     </div>
                                 </div>
                                 <div className="field">
                                     <label>Active until (optional bound)</label>
                                     <input type="datetime-local" value={until}
                                         onChange={(e) => setUntil(e.target.value)} />
-                                    <div className="hint">
-                                        The schedule never runs after this. Blank = unbounded.
-                                    </div>
+                                    <div className="hint">Blank = unbounded.</div>
                                 </div>
                             </>
                         ) : (

@@ -35,7 +35,7 @@ const ACTION_TYPE_META = {
     },
     CHANNEL: {
         label: 'Channel',
-        description: 'Routes the alert payload into an OIE channel (fan out to Slack, SMS, etc. yourself).',
+        description: 'Routes the alert payload into an OIE channel.',
         defaultConfig: { channelId: '' },
     },
     SNS: {
@@ -339,8 +339,7 @@ function ChannelConfigFields({ config, setConfig }) {
             <ChannelPicker value={config.channelId || ''} emptyLabel="Select a channel…"
                 onChange={(id) => setConfig({ channelId: id })} />
             <div className="hint">
-                The alert payload is routed to this channel as a raw JSON message
-                (sourceMap carries sentinelSeverity, sentinelChannelName, etc.).
+                The alert payload arrives as a raw JSON message.
             </div>
         </div>
     );
@@ -380,8 +379,8 @@ function SnsConfigFields({ config, setConfig }) {
                         <input type="password" value={config.secretAccessKey || ''} autoComplete="new-password"
                             onChange={(e) => setConfig({ secretAccessKey: e.target.value })} />
                         <div className="hint">
-                            Stored encrypted; shown as {REDACTED} once saved. Leave the marker
-                            unchanged to keep the stored secret, or type a new one to replace it.
+                            Stored encrypted; leave the {REDACTED} marker unchanged to keep the
+                            stored secret.
                         </div>
                     </div>
                 </>
@@ -452,8 +451,7 @@ function WebhookConfigFields({ config, setConfig }) {
                     autoComplete="off"
                     onChange={(e) => setConfig({ url: e.target.value })} />
                 <div className="hint">
-                    Required. The path is never echoed back in a failure message — for many
-                    providers it is the credential.
+                    Required. The path is treated as a credential and never echoed in errors.
                 </div>
             </div>
             <div className="field">
@@ -467,19 +465,16 @@ function WebhookConfigFields({ config, setConfig }) {
                 <label>Timeout (seconds)</label>
                 <NullableNumberInput value={config.timeoutSeconds} min={1}
                     placeholder="10" onChange={(v) => setConfig({ timeoutSeconds: v })} />
-                <div className="hint">Empty = 10. Maximum 30; the whole exchange is bounded by it.</div>
+                <div className="hint">Empty = 10. Maximum 30.</div>
             </div>
 
             <div className="field span-2">
                 <label>Headers</label>
                 <HeaderRows rows={config.headers} onChange={(rows) => setConfig({ headers: rows })} />
                 <div className="hint">
-                    Values accept the same {'${…}'} tokens as the body. Authorization, Cookie and
-                    any name containing token/secret/password/signature/credential/api-key are
-                    stored encrypted and shown as {REDACTED} once saved — leave the marker
-                    unchanged to keep the stored value, or type a new one to replace it.
-                    Content-Length, Host, Connection, Expect and Upgrade are set by the HTTP
-                    client and cannot be overridden.
+                    Values accept the same {'${…}'} tokens as the body. Credential-like headers
+                    are stored encrypted and shown as {REDACTED} — leave the marker unchanged to
+                    keep the stored value.
                 </div>
             </div>
 
@@ -491,8 +486,8 @@ function WebhookConfigFields({ config, setConfig }) {
                     onChange={(e) => setConfig({ bodyTemplate: e.target.value })}
                     {...TOKEN_TARGET_PROPS} />
                 <TokenChips tokens={WEBHOOK_BODY_TOKENS} inputRef={bodyRef}
-                    note={'Empty = the full alert payload as JSON. Values are JSON-escaped for a '
-                        + 'JSON body; ${valueJson} is inserted raw so it embeds unquoted.'} />
+                    note={'Empty = the full alert payload as JSON. Values are JSON-escaped; '
+                        + '${valueJson} is inserted raw.'} />
             </div>
 
             <div className="field span-2">
@@ -509,16 +504,14 @@ function WebhookConfigFields({ config, setConfig }) {
                 </label>
                 <div className="hint">
                     {insecure
-                        ? 'Plaintext sends the alert body and any Authorization header unencrypted. '
+                        ? 'Plaintext http sends the alert and its headers unencrypted. '
                         : 'https is required unless you opt in. '}
                     {privateNet
-                        ? 'Private targets are allowed for this action: it can reach anything on the '
-                            + 'engine’s LAN, including unauthenticated internal admin APIs. '
+                        ? 'Allows requests to private/internal addresses — only for webhooks inside '
+                            + 'your own network. '
                         : 'Private and internal targets are blocked. '}
-                    Link-local (169.254.0.0/16 — the cloud instance metadata service), loopback,
-                    wildcard and multicast addresses are always blocked and no setting permits them.
-                    The check runs against every address the host resolves to, at send time, and
-                    redirects are never followed.
+                    Link-local, loopback and multicast addresses are always blocked; redirects are
+                    never followed.
                 </div>
             </div>
         </div>
@@ -767,8 +760,7 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                             <NullableNumberInput value={maxNotificationsPerWindow} min={1}
                                 placeholder="no ceiling" onChange={setMaxNotificationsPerWindow} />
                             <div className="hint">
-                                Individual notifications this action may send per rollup window,
-                                across all problems. Empty = no ceiling.
+                                Maximum sends per rollup window across all problems. Empty = no ceiling.
                             </div>
                         </div>
                         <div className="field">
@@ -790,7 +782,7 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                             <NullableNumberInput value={escalateAfterSeconds} min={60}
                                 placeholder="no escalation" onChange={setEscalateAfterSeconds} />
                             <div className="hint">
-                                How long a problem may stay open before a different action is
+                                How long a problem may stay open before the target action is
                                 notified. Empty = never escalate.
                             </div>
                         </div>
@@ -820,29 +812,18 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                                 ) : null}
                                 {targetMissing ? (
                                     <span className="text-err">
-                                        The selected action has been deleted; escalation is skipped
-                                        with a log warning until you pick another.{' '}
+                                        The selected action was deleted — escalation is skipped
+                                        until you pick another.{' '}
                                     </span>
                                 ) : null}
-                                A disabled target never fires. The target sends under its own
-                                conditions, repeat interval and ceiling.
+                                A disabled target never fires; the target sends under its own
+                                conditions and limits.
                             </div>
                         </div>
                         <div className="field span-2">
                             <div className="hint">
-                                <b>Order these apply in.</b> For each notification: suppression
-                                first (maintenance window, dependency, acknowledgement, or a
-                                trigger detected as flapping) — a suppressed alert is not counted
-                                and not escalated. Then the ceiling: under it the notification is
-                                sent individually; over it the individual sends stop and one rollup
-                                naming the affected channels goes out per window. Then escalation,
-                                independently of what the ceiling decided — a problem still open
-                                past the delay reaches the target even if this action has gone
-                                quiet, which is usually exactly what you want. Repeat and escalation
-                                are separate: repeat re-notifies <i>this</i> action, escalation
-                                hands the problem to <i>another</i> one, and if the target also has
-                                an escalation the delays add up along the chain. Acknowledging a
-                                problem stops both.
+                                Order: suppression first, then the ceiling, then escalation.
+                                Acknowledging a problem stops repeats and escalation.
                             </div>
                         </div>
                     </div>
@@ -850,9 +831,8 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                     <SectionLabel>Conditions</SectionLabel>
                     <ConditionBuilder value={conditions} onChange={setConditions} />
                     <div className="sn-hint">
-                        All rows must match (AND). With no rows the action fires for every event
-                        its mode covers. To tie this action to specific monitors, add a Monitor
-                        condition and multi-select them.
+                        All rows must match (AND); with no rows the action fires for every event
+                        its mode covers.
                     </div>
 
                     <SectionLabel>Delivery — {typeMeta.label}</SectionLabel>

@@ -29,31 +29,31 @@ const SETTINGS_FIELDS = [
         key: 'collectorIntervalSeconds',
         label: 'Collector interval (seconds)',
         min: 10, max: 600,
-        hint: 'How often channel statistics are sampled into activity data. Valid range 10–600.',
+        hint: 'How often channel statistics are sampled. Range 10–600.',
     },
     {
         key: 'evaluatorIntervalSeconds',
         label: 'Evaluator interval (seconds)',
         min: 30, max: 3600,
-        hint: 'How often monitors are evaluated against their channels. Valid range 30–3600.',
+        hint: 'How often monitors are evaluated. Range 30–3600.',
     },
     {
         key: 'sampleRetentionDays',
         label: 'Sample retention (days)',
         min: 1, max: 90,
-        hint: 'How long raw activity samples are kept before pruning. Valid range 1–90.',
+        hint: 'How long raw activity samples are kept. Range 1–90.',
     },
     {
         key: 'trendRetentionDays',
         label: 'Trend retention (days)',
         min: 7, max: 3650,
-        hint: 'How long hourly baseline trends are kept. Valid range 7–3650.',
+        hint: 'How long hourly baseline trends are kept. Range 7–3650.',
     },
     {
         key: 'resolvedAlertRetentionDays',
         label: 'Resolved alert retention (days)',
         min: 7, max: 3650,
-        hint: 'How long resolved problems are kept in history. Valid range 7–3650.',
+        hint: 'How long resolved problems are kept. Range 7–3650.',
     },
 ];
 
@@ -220,19 +220,12 @@ function ExportImportPanel() {
                 <div className="sn-hint" style={{ marginBottom: 10, lineHeight: 1.55 }}>
                     <div>
                         The export carries every monitor, action, and maintenance window as one JSON
-                        document — promotable dev → test → prod like a channel, and reviewable in
-                        version control.
+                        document.
                     </div>
                     <div style={{ marginTop: 4 }}>
-                        Import matches entities by <b>name</b>, not id (ids are per-server serials):
-                        a known name is updated, an unknown name is created, an entity that already
-                        matches is skipped, and nothing is ever deleted. Every entity is validated
-                        exactly as the editors validate it. Secrets export as the redaction marker
-                        and must be re-entered here — the result names the fields per action.
-                    </div>
-                    <div style={{ marginTop: 4 }}>
-                        Importing writes to this server as soon as it is confirmed, and reports what
-                        it did to every entity in the document.
+                        Import matches entities by <b>name</b>: known names are updated, new names
+                        created, nothing is deleted. Secrets export as the redaction marker and must
+                        be re-entered.
                     </div>
                 </div>
 

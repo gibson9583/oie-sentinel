@@ -501,11 +501,15 @@ function detailValue(v) {
  * of the login screen from a page whose URL an operator typed months ago into a
  * monitor; `noreferrer` additionally keeps the console's URL out of the
  * destination's logs. The URL itself is validated at save time by
- * MonitorService as an absolute http/https URL, which is what stops a
- * `javascript:` href from ever reaching this attribute — belt and braces, since
- * a value in the database predating that validation would still land here.
+ * MonitorService as an absolute http/https URL; the scheme check below repeats
+ * that client-side so a value that never went through the service layer (a row
+ * predating the validation, or written straight to the database) still cannot
+ * put a `javascript:`/`data:` href into an admin page.
  */
 function RunbookLink({ url }) {
+    if (!/^https?:\/\//i.test(url)) {
+        return null;
+    }
     return (
         <a href={url} target="_blank" rel="noopener noreferrer" title={url}
             style={{ overflowWrap: 'anywhere' }}>
@@ -620,9 +624,9 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
     const activityHint = `3h either side of the open${
         !isNaN(resolvedMs) && !resolveInWindow ? `, resolved ${fmtTime(ev.resolvedTime)} (outside it)` : ''}`;
     const activityUnavailable = !ev.channelId
-        ? 'This problem is not scoped to a single channel, so there is no throughput series to chart.'
+        ? 'Not scoped to a single channel — no throughput to chart.'
         : (!activityWindow
-            ? 'This problem has no open time recorded, so there is no window to chart.'
+            ? 'No open time recorded — nothing to chart.'
             : null);
 
     const parsed = detail ? parseDetails(ev.detailsJson) : null;
@@ -672,9 +676,9 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
                         <div className="panel mb-3"><div className="panel-body">
                             <span className="tag amber">Suppressed</span>{' '}
                             <span className="text-text-dim">
-                                This problem opened during a maintenance window, outside its
-                                alerting schedule, or while its dependency monitor was already
-                                alerting — actions were not dispatched.
+                                Opened during a maintenance window, outside its alerting schedule,
+                                or while its dependency monitor was alerting — no actions were
+                                dispatched.
                             </span>
                         </div></div>
                     ) : null}
