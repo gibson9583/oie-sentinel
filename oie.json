@@ -5,7 +5,7 @@
     "description": "Zabbix-inspired monitoring and alerting for channel activity: inactivity, low-volume, anomaly, connection-status, error-rate and queue-depth monitors, with email, channel, SNS and webhook alert delivery, storm control, escalation chains, and a dashboard embedded in the OIE Web Administrator.",
     "type": "plugin",
     "ui": ["web"],
-    "version": "1.0.1",
+    "version": "1.1.0",
     "minEngineVersion": "4.6.0",
     "maxEngineVersion": "4.6.0",
     "filename": "sentinel-{version}.zip",

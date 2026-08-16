@@ -14,7 +14,7 @@
     <packaging>pom</packaging>
 
     <properties>
-        <revision>1.0.1</revision>
+        <revision>1.1.0</revision>
 
         <!-- The engine's compatibility check (ExtensionLoader.isExtensionCompatible)
              splits plugin.xml's <mirthVersion> on commas and compares each entry to

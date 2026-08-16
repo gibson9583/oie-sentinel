@@ -22,6 +22,10 @@ console, riding its existing session (no separate login).
   state** (see below).
 - Connection-status monitors roll up per connector or once per channel, so one channel losing its
   upstream pages once instead of once per destination.
+- Scoped to a single channel, a channel group, a **channel tag**, or all channels — group and tag
+  membership resolve live, so reorganizing channels never requires touching monitors.
+- Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency
+  suppression (a parent monitor's open problem silences its dependents on the same channel).
 
 ### Channel state is the one monitor evaluated against stopped channels
 
@@ -44,10 +48,6 @@ plugin restart — "stopped since before the last restart" is the likeliest shap
 this type exists to catch. The stamp is a lower bound: a monitor created while a channel is already
 stopped counts from its own first tick, so it breaches one minimum-duration later rather than
 immediately.
-- Scoped to a single channel, a channel group, a **channel tag**, or all channels — group and tag
-  membership resolve live, so reorganizing channels never requires touching monitors.
-- Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency
-  suppression (a parent monitor's open problem silences its dependents on the same channel).
 
 **Problems**
 - Problem list with server-side filtering/paging, bulk acknowledge, and a detail pane with the
@@ -288,7 +288,7 @@ oie-sentinel/
 ## Releasing
 
 ```bash
-git tag v1.0.1 && git push origin v1.0.1
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
