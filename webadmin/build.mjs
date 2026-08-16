@@ -37,3 +37,6 @@ await build({
     },
 });
 console.log('built web/plugin.js');
+// A bundle that builds but throws while EVALUATING is invisible to every other
+// check in this toolchain and to the engine — see verify.mjs.
+await import('./verify.mjs');
