@@ -88,6 +88,7 @@ const TABS = [
    kinds carrying a payload the page needs, the intent is left in the store for
    that page to consume and clear — this only decides where to look. */
 const INTENT_TABS = {
+    dashboard: 'dashboard',
     problems: 'problems',
     unacknowledged: 'problems',
     schedules: 'schedules',
@@ -96,7 +97,7 @@ const INTENT_TABS = {
 /* Kinds that are nothing but "open this tab". No page reads them, so nobody
    downstream would ever clear them — the shell must, or the next time this
    view mounts it would obey a months-old palette click. */
-const SHELL_CONSUMED = new Set(['schedules']);
+const SHELL_CONSUMED = new Set(['dashboard', 'schedules']);
 
 function tabForIntent(intent) {
     return intent && INTENT_TABS[intent.kind];

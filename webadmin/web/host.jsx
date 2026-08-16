@@ -169,7 +169,7 @@ function installHostStyles() {
 /**
  * The store key a host-surface action uses to tell the Sentinel view what the
  * operator actually wanted before navigating to it. Values look like
- * `{ kind: 'problems' | 'unacknowledged' | 'schedules', channelId, at }`.
+ * `{ kind: 'dashboard' | 'problems' | 'unacknowledged' | 'schedules', channelId, at }`.
  *
  * <p>A store handoff rather than a URL parameter because the plugin registers
  * exactly one route. The `at` stamp is not decoration: `setState` notifies on
@@ -490,14 +490,27 @@ export function registerHostSurfaces() {
         // rather than a row this column could fill honestly.
     });
 
-    // Palette entries, so a Sentinel destination is reachable from anywhere in
-    // the console without first navigating to it. Both are gated on the VIEW
-    // task and not on acknowledge: filtering a list to the unacknowledged rows is a
-    // read, and a NOC operator who can see problems but not close them still
-    // needs to find the open ones fastest. `task` is a NAME, evaluated by the
-    // host each time it renders the palette — calling checkTask here instead
-    // would freeze the answer at plugin-load time, which can precede login.
+    // One entry per Sentinel tab worth reaching directly. All are gated on the
+    // VIEW task and not on acknowledge: filtering a list to the unacknowledged
+    // rows is a read, and a NOC operator who can see problems but not close
+    // them still needs to find the open ones fastest. `task` is a NAME,
+    // evaluated by the host each time it renders the palette — calling
+    // checkTask here instead would freeze the answer at plugin-load time,
+    // which can precede login.
+    //
+    // The Dashboard entry is not redundant with the nav item. The palette
+    // already lists the VIEW (the host reads platform.navItems()), but that
+    // only navigates to /sentinel, which lands on whichever tab the view
+    // decides — and from inside Sentinel it is the router's same-path
+    // re-render, not a tab change. This asks for the tab explicitly, so it
+    // behaves the same wherever it is invoked from.
     const commands = [
+        {
+            id: 'sentinel-dashboard',
+            label: 'Sentinel: Dashboard',
+            keywords: ['overview', 'summary', 'health', 'monitoring', 'kpi'],
+            run: () => dispatchIntent('dashboard', null),
+        },
         {
             id: 'sentinel-open-problems',
             label: 'Sentinel: Open problems',
