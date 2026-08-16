@@ -52,6 +52,21 @@ const ROLLUP_MODES = [
     { value: 'CHANNEL', label: 'Alert once per channel' },
 ];
 
+// The donkey DeployedState names a CHANNEL_STATE monitor can match, split by
+// whether a channel rests there or merely passes through. The split is the
+// whole usability of this editor: the resting states are what an operator
+// wants ("stopped and nobody noticed"), the transitional ones are what every
+// ordinary redeploy walks through, so offering them as one flat list invites
+// a monitor that pages on every deployment.
+const CHANNEL_RESTING_STATES = ['STOPPED', 'PAUSED', 'UNDEPLOYED'];
+const CHANNEL_TRANSITIONAL_STATES = [
+    'DEPLOYING', 'UNDEPLOYING', 'STARTING', 'STOPPING', 'PAUSING', 'SYNCING',
+];
+// STARTED is matchable but deliberately absent from both lists: a monitor that
+// alerts because a channel is running is a monitor nobody wants, and offering
+// the checkbox is an invitation to page the whole estate by accident.
+const CHANNEL_STATES = [...CHANNEL_RESTING_STATES, ...CHANNEL_TRANSITIONAL_STATES];
+
 /** "WAITING_FOR_RESPONSE" -> "Waiting for response". */
 function stateLabel(s) {
     return String(s).toLowerCase().replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
@@ -179,6 +194,16 @@ function normalizeTypeConfig(type, cfg, keepUnknownStates) {
             : names.filter((s) => CONNECTION_STATES.includes(s));
         if (typeof out.rollup === 'string') out.rollup = out.rollup.trim().toUpperCase();
     }
+    if (type === 'CHANNEL_STATE') {
+        // Same rule as CONNECTION_STATUS, against the deployed-state list:
+        // an existing monitor's unrecognized name survives a round trip (it
+        // may be a state a newer engine reports), a seeded default is filtered.
+        const names = (Array.isArray(out.alertOnStates) ? out.alertOnStates : [])
+            .map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+        out.alertOnStates = keepUnknownStates
+            ? names
+            : names.filter((s) => CHANNEL_STATES.includes(s));
+    }
     return out;
 }
 
@@ -272,6 +297,20 @@ function buildConfig(type, cfg) {
             num('threshold', 'Queue depth threshold', { min: 0, integer: true });
             num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
             break;
+        case 'CHANNEL_STATE': {
+            const states = Array.from(new Set(
+                (Array.isArray(cfg.alertOnStates) ? cfg.alertOnStates : [])
+                    .map((s) => String(s).trim().toUpperCase()).filter(Boolean)));
+            // The server rejects an empty array outright (the evaluator would
+            // fall back to its default set, which is not what an operator who
+            // cleared every box asked for), so fail here with better words.
+            if (!states.length) {
+                throw new Error('Select at least one channel state to alert on.');
+            }
+            out.alertOnStates = states;
+            num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
+            break;
+        }
         default:
             break;
     }
@@ -456,6 +495,58 @@ function ConfigFields({ type, cfg, setCfg }) {
                     </div>
                 </div>
             );
+        case 'CHANNEL_STATE': {
+            const selected = Array.isArray(cfg.alertOnStates) ? cfg.alertOnStates : [];
+            const extras = selected.filter((s) => !CHANNEL_STATES.includes(s));
+            const toggle = (s, on) => setCfg({
+                alertOnStates: on ? [...selected, s] : selected.filter((x) => x !== s),
+            });
+            const box = (s, suffix, title) => (
+                <label key={s} className="check" title={title}>
+                    <input type="checkbox" checked={selected.includes(s)}
+                        onChange={(e) => toggle(s, e.target.checked)} />
+                    {stateLabel(s)}{suffix || ''}
+                </label>
+            );
+            return (
+                <div className="form-grid">
+                    <div className="field span-2">
+                        <label>Alert on channel states</label>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 16px' }}>
+                            {CHANNEL_RESTING_STATES.map((s) => box(s))}
+                        </div>
+                        <div className="hint">
+                            A channel does not leave these on its own — this is the
+                            &ldquo;stopped and nobody noticed&rdquo; set.
+                        </div>
+                    </div>
+                    <div className="field span-2">
+                        <label>Also alert on transitional states</label>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 16px' }}>
+                            {CHANNEL_TRANSITIONAL_STATES.map((s) => box(s))}
+                            {extras.map((s) => box(s, ' (unknown)',
+                                'Not a state this engine reports — it will never match.'))}
+                        </div>
+                        <div className="hint">
+                            Every redeploy passes through these. Only select one with a minimum
+                            duration long enough to clear a normal deployment — that is how you
+                            catch a channel stuck mid-start.
+                        </div>
+                    </div>
+                    <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
+                        onChange={(v) => setCfg({ minDurationSeconds: v })}
+                        hint="The state must persist at least this long before it counts as a breach." />
+                    <div className="field span-2">
+                        <div className="hint">
+                            The only monitor type evaluated against channels that are not started —
+                            that is the point of it. Duration is counted from the first tick that saw
+                            the current state, so a monitor created while a channel is already
+                            stopped breaches one minimum-duration later rather than immediately.
+                        </div>
+                    </div>
+                </div>
+            );
+        }
         default:
             return null;
     }

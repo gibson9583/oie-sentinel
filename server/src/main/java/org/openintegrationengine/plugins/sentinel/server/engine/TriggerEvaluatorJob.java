@@ -30,6 +30,7 @@ import org.openintegrationengine.plugins.sentinel.server.db.MaintenanceWindowRep
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.AnomalyEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.ChannelStateEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ConnectionStatusEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ErrorRateEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
@@ -119,6 +120,18 @@ public class TriggerEvaluatorJob implements Job {
      */
     private static final String TRIGGER_LEFT_MESSAGE =
             "Connector no longer evaluated (removed, or monitor rollup changed)";
+
+    /**
+     * Message used when a CHANNEL_STATE problem is auto-resolved because its
+     * channel left the monitor's <em>scope</em> — deleted from the server, or
+     * removed from the group or tag the monitor names. That type evaluates
+     * every channel in scope whatever state it is in, so unlike every other
+     * type its channel cannot depart by being stopped; when one does depart,
+     * the channel is genuinely gone and the operator should not be told it
+     * merely stopped.
+     */
+    private static final String SCOPE_LEFT_MESSAGE =
+            "Channel is no longer in this monitor's scope (deleted, or removed from the group/tag)";
 
     /**
      * Quartz entry point. Catches {@link Throwable} deliberately: an
@@ -235,7 +248,14 @@ public class TriggerEvaluatorJob implements Job {
      * grants {@link #applyOutcome} no authority to resolve an open alert.</p>
      */
     private static void evaluateMonitor(Monitor monitor, Instant now) {
-        List<ScopeResolver.ChannelTarget> targets = ScopeResolver.resolveStartedChannels(monitor);
+        // CHANNEL_STATE is the one type whose subject IS the state, so it
+        // resolves every channel in scope rather than only the started ones —
+        // filtering to STARTED would hand it exactly the channels it has
+        // nothing to say about. See ChannelStateEvaluator.
+        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE;
+        List<ScopeResolver.ChannelTarget> targets = watchesState
+                ? ScopeResolver.resolveScopedChannels(monitor)
+                : ScopeResolver.resolveStartedChannels(monitor);
 
         Set<String> targetChannelIds = new HashSet<>();
         for (ScopeResolver.ChannelTarget target : targets) {
@@ -274,6 +294,10 @@ public class TriggerEvaluatorJob implements Job {
                         break;
                     case QUEUE_DEPTH:
                         outcome = QueueDepthEvaluator.evaluate(monitor, target.channelId, now);
+                        break;
+                    case CHANNEL_STATE:
+                        outcome = ChannelStateEvaluator.evaluate(monitor, target.channelId,
+                                ScopeResolver.channelState(target.channelId), now);
                         break;
                     default:
                         // Recording nothing here is load-bearing: a type this
@@ -594,7 +618,15 @@ public class TriggerEvaluatorJob implements Job {
 
             String message;
             if (channelDeparted) {
-                message = CHANNEL_LEFT_MESSAGE;
+                // "No longer started" is the right words for every type whose
+                // targets are the started channels. For CHANNEL_STATE it would
+                // be exactly backwards — not started is what that monitor is
+                // FOR, and its targets are every channel in scope, so the only
+                // way one of them departs is that the channel was deleted or
+                // left the group/tag the monitor names.
+                message = monitor.getMonitorType() == MonitorType.CHANNEL_STATE
+                        ? SCOPE_LEFT_MESSAGE
+                        : CHANNEL_LEFT_MESSAGE;
             } else {
                 Set<Integer> evaluated = evaluatedTriggers.get(state.getChannelId());
                 if (evaluated == null || evaluated.contains(state.getMetadataId())) {

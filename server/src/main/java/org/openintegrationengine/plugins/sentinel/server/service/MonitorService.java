@@ -17,11 +17,13 @@ import java.util.Set;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
+import com.mirth.connect.donkey.model.channel.DeployedState;
 import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
 
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.AnomalyEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.ChannelStateEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ConnectionStatusEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ErrorRateEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
@@ -32,6 +34,7 @@ import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelTestOutcome;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorTestResult;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
 
 /**
@@ -221,7 +224,14 @@ public final class MonitorService {
         }
 
         Instant now = Instant.now();
-        List<ScopeResolver.ChannelTarget> targets = ScopeResolver.resolveStartedChannels(monitor);
+        // Mirror the evaluator's own scope choice exactly — a CHANNEL_STATE
+        // dry run filtered to started channels would report "no channels in
+        // scope" for the stopped channel the operator is writing the monitor
+        // to catch, which is the most misleading answer a test could give.
+        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE;
+        List<ScopeResolver.ChannelTarget> targets = watchesState
+                ? ScopeResolver.resolveScopedChannels(monitor)
+                : ScopeResolver.resolveStartedChannels(monitor);
         List<ChannelTestOutcome> outcomes = new ArrayList<>();
         boolean anyError = false;
 
@@ -259,6 +269,10 @@ public final class MonitorService {
                     case QUEUE_DEPTH:
                         addOutcome(outcomes, target, QueueDepthEvaluator.evaluate(monitor, target.channelId, now));
                         break;
+                    case CHANNEL_STATE:
+                        addOutcome(outcomes, target, ChannelStateEvaluator.evaluate(monitor, target.channelId,
+                                ScopeResolver.channelState(target.channelId), now));
+                        break;
                 }
             } catch (Exception e) {
                 anyError = true;
@@ -269,8 +283,11 @@ public final class MonitorService {
 
         MonitorTestResult result = new MonitorTestResult();
         result.setOk(!anyError);
+        // The empty-scope wording has to match which resolver ran, or a
+        // CHANNEL_STATE test on a genuinely empty group reads as though the
+        // started filter hid something from it.
         result.setMessage(targets.isEmpty()
-                ? "No started channels in scope"
+                ? (watchesState ? "No channels in scope" : "No started channels in scope")
                 : targets.size() + " channel(s) evaluated");
         result.setOutcomes(outcomes);
         return result;
@@ -455,6 +472,47 @@ public final class MonitorService {
                 requireNonNegativeIfPresent(config, "threshold");
                 requireNonNegativeIfPresent(config, "minDurationSeconds");
                 break;
+            case CHANNEL_STATE:
+                requireNonNegativeIfPresent(config, "minDurationSeconds");
+                validateDeployedStates(config);
+                break;
+        }
+    }
+
+    /**
+     * Validates CHANNEL_STATE's {@code alertOnStates} against the real
+     * {@link DeployedState} enum, for the same reason
+     * {@link #validateAlertOnStates(JsonNode)} does it for connector states:
+     * the evaluator matches names textually, so a typo produces a monitor
+     * that watches for a state no channel will ever report and therefore
+     * never fires — a monitor the operator believes is protecting them.
+     *
+     * <p>An empty array is rejected rather than accepted. The evaluator falls
+     * back to its resting-state default for an empty list, which is a
+     * reasonable runtime degradation but a poor save-time outcome: an
+     * operator who cleared every checkbox meant "watch nothing" or is
+     * mid-edit, and silently storing something that behaves like the default
+     * set would page them for states they explicitly deselected.</p>
+     */
+    private static void validateDeployedStates(JsonNode config) {
+        JsonNode states = config.get("alertOnStates");
+        if (states == null || states.isNull()) {
+            return; // absent → evaluator defaults to the resting states
+        }
+        if (!states.isArray()) {
+            throw new IllegalArgumentException("alertOnStates must be a JSON array of channel state names");
+        }
+        if (states.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "alertOnStates must name at least one channel state to alert on");
+        }
+        for (JsonNode entry : states) {
+            String name = entry.asText("");
+            try {
+                DeployedState.valueOf(name.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Unknown channel state '" + name + "' in alertOnStates");
+            }
         }
     }
 

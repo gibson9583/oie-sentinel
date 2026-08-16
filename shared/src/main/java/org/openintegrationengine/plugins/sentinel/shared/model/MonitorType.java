@@ -29,5 +29,21 @@ public enum MonitorType {
      * types this one reads an instantaneous gauge, not summed deltas — see
      * {@code QueueDepthEvaluator}.
      */
-    QUEUE_DEPTH
+    QUEUE_DEPTH,
+    /**
+     * Alerts when a channel's own deployed state sits in a configured set
+     * (stopped, paused, undeployed) for too long — the "someone stopped this
+     * channel and forgot" monitor.
+     *
+     * <p><b>The one type not gated on STARTED.</b> Every other monitor here
+     * evaluates only channels currently in {@code DeployedState.STARTED},
+     * because inferring anything from a stopped channel's absent traffic is a
+     * guaranteed false positive. That gate is precisely what makes this type
+     * necessary: it means a channel leaving STARTED does not raise an alarm,
+     * it makes the alarms it already had go quiet. Nothing else in the plugin
+     * notices a production channel being stopped. See
+     * {@code ChannelStateEvaluator} and
+     * {@code ScopeResolver#resolveScopedChannels}.</p>
+     */
+    CHANNEL_STATE
 }

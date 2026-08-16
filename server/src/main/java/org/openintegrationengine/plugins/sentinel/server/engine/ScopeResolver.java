@@ -140,6 +140,106 @@ public final class ScopeResolver {
     }
 
     /**
+     * Resolves a monitor's scope to every channel it names, <em>whatever
+     * state those channels are in</em> — the counterpart to
+     * {@link #resolveStartedChannels(Monitor)} for the one monitor type whose
+     * subject is the state itself.
+     *
+     * <p>The started gate the other resolver applies is not a detail here, it
+     * is the entire difference. A CHANNEL_STATE monitor exists to notice a
+     * channel that is stopped, paused, or undeployed; resolving its scope
+     * through a filter that drops exactly those channels would make it
+     * evaluate only the channels it has nothing to say about. Nothing else in
+     * this class changes — group, tag and channel membership resolve
+     * identically, and a scope naming a channel that no longer exists still
+     * yields nothing, because the id is read from the same live channel
+     * cache.</p>
+     *
+     * <p>Undeployed channels are included, which is why the ALL case walks
+     * the channel cache rather than {@code getDeployedIds()}: "undeployed" is
+     * one of the states an operator most wants paged about, and the deployed
+     * id set is by definition unable to report it.</p>
+     *
+     * @param monitor the monitor whose scope to resolve
+     * @return every channel in scope regardless of state; empty (never
+     *         {@code null}) when the monitor has no usable scope
+     */
+    public static List<ChannelTarget> resolveScopedChannels(Monitor monitor) {
+        List<ChannelTarget> targets = new ArrayList<>();
+        ScopeType scopeType = monitor != null ? monitor.getScopeType() : null;
+        if (scopeType == null) {
+            log.warn("Monitor {} has no scope type; resolving to no channels",
+                    monitor != null ? monitor.getId() : null);
+            return targets;
+        }
+
+        switch (scopeType) {
+            case ALL:
+                List<Channel> channels = ChannelController.getInstance().getChannels(null);
+                if (channels != null) {
+                    for (Channel channel : channels) {
+                        if (channel.getId() != null) {
+                            targets.add(new ChannelTarget(channel.getId(), channelName(channel.getId())));
+                        }
+                    }
+                }
+                break;
+            case GROUP:
+                for (String channelId : groupChannelIds(monitor.getScopeId())) {
+                    addIfChannelExists(targets, channelId);
+                }
+                break;
+            case TAG:
+                for (String channelId : tagChannelIds(monitor.getScopeId())) {
+                    addIfChannelExists(targets, channelId);
+                }
+                break;
+            case CHANNEL:
+                addIfChannelExists(targets, monitor.getScopeId());
+                break;
+        }
+        return targets;
+    }
+
+    /**
+     * Adds a channel target only when the id still resolves to a real
+     * channel. Group and tag membership can outlive the channel it names, and
+     * an undeployed-state monitor must not report a deleted channel as
+     * "undeployed" forever — deleted and stopped are different facts and only
+     * one of them is an incident.
+     */
+    private static void addIfChannelExists(List<ChannelTarget> targets, String channelId) {
+        if (channelId == null) {
+            return;
+        }
+        Channel channel = ChannelController.getInstance().getChannelById(channelId);
+        if (channel != null) {
+            targets.add(new ChannelTarget(channelId, channelName(channelId)));
+        }
+    }
+
+    /**
+     * The channel's current runtime state as an uppercase name, using
+     * {@code UNDEPLOYED} for a channel the engine holds no deployed instance
+     * of — the same vocabulary {@link #listChannels()} reports, so the monitor
+     * editor's state picker and the evaluator agree on one spelling.
+     *
+     * <p>Returns the {@link DeployedState} {@code name()}, never its
+     * {@code toString()}: the enum overrides {@code toString()} to
+     * capitalized display text ("Started"), and a config matching on that
+     * form would silently never fire.</p>
+     *
+     * @param channelId the OIE channel id
+     * @return the state name; never {@code null}
+     */
+    public static String channelState(String channelId) {
+        EngineController engineController = ControllerFactory.getFactory().createEngineController();
+        com.mirth.connect.donkey.server.channel.Channel deployed = engineController.getDeployedChannel(channelId);
+        DeployedState state = deployed != null ? deployed.getCurrentState() : null;
+        return state != null ? state.name() : DeployedState.UNDEPLOYED.name();
+    }
+
+    /**
      * True iff the channel is deployed and its runtime state is exactly
      * {@code STARTED}. Reads the donkey runtime channel, which is an
      * in-memory map lookup — cheap enough to call once per candidate channel

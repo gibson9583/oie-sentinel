@@ -14,13 +14,36 @@ console, riding its existing session (no separate login).
 ## Features
 
 **Monitors**
-- Six monitor types: **Inactivity** (no messages for N minutes), **Low volume** (fewer than N
+- Seven monitor types: **Inactivity** (no messages for N minutes), **Low volume** (fewer than N
   messages per window), **Anomaly** (volume deviates from a rolling baseline), **Connection
   status** (connector state matching), **Error rate** (errored share of received messages over a
-  window, with a minimum-volume guard so one error on a quiet channel is not 100%), and **Queue
-  depth** (destination queue at or above a threshold for a sustained period).
+  window, with a minimum-volume guard so one error on a quiet channel is not 100%), **Queue
+  depth** (destination queue at or above a threshold for a sustained period), and **Channel
+  state** (see below).
 - Connection-status monitors roll up per connector or once per channel, so one channel losing its
   upstream pages once instead of once per destination.
+
+### Channel state is the one monitor evaluated against stopped channels
+
+Every other type is evaluated only against channels in `STARTED`, and that gate is correct for all
+of them — a stopped channel's source is not polling, so an inactivity or volume breach against it
+would be measuring the operator's own decision. The consequence is that stopping a production
+channel raises no alarm; it *silences* the alarms that channel already had, which the evaluator
+closes with "Channel is no longer started".
+
+A **Channel state** monitor watches the state itself, so it is resolved against every channel in
+scope whatever state it is in. It defaults to the resting states — `STOPPED`, `PAUSED`,
+`UNDEPLOYED` — the ones a channel does not leave on its own. The transitional states (`STARTING`,
+`DEPLOYING`, `STOPPING`, …) are selectable but never seeded: every ordinary redeploy passes through
+them, and a default that paged on that would teach operators to ignore the monitor. Select one
+deliberately, with a minimum duration long enough to clear a normal deployment, to catch a channel
+stuck mid-start.
+
+How long the state has held is read from the trigger row rather than from memory, so it survives a
+plugin restart — "stopped since before the last restart" is the likeliest shape of the incident
+this type exists to catch. The stamp is a lower bound: a monitor created while a channel is already
+stopped counts from its own first tick, so it breaches one minimum-duration later rather than
+immediately.
 - Scoped to a single channel, a channel group, a **channel tag**, or all channels — group and tag
   membership resolve live, so reorganizing channels never requires touching monitors.
 - Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency

@@ -61,7 +61,7 @@ export function SeverityChip({ severity }) {
 /* ---- monitor types ------------------------------------------------------ */
 
 export const MONITOR_TYPE_ORDER = ['INACTIVITY', 'LOW_VOLUME', 'ANOMALY', 'CONNECTION_STATUS',
-    'ERROR_RATE', 'QUEUE_DEPTH'];
+    'ERROR_RATE', 'QUEUE_DEPTH', 'CHANNEL_STATE'];
 
 // defaultConfig mirrors the configJson shapes in webadmin-contract.md; the
 // monitors page seeds new-monitor editors from it.
@@ -104,6 +104,17 @@ export const MONITOR_TYPE_META = {
         // latest sample; minDurationSeconds separates a real backlog from the
         // burst a destination clears on its next reconnect.
         defaultConfig: { threshold: 1000, minDurationSeconds: 300 },
+    },
+    CHANNEL_STATE: {
+        label: 'Channel state',
+        description: 'Alerts when a channel is stopped, paused or undeployed for too long.',
+        // The resting states only: every other type is evaluated against
+        // STARTED channels alone, so a channel being stopped currently makes
+        // its alarms go quiet rather than raising one. The transitional states
+        // are selectable in the editor but never seeded — a redeploy walks
+        // through them and a default that paged on that teaches operators to
+        // ignore this monitor.
+        defaultConfig: { alertOnStates: ['STOPPED', 'PAUSED', 'UNDEPLOYED'], minDurationSeconds: 300 },
     },
 };
 
