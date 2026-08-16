@@ -51,6 +51,42 @@ function installDomStubs() {
     globalThis.window = globalThis;
 }
 
+/**
+ * A palette command must navigate to the Sentinel view when the user is
+ * elsewhere, and must NOT when they are already there.
+ *
+ * The host router treats navigation to the current path as a forced
+ * re-render rather than a no-op, and does it asynchronously. Navigating
+ * unconditionally therefore rebuilt an already-mounted Sentinel view AFTER the
+ * store handoff had been consumed, so every command and channel action worked
+ * from anywhere else in the console and silently did nothing from inside
+ * Sentinel. Nothing else catches that: register() succeeds either way, and the
+ * difference only appears once a view is mounted.
+ */
+function assertIntentNavigation(registered) {
+    const router = globalThis.__sentinelRouter;
+    const command = registered.commands.find((c) => typeof c.run === 'function');
+    if (!router || !command) {
+        throw new Error('cannot check intent navigation: no router stub or no runnable command');
+    }
+
+    router.path = '/dashboard';
+    router.navigations.length = 0;
+    command.run();
+    if (!router.navigations.includes('/sentinel')) {
+        throw new Error('a command run from outside Sentinel did not navigate to /sentinel');
+    }
+
+    router.path = '/sentinel';
+    router.navigations.length = 0;
+    command.run();
+    if (router.navigations.length) {
+        throw new Error('a command run from INSIDE Sentinel navigated to '
+            + `${router.navigations.join(', ')} — the host router re-renders the view in place `
+            + 'for a same-path navigate, which discards the store handoff');
+    }
+}
+
 async function main() {
     const workDir = await mkdtemp(path.join(tmpdir(), 'sentinel-verify-'));
     const outfile = path.join(workDir, 'bundle.mjs');
@@ -104,6 +140,8 @@ async function main() {
         if (failed.length) {
             throw new Error(`register() ran but did not register: ${failed.join(', ')}`);
         }
+
+        assertIntentNavigation(registered);
 
         console.log(`verified web/plugin.js loads: ${registered.navItems.length} nav item(s), `
             + `${registered.dashboardColumns.length} dashboard column(s), `

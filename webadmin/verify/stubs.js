@@ -58,6 +58,17 @@ export const registered = globalThis.__sentinelRegistered || (globalThis.__senti
     dashboardColumns: [], commands: [],
 });
 
+/**
+ * Router state, also global and for the same reason as {@link registered}: the
+ * bundle holds its own copy of this module, so verify.mjs can only steer the
+ * router — and see where the plugin tried to go — through something both
+ * copies share.
+ */
+export const router = globalThis.__sentinelRouter || (globalThis.__sentinelRouter = {
+    path: '/',
+    navigations: [],
+});
+
 export const platform = {
     React,
     apiVersion: '4.6.0',
@@ -71,7 +82,10 @@ export const platform = {
         put: async () => ({}), del: async () => ({}),
     },
     store: { getState: () => null, setState: noop, subscribe: () => noop },
-    router: { navigate: noop, currentPath: () => '/' },
+    router: {
+        navigate: (path) => router.navigations.push(path),
+        currentPath: () => router.path,
+    },
     events: { on: () => noop, emit: noop },
     checkTask: () => true,
     reactView: (component) => component,

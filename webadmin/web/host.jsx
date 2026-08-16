@@ -184,11 +184,38 @@ function installHostStyles() {
  */
 export const INTENT_KEY = 'sentinel:intent';
 
-/** Records an intent and navigates to the Sentinel view to act on it. */
+/**
+ * Records an intent and, only if we are not already there, navigates to the
+ * Sentinel view to act on it.
+ *
+ * <p><b>The conditional navigate is the whole point.</b> The host router
+ * treats navigation to the path you are already on as a forced re-render
+ * rather than a no-op:</p>
+ *
+ * <pre>
+ * if (target === currentPath()) { handleChange(); return; }   // re-render in place
+ * </pre>
+ *
+ * <p>and {@code handleChange} is async. Calling it unconditionally from an
+ * already-mounted Sentinel view produced a race that discarded the handoff
+ * every time: the store write notified the view's subscriber, which switched
+ * tabs and remounted the target page, whose initializer read <em>and
+ * cleared</em> the intent — and only then did the re-render land, rebuilding
+ * the view from scratch so its own initializer found nothing and fell back to
+ * the Dashboard. The commands and channel actions worked from anywhere else in
+ * the console and silently did nothing from inside Sentinel.</p>
+ *
+ * <p>When the view is already mounted its store subscription is the delivery
+ * mechanism and no navigation is needed. When it is not, there is no
+ * subscriber to race with and the navigation mounts a view whose initializer
+ * picks the intent up. Checking the path picks the right one of those.</p>
+ */
 function dispatchIntent(kind, channelId) {
     try {
         platform.store.setState(INTENT_KEY, { kind, channelId, at: Date.now() });
-        platform.router.navigate('/sentinel');
+        if (!String(platform.router.currentPath() || '').startsWith('/sentinel')) {
+            platform.router.navigate('/sentinel');
+        }
     } catch (e) {
         errorModal('Sentinel', errText(e));
     }
