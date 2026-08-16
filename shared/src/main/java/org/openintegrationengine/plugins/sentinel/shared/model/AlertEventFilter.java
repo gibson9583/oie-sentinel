@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.shared.model;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -23,6 +24,40 @@ import java.util.Set;
  * value through {@link #validateSortColumn(String)}/{@link
  * #validateSortDir(String)} so a field on this object can never hold
  * anything other than an allow-listed value, however it was constructed.</p>
+ *
+ * <h2>The two list setters copy, and must keep copying</h2>
+ *
+ * <p>{@link #setSeverityIn(List)} and {@link #setChannelIdIn(List)} store an
+ * {@link ArrayList} copy rather than the caller's list. That looks like
+ * pointless defensiveness and is not: it is load-bearing, and removing it
+ * silently breaks features rather than failing a build.</p>
+ *
+ * <p>Both fields are read by the mappers through OGNL guards of the form
+ * {@code <if test="channelIdIn != null and !channelIdIn.isEmpty()">}. OGNL
+ * resolves {@code isEmpty()} reflectively <em>against the concrete class</em>,
+ * not the {@link List} interface. {@code List.of(...)} returns
+ * {@code java.util.ImmutableCollections$List12}, which lives in {@code
+ * java.base} and is not exported, so under the module system the reflective
+ * call fails:</p>
+ *
+ * <pre>
+ * Method "isEmpty" failed for object [...]
+ *   IllegalAccessException: OgnlRuntime cannot access a member of class
+ *   java.util.ImmutableCollections$List12 (in module java.base)
+ * </pre>
+ *
+ * <p>which MyBatis wraps and the repository turns into a failed query. It had
+ * exactly that effect twice: {@code AlertStormControl} passed
+ * {@code List.of(channelId)} and so <b>flap detection never ran</b> — every
+ * dispatch logged "Flap check failed; notifying normally", which is the
+ * behaviour flap detection exists to prevent — and {@code MetricsService}
+ * passed {@code List.of(severity)}, breaking the Prometheus endpoint's
+ * per-severity counts. Neither was caught by a test, because tests mock the
+ * repository and never reach OGNL.</p>
+ *
+ * <p>Copying here fixes every caller at once, including future ones, and is the
+ * right layer for it: the constraint belongs to how this DTO is consumed, not
+ * to any one call site's choice of list literal.</p>
  */
 public class AlertEventFilter {
 
@@ -74,11 +109,15 @@ public class AlertEventFilter {
     }
 
     /**
+     * Stores an {@link ArrayList} copy — see the class Javadoc. A
+     * {@code List.of(...)} argument would otherwise reach the mapper's OGNL
+     * guard as a non-exported JDK class and fail the query at runtime.
+     *
      * @param severityIn if non-null and non-empty, restrict to events whose
      *                   severity is one of these
      */
     public void setSeverityIn(List<Severity> severityIn) {
-        this.severityIn = severityIn;
+        this.severityIn = severityIn == null ? null : new ArrayList<>(severityIn);
     }
 
     /**
@@ -90,11 +129,14 @@ public class AlertEventFilter {
     }
 
     /**
+     * Stores an {@link ArrayList} copy — see the class Javadoc. This is the
+     * setter whose missing copy left flap detection silently disabled.
+     *
      * @param channelIdIn if non-null and non-empty, restrict to events whose
      *                    channel id is one of these
      */
     public void setChannelIdIn(List<String> channelIdIn) {
-        this.channelIdIn = channelIdIn;
+        this.channelIdIn = channelIdIn == null ? null : new ArrayList<>(channelIdIn);
     }
 
     /**
