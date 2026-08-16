@@ -119,12 +119,10 @@ const HOST_CSS = `
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--err) 42%, transparent);
 }
 
-/* The filled chip for the same rung, defined here rather than in
-   plugin.jsx's SENTINEL_CSS so it cannot go missing outside .sn-view.
-   Selecting on two classes outranks the host's own single-class .tag border
-   without needing !important. */
-.tag.sn-sev-top { border-color: transparent; font-weight: 650; color: #1a0508; }
-[data-theme="light"] .tag.sn-sev-top { color: #fff; }
+/* The chip for the same rung. Only the weight lives here — its tint, border
+   and label colour are set inline from SEVERITY_META (see SeverityChip), so
+   the ramp has one source of truth and no theme-specific ink is needed. */
+.tag.sn-sev-top { font-weight: 650; }
 
 /* Monitored and nothing open: hollow green ring + green check.
    Making this outlined rather than filled is what gives the column a real

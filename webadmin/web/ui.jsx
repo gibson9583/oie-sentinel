@@ -90,26 +90,47 @@ export const SEVERITY_META = {
  * filled chip. That survives greyscale, survives colour-blindness, and needs no
  * new colour to be picked or maintained per theme.</p>
  *
- * <p>The ink flips with the theme because the fill does: dark theme's
- * {@code --err} (#ff5f5f) is bright and takes dark ink, light theme's
- * (#cc3b3b) is deep and takes white — the same problem, and the same fix, as
- * the dashboard badge's Warning/Average ink.</p>
+ * <p><b>Weight means the host's own coloured-tag recipe, not a solid fill.</b>
+ * This first shipped as a solid {@code --err} pill, which was wrong twice
+ * over. Nothing else in the console is solid-filled, so it read as foreign
+ * rather than as emphatic. And the host's {@code .tag} carries
+ * {@code padding: 3px 7px 1.5px} — deliberately asymmetric, tuned so cap ink
+ * lands pixel-symmetric <em>against a transparent background</em> — so filling
+ * the pill exposed that 1.5px and left the label visibly sitting low. The
+ * component was designed never to be filled.</p>
+ *
+ * <p>{@code .tag.red} in the host's stylesheet is already the answer: a 10%
+ * tint, a 40% border and a coloured label. Disaster uses exactly that, and
+ * keeps its dot like every other rung, so the family stays consistent while
+ * the tint and the coloured label carry the extra weight. The centring problem
+ * goes with it — a 10% tint has no hard pill edge to measure the text
+ * against.</p>
  */
 export function SeverityChip({ severity }) {
     const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
-    if (meta.top) {
-        return (
-            <span className="tag sn-sev sn-sev-top" style={{ background: meta.color }}>
-                {meta.label}
-            </span>
-        );
-    }
     return (
-        <span className="tag sn-sev" style={{ borderColor: `color-mix(in srgb, ${meta.color} 55%, transparent)` }}>
+        <span className={`tag sn-sev${meta.top ? ' sn-sev-top' : ''}`} style={severityChipStyle(meta)}>
             <span className="sn-sev-dot" style={{ background: meta.color }} />
             {meta.label}
         </span>
     );
+}
+
+/**
+ * The chip's inline colours, shared by the React and DOM builders so the two
+ * cannot drift. Inline rather than in a stylesheet because the values derive
+ * from {@link SEVERITY_META}, which is the single source of truth for the
+ * ramp; only the font weight lives in CSS.
+ */
+function severityChipStyle(meta) {
+    if (meta.top) {
+        return {
+            borderColor: `color-mix(in srgb, ${meta.color} 40%, transparent)`,
+            background: `color-mix(in srgb, ${meta.color} 10%, transparent)`,
+            color: meta.color,
+        };
+    }
+    return { borderColor: `color-mix(in srgb, ${meta.color} 55%, transparent)` };
 }
 
 /**
@@ -127,15 +148,10 @@ export function SeverityChip({ severity }) {
 export function severityChipNode(severity) {
     const { h } = platform.ui;
     const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
-    if (meta.top) {
-        const chip = h('span.tag.sn-sev.sn-sev-top', String(meta.label));
-        chip.style.background = meta.color;
-        return chip;
-    }
     const dot = h('span.sn-sev-dot');
     dot.style.background = meta.color;
-    const chip = h('span.tag.sn-sev', dot, String(meta.label));
-    chip.style.borderColor = `color-mix(in srgb, ${meta.color} 55%, transparent)`;
+    const chip = h(`span.tag.sn-sev${meta.top ? '.sn-sev-top' : ''}`, dot, String(meta.label));
+    Object.assign(chip.style, severityChipStyle(meta));
     return chip;
 }
 
