@@ -18,7 +18,7 @@ import {
 } from '../api.js';
 import {
     canAcknowledge, toast, useApi, useDataTable, useUsernames, FilterBar,
-    ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, SEVERITY_META,
+    ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, severityChipNode,
     MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
@@ -106,15 +106,6 @@ function normalizePaged(res) {
 
 /* ---- DataTable cell builders (DOM nodes via platform.ui.h, never JSX) ---- */
 
-function sevChipNode(severity) {
-    const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
-    const dot = h('span.sn-sev-dot');
-    dot.style.background = meta.color;
-    const chip = h('span.tag.sn-sev', dot, String(meta.label));
-    chip.style.borderColor = `color-mix(in srgb, ${meta.color} 55%, transparent)`;
-    return chip;
-}
-
 function statusNode(status) {
     const resolved = status === 'RESOLVED';
     return h('span.status-cell', h(`span.pip.${resolved ? 'ok' : 'err'}`), status || '—');
@@ -157,7 +148,7 @@ function buildColumns(namesRef) {
     return [
         {
             key: 'severity', label: 'Severity', width: '110px',
-            render: (r) => sevChipNode(r.severity),
+            render: (r) => severityChipNode(r.severity),
             sortValue: (r) => r.severity || '',
         },
         {

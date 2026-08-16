@@ -40,22 +40,103 @@ export function toast(message, kind) {
 
 export const SEVERITY_ORDER = ['INFORMATION', 'WARNING', 'AVERAGE', 'HIGH', 'DISASTER'];
 
+/*
+ * Severity ramp. Four rungs are host tokens; AVERAGE is the exception and has
+ * to be, because the host's `--amber` cannot express it:
+ *
+ *   dark   --warn and --amber are BOTH #f0b541 — Warning and Average render
+ *          pixel-identical, so two rungs of a five-step ordinal ramp are
+ *          indistinguishable.
+ *   light  --amber is never redefined under [data-theme="light"], so Average
+ *          inherits that same dark-theme yellow onto a white background, where
+ *          it is both too pale to read and still confusable with Warning.
+ *
+ * So AVERAGE resolves through a plugin-owned `--sn-sev-average` (defined per
+ * theme in host.jsx's head stylesheet, which is installed at plugin load and
+ * is therefore present whether or not the Sentinel view is mounted). The
+ * fallback in the var() keeps the chip sane if that stylesheet is ever missing.
+ * This is a workaround for a host token gap, not a redesign — the other four
+ * rungs deliberately still track the host's palette.
+ */
 export const SEVERITY_META = {
     INFORMATION: { label: 'Information', color: 'var(--text-dim)', rank: 0 },
     WARNING: { label: 'Warning', color: 'var(--warn)', rank: 1 },
-    AVERAGE: { label: 'Average', color: 'var(--amber)', rank: 2 },
+    AVERAGE: { label: 'Average', color: 'var(--sn-sev-average, #f08c3c)', rank: 2 },
     HIGH: { label: 'High', color: 'var(--err)', rank: 3 },
-    DISASTER: { label: 'Disaster', color: 'color-mix(in srgb, var(--err) 80%, black)', rank: 4 },
+    // `top` marks the rung that gets extra visual weight rather than another
+    // hue — see below for why, and host.jsx for how the dashboard badge honours
+    // the same flag with a different treatment.
+    DISASTER: { label: 'Disaster', color: 'var(--err)', rank: 4, top: true },
 };
 
+/**
+ * The severity pill. Outlined with a colour dot for the first four rungs;
+ * DISASTER is rendered FILLED instead.
+ *
+ * <h3>Why the top rung is a treatment, not a colour</h3>
+ *
+ * <p>Disaster used to be {@code color-mix(--err 80%, black)} — High darkened.
+ * Two problems. Against High it was a small lightness step on an already
+ * similar red, indistinguishable at the 7px dot these chips use. And
+ * <em>darkening</em> to mean "worse" is light-theme reasoning: on the dark
+ * theme it made the most severe rung the dimmest thing in the ramp, so the top
+ * of the scale receded exactly where it should shout.</p>
+ *
+ * <p>Reaching for a fifth hue (crimson, magenta) fixes it only for people who
+ * see colour — in greyscale the dots collapse again — and it reads as a
+ * different category rather than a higher step, which breaks the
+ * hotter-is-worse story the other four rungs tell. So Disaster keeps
+ * {@code --err} and earns its distinction from <em>weight</em>: it is the only
+ * filled chip. That survives greyscale, survives colour-blindness, and needs no
+ * new colour to be picked or maintained per theme.</p>
+ *
+ * <p>The ink flips with the theme because the fill does: dark theme's
+ * {@code --err} (#ff5f5f) is bright and takes dark ink, light theme's
+ * (#cc3b3b) is deep and takes white — the same problem, and the same fix, as
+ * the dashboard badge's Warning/Average ink.</p>
+ */
 export function SeverityChip({ severity }) {
     const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
+    if (meta.top) {
+        return (
+            <span className="tag sn-sev sn-sev-top" style={{ background: meta.color }}>
+                {meta.label}
+            </span>
+        );
+    }
     return (
         <span className="tag sn-sev" style={{ borderColor: `color-mix(in srgb, ${meta.color} 55%, transparent)` }}>
             <span className="sn-sev-dot" style={{ background: meta.color }} />
             {meta.label}
         </span>
     );
+}
+
+/**
+ * DOM twin of {@link SeverityChip}, for DataTable cell renderers — a column's
+ * {@code render()} must return a DOM node or a string, never JSX.
+ *
+ * <p><b>Shared deliberately.</b> This existed as two near-identical private
+ * copies, in monitors.jsx and problems.jsx, and the copies are what made the
+ * filled top rung a trap: changing {@link SeverityChip} updated the React chip
+ * while both tables carried on drawing Disaster as an outlined dot — including
+ * the Monitors list, which is where the High/Disaster collision was actually
+ * noticed. One chip with three implementations is how a severity ramp ends up
+ * meaning different things on different screens.</p>
+ */
+export function severityChipNode(severity) {
+    const { h } = platform.ui;
+    const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
+    if (meta.top) {
+        const chip = h('span.tag.sn-sev.sn-sev-top', String(meta.label));
+        chip.style.background = meta.color;
+        return chip;
+    }
+    const dot = h('span.sn-sev-dot');
+    dot.style.background = meta.color;
+    const chip = h('span.tag.sn-sev', dot, String(meta.label));
+    chip.style.borderColor = `color-mix(in srgb, ${meta.color} 55%, transparent)`;
+    return chip;
 }
 
 /* ---- monitor types ------------------------------------------------------ */

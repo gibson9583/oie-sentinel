@@ -19,7 +19,7 @@ import {
     getCoreChannelGroups, getCoreTags, errText,
 } from '../api.js';
 import {
-    canManage, toast, useApi, useDataTable, SeverityChip, SEVERITY_ORDER,
+    canManage, toast, useApi, useDataTable, SeverityChip, severityChipNode, SEVERITY_ORDER,
     SEVERITY_META, MONITOR_TYPE_ORDER, MONITOR_TYPE_META, ChannelPicker,
     ChannelGroupPicker, TagPicker, fmtNum, fmtTime, fmtAgo,
 } from '../ui.jsx';
@@ -85,16 +85,6 @@ function scopeLabel(monitor, channelNames, groupNames, tagNames) {
         return `Tag: ${tagNames[monitor.scopeId] || monitor.scopeId || '?'}`;
     }
     return 'All channels';
-}
-
-/** DOM twin of ui.jsx's SeverityChip — DataTable cell renderers must return
-    DOM nodes, not React elements. */
-function severityChipNode(severity) {
-    const meta = SEVERITY_META[severity] || { label: severity || '—', color: 'var(--text-faint)' };
-    return h('span.tag.sn-sev',
-        { style: { borderColor: `color-mix(in srgb, ${meta.color} 55%, transparent)` } },
-        h('span.sn-sev-dot', { style: { background: meta.color } }),
-        meta.label);
 }
 
 /* Columns/options are captured ONCE by DataTable at mount; every callback
