@@ -13,7 +13,7 @@
 // settings form above keeps canManageSettings().
 
 import { platform } from '@oie/web-shell';
-import { errorModal, confirmDialog } from '@oie/web-ui';
+import { errorModal, confirmDialog, saveFile, pickFile } from '@oie/web-ui';
 import {
     getSettings, updateSettings, exportConfiguration, importConfiguration, errText,
 } from '../api.js';
@@ -147,25 +147,22 @@ function ExportImportPanel() {
     const [doc, setDoc] = React.useState(null);     // { name, parsed }
     const [result, setResult] = React.useState(null);
 
+    // saveFile gives a native Save As dialog where the browser supports the
+    // File System Access API and falls back to a plain download elsewhere. It
+    // must be handed a FUNCTION, not a value: the picker only opens inside the
+    // click gesture, so the export fetch has to run after the operator has
+    // chosen where the file goes.
     const download = async () => {
         setBusy('export');
         try {
-            const exported = await exportConfiguration();
-            // Re-serialized with two-space indent rather than saved as the wire
-            // sent it: the point of the file is to live in a repository, and a
-            // single-line document makes every review diff useless.
-            const blob = new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            // Anchor must be in the document for click() to download in every
-            // browser, and the object URL must outlive the click — hence the
-            // append/click/remove/defer-revoke dance rather than a bare click.
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = exportFilename(new Date());
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 0);
+            await saveFile(exportFilename(new Date()), 'application/json', async () => {
+                const exported = await exportConfiguration();
+                // Re-serialized with two-space indent rather than saved as the
+                // wire sent it: the point of the file is to live in a
+                // repository, and a single-line document makes every review
+                // diff useless.
+                return JSON.stringify(exported, null, 2);
+            });
             toast('Configuration exported.', 'success');
         } catch (e) {
             errorModal('Export Failed', errText(e));
@@ -174,12 +171,12 @@ function ExportImportPanel() {
         }
     };
 
-    const pick = async (e) => {
-        const file = e.target.files && e.target.files[0];
-        if (!file) return;
+    const pick = async () => {
+        const file = await pickFile('application/json,.json');
+        if (!file) return;   // dialog dismissed
         setResult(null);
         try {
-            setDoc({ name: file.name, parsed: JSON.parse(await file.text()) });
+            setDoc({ name: file.name, parsed: JSON.parse(file.content) });
         } catch (err) {
             setDoc(null);
             errorModal('Invalid File', `${file.name} is not valid JSON.`);
@@ -236,9 +233,13 @@ function ExportImportPanel() {
                         onClick={download}>
                         {busy === 'export' ? 'Exporting…' : 'Export configuration'}
                     </button>
-                    <input type="file" accept="application/json,.json"
+                    <button type="button" className="btn"
                         disabled={!manage || !!busy}
-                        onChange={pick} />
+                        title={manageTitle}
+                        onClick={pick}>
+                        Choose file…
+                    </button>
+                    {doc ? <span className="sn-hint">{doc.name}</span> : null}
                 </div>
 
                 <div className="flex items-center gap-2 mt-3">
