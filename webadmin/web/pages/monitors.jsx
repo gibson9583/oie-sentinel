@@ -23,6 +23,7 @@ import {
     SEVERITY_META, MONITOR_TYPE_ORDER, MONITOR_TYPE_META, ChannelPicker,
     ChannelGroupPicker, TagPicker, fmtNum, fmtTime, fmtAgo,
 } from '../ui.jsx';
+import { readIntent, clearIntent } from '../host.jsx';
 
 const React = platform.React;
 const { h } = platform.ui;
@@ -1091,6 +1092,26 @@ export function MonitorsPage() {
     const tags = useApi(getCoreTags, []);
     const [view, setView] = React.useState(null); // null | { mode: 'new' } | { mode: 'edit', monitor }
     const manage = canManage();
+
+    /* The "New Sentinel Monitor" palette command lands here (see host.jsx).
+       Consume it on mount — the shell has already switched to this tab — and
+       clear it, so returning to Monitors later does not reopen an editor
+       nobody asked for. */
+    React.useEffect(() => {
+        const intent = readIntent();
+        if (!intent || intent.kind !== 'newMonitor') {
+            return;
+        }
+        clearIntent();
+        if (!canManage()) {
+            // The palette gates this on doManageSentinel, but checkTask fails
+            // open when no authorization plugin is installed. Say why rather
+            // than opening an editor whose Save the servlet would refuse.
+            toast('Creating a monitor requires the Manage Monitoring permission.', 'info');
+            return;
+        }
+        setView({ mode: 'new' });
+    }, []);
 
     // Scope names silently degrade to raw ids when these fail — still surface
     // it, but as 'info': the host shows warn toasts as blocking modals, too

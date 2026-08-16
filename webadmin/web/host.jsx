@@ -169,7 +169,8 @@ function installHostStyles() {
 /**
  * The store key a host-surface action uses to tell the Sentinel view what the
  * operator actually wanted before navigating to it. Values look like
- * `{ kind: 'dashboard' | 'problems' | 'unacknowledged' | 'schedules', channelId, at }`.
+ * `{ kind: 'dashboard' | 'problems' | 'unacknowledged' | 'schedules' | 'newMonitor',
+ *    channelId, at }`.
  *
  * <p>A store handoff rather than a URL parameter because the plugin registers
  * exactly one route. The `at` stamp is not decoration: `setState` notifies on
@@ -528,6 +529,24 @@ export function registerHostSurfaces() {
             label: 'Sentinel: Schedules',
             keywords: ['maintenance', 'window', 'suppress', 'mute', 'on-call'],
             run: () => dispatchIntent('schedules', null),
+        },
+        {
+            // The one entry that opens an editor rather than just a tab, and
+            // so the one gated on the AUTHORING task instead of the view task.
+            // It sits in the host's own 'Create' section next to New Channel
+            // and New Alert — that grouping is where an operator looks for
+            // "make me a new X", and the host's palette already establishes
+            // create entry points as a first-class category.
+            //
+            // Still navigation, not a mutation: it opens a blank editor and
+            // nothing is written until the operator saves inside Sentinel.
+            id: 'sentinel-new-monitor',
+            label: 'New Sentinel Monitor',
+            icon: 'plus',
+            section: 'Create',
+            task: 'doManageSentinel',
+            keywords: ['create', 'add', 'monitor', 'sentinel', 'alert'],
+            run: () => dispatchIntent('newMonitor', null),
         },
     ];
     commands.forEach((command) => platform.registerCommand?.({

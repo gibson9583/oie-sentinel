@@ -92,6 +92,7 @@ const INTENT_TABS = {
     problems: 'problems',
     unacknowledged: 'problems',
     schedules: 'schedules',
+    newMonitor: 'monitors',
 };
 
 /* Kinds that are nothing but "open this tab". No page reads them, so nobody

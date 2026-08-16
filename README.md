@@ -107,9 +107,20 @@ reports "still loading" and never falls back to "not watched".
 Open problems are polled once for the whole table rather than once per row; coverage is re-read
 every five minutes, since it only changes when somebody edits a monitor.
 
-**Command palette** (⌘K / Ctrl+K, then `>`) entries for the dashboard, open problems, unacknowledged
-problems, and schedules. These register into the host's own palette rather than a Sentinel-specific
-one, so they sit alongside its built-in entries and are filtered through the same permission check.
+**Command palette** (⌘K / Ctrl+K, then `>`) entries:
+
+| Entry | Section | Needs |
+| --- | --- | --- |
+| Sentinel: Dashboard | Monitor | View Monitoring |
+| Sentinel: Open problems | Monitor | View Monitoring |
+| Sentinel: Unacknowledged problems | Monitor | View Monitoring |
+| Sentinel: Schedules | Monitor | View Monitoring |
+| New Sentinel Monitor | Create | Manage Monitoring |
+
+The first four open a Sentinel tab; the last opens a blank monitor editor and sits in the palette's
+*Create* section with the host's own New Channel and New Alert. All register into the host's palette
+rather than a Sentinel-specific one, so they sit alongside its built-in entries and are filtered
+through the same permission check it applies to those.
 
 **Operations**
 - Dashboard tab with problem counts by severity, per-channel activity charts, and top channels.
