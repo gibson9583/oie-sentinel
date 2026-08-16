@@ -826,7 +826,7 @@ function MonitorHistoryPanel({ monitorId }) {
 
 function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
     const isNew = !monitor;
-    const [name, setName] = React.useState(monitor ? monitor.name : '');
+    const [name, setName] = React.useState((monitor && monitor.name) || '');
     const [description, setDescription] = React.useState((monitor && monitor.description) || '');
     const [runbookUrl, setRunbookUrl] = React.useState((monitor && monitor.runbookUrl) || '');
     const [monitorType, setMonitorType] = React.useState((monitor && monitor.monitorType) || 'INACTIVITY');

@@ -84,6 +84,31 @@ immediately.
   End at or before start wraps past midnight (e.g. 22:00–06:00).
 - "Activate now" re-times a one-time window mid-incident without editing it.
 
+**Outside the Sentinel tab.** Sentinel adds a column to the Dashboard and entries to the command
+palette — so an operator does not have to know Sentinel exists to see that a channel is alarming.
+Both only read Sentinel state or navigate into the plugin; everything that changes a monitor, an
+action or a schedule lives in Sentinel's own UI.
+
+**A Sentinel column in the Dashboard's channel table.** One badge per channel, in three states:
+
+| Badge | Meaning |
+| --- | --- |
+| A **count**, filled in the severity colour | Open problems. The number is how many are open, the colour is the highest severity among them — three Information problems and one Disaster are very different situations, and a count or a colour alone would render them identically. Click it to open that channel's problems. |
+| A green **✓** outline | Monitored, nothing open. |
+| A dashed grey **–** | No enabled monitor covers this channel. Sentinel has nothing to say about it. |
+
+That last distinction is the point of the column. Reporting "no monitor is watching this" the same
+way as "watched and healthy" would present the absence of a watcher as the absence of a problem,
+which is the most misleading thing a monitoring column could do. Coverage is resolved exactly —
+channel scope directly, group and tag scopes through membership, and one ALL-scoped monitor covering
+everything — using the same rule the evaluator applies. If the coverage lookup fails, the badge
+reports "still loading" and never falls back to "not watched".
+
+Open problems are polled once for the whole table rather than once per row; coverage is re-read
+every five minutes, since it only changes when somebody edits a monitor.
+
+**Command palette** entries for open problems, unacknowledged problems, and schedules.
+
 **Operations**
 - Dashboard tab with problem counts by severity, per-channel activity charts, and top channels.
 - Per-monitor history: alert count and mean time-to-resolve over time.

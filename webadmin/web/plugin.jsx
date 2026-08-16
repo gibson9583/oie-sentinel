@@ -9,6 +9,7 @@
 
 import { platform } from '@oie/web-shell';
 import { canManage, canManageSettings } from './ui.jsx';
+import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
@@ -83,8 +84,57 @@ const TABS = [
     { key: 'settings', label: 'Settings', component: SettingsPage, manageOnly: true },
 ];
 
+/* Which tab an intent from a host surface (see host.jsx) lands on. For the
+   kinds carrying a payload the page needs, the intent is left in the store for
+   that page to consume and clear — this only decides where to look. */
+const INTENT_TABS = {
+    problems: 'problems',
+    unacknowledged: 'problems',
+    schedules: 'schedules',
+};
+
+/* Kinds that are nothing but "open this tab". No page reads them, so nobody
+   downstream would ever clear them — the shell must, or the next time this
+   view mounts it would obey a months-old palette click. */
+const SHELL_CONSUMED = new Set(['schedules']);
+
+function tabForIntent(intent) {
+    return intent && INTENT_TABS[intent.kind];
+}
+
 function SentinelView() {
-    const [tab, setTab] = React.useState('dashboard');
+    // Read the pending intent in the initializer as well as subscribing below:
+    // a palette command sets it and navigates, so it is already there when
+    // this view first mounts and there is no notification left to catch.
+    const [tab, setTab] = React.useState(() => {
+        const intent = readIntent();
+        const target = tabForIntent(intent);
+        if (target && SHELL_CONSUMED.has(intent.kind)) clearIntent();
+        return target || 'dashboard';
+    });
+    /* Bumped on each arriving intent and mixed into the page key, so a second
+       hand-off REMOUNTS the target page. Without it, an intent naming a
+       different channel while that tab is already open changes nothing: pages
+       read the intent in a state initializer (to get the first fetch right),
+       and an initializer only runs at mount. */
+    const [intentStamp, setIntentStamp] = React.useState(0);
+
+    React.useEffect(() => {
+        try {
+            return platform.store.subscribe(INTENT_KEY, (value) => {
+                // Null is the consuming page clearing it, not a new request.
+                const target = tabForIntent(value);
+                if (target) {
+                    setTab(target);
+                    setIntentStamp((n) => n + 1);
+                    if (SHELL_CONSUMED.has(value.kind)) clearIntent();
+                }
+            });
+        } catch (e) {
+            return undefined;   // no store: host surfaces simply do not hand off
+        }
+    }, []);
+
     // checkTask is synchronous and fails open without RBAC; hidden-tab decision
     // is cosmetic — the servlet's permissions are the real gate. Settings is
     // reachable by either tier: Manage Settings is a standalone permission, so
@@ -105,7 +155,7 @@ function SentinelView() {
                 ))}
             </div>
             <div className="view-body">
-                <Page />
+                <Page key={`${active.key}-${intentStamp}`} />
             </div>
         </div>
     );
@@ -129,4 +179,7 @@ export function register() {
         task: 'doShowSentinel',
     });
     platform.registerView('/sentinel', platform.reactView(SentinelView), { title: 'OIE Sentinel' });
+    // Registered after the icon, which the dashboard column and channel
+    // actions both reference by name.
+    registerHostSurfaces();
 }

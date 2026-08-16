@@ -605,37 +605,65 @@ export function useMonitoredChannels(channels) {
     return React.useMemo(() => {
         const list = Array.isArray(channels) ? channels : [];
         const all = { channels: list, filtered: false, total: list.length };
-        const defined = Array.isArray(monitors.data) ? monitors.data.filter((m) => m && m.enabled) : null;
+        const coverage = resolveCoverage(monitors.data, groups.data, tags.data);
         // Still loading, failed, or nothing to narrow by: show everything.
-        if (!defined || !defined.length || !list.length) return all;
-        if (defined.some((m) => m.scopeType === 'ALL')) return all;
+        if (!coverage.known || coverage.coversAll || !list.length) return all;
 
-        const members = (rows, key) => {
-            const map = {};
-            (Array.isArray(rows) ? rows : []).forEach((r) => {
-                if (r && r[key]) map[r[key]] = Array.isArray(r.channelIds) ? r.channelIds : [];
-            });
-            return map;
-        };
-        const groupMembers = members(groups.data, 'id');
-        const tagMembers = members(tags.data, 'id');
-
-        const covered = new Set();
-        defined.forEach((m) => {
-            if (m.scopeType === 'CHANNEL') {
-                if (m.scopeId) covered.add(m.scopeId);
-            } else if (m.scopeType === 'GROUP') {
-                (groupMembers[m.scopeId] || []).forEach((id) => covered.add(id));
-            } else if (m.scopeType === 'TAG') {
-                (tagMembers[m.scopeId] || []).forEach((id) => covered.add(id));
-            }
-        });
-
-        const narrowed = list.filter((c) => covered.has(c.channelId));
+        const narrowed = list.filter((c) => coverage.covered.has(c.channelId));
         return narrowed.length
             ? { channels: narrowed, filtered: narrowed.length < list.length, total: list.length }
             : all;
     }, [channels, monitors.data, groups.data, tags.data]);
+}
+
+/**
+ * Resolves which channels at least one ENABLED monitor actually covers, from
+ * already-fetched monitor / group / tag lists.
+ *
+ * <p>Extracted from {@link useMonitoredChannels} so the host Dashboard column
+ * (which is not a hook context and runs off a shared poll rather than three
+ * {@code useApi} calls) applies the identical rule. Two places deciding
+ * separately what "monitored" means is exactly how a coverage indicator ends
+ * up disagreeing with the picker that claims to show the same thing.</p>
+ *
+ * @param monitors GET /monitors
+ * @param groups   GET /core/channelGroups
+ * @param tags     GET /core/tags
+ * @returns { known, coversAll, covered } — `known` is false while the monitor
+ *          list has not loaded or failed, and callers MUST NOT report anything
+ *          as unmonitored in that state; `coversAll` short-circuits the set
+ *          because a single enabled ALL-scoped monitor covers every channel
+ *          that exists, including ones created later
+ */
+export function resolveCoverage(monitors, groups, tags) {
+    const empty = { known: false, coversAll: false, covered: new Set() };
+    const defined = Array.isArray(monitors) ? monitors.filter((m) => m && m.enabled) : null;
+    if (!defined) return empty;
+    if (defined.some((m) => m.scopeType === 'ALL')) {
+        return { known: true, coversAll: true, covered: new Set() };
+    }
+
+    const members = (rows, key) => {
+        const map = {};
+        (Array.isArray(rows) ? rows : []).forEach((r) => {
+            if (r && r[key]) map[r[key]] = Array.isArray(r.channelIds) ? r.channelIds : [];
+        });
+        return map;
+    };
+    const groupMembers = members(groups, 'id');
+    const tagMembers = members(tags, 'id');
+
+    const covered = new Set();
+    defined.forEach((m) => {
+        if (m.scopeType === 'CHANNEL') {
+            if (m.scopeId) covered.add(m.scopeId);
+        } else if (m.scopeType === 'GROUP') {
+            (groupMembers[m.scopeId] || []).forEach((id) => covered.add(id));
+        } else if (m.scopeType === 'TAG') {
+            (tagMembers[m.scopeId] || []).forEach((id) => covered.add(id));
+        }
+    });
+    return { known: true, coversAll: false, covered };
 }
 
 /**

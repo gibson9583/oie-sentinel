@@ -21,6 +21,7 @@ import {
     ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, SEVERITY_META,
     MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
+import { readIntent, clearIntent } from '../host.jsx';
 
 const React = platform.React;
 const { h, modal } = platform.ui;
@@ -194,8 +195,36 @@ function buildColumns(namesRef) {
 
 /* ---- page --------------------------------------------------------------- */
 
+/**
+ * Turns a pending host-surface intent (see host.jsx) into the filter set the
+ * list should open with, or returns the defaults when there is none.
+ *
+ * <p>Consumed in a state initializer rather than an effect: an effect would
+ * render the default filter set first, fire its fetch, and only then narrow —
+ * so clicking a channel's severity chip on the host Dashboard would flash
+ * every open problem on the server before showing the one channel's. Reading
+ * it before the first render means the very first request is already the right
+ * one.</p>
+ */
+function initialFilters() {
+    const intent = readIntent();
+    if (!intent) {
+        return DEFAULT_PROBLEM_FILTERS;
+    }
+    if (intent.kind === 'problems') {
+        clearIntent();
+        return { ...DEFAULT_PROBLEM_FILTERS, channelId: intent.channelId || '' };
+    }
+    if (intent.kind === 'unacknowledged') {
+        clearIntent();
+        return { ...DEFAULT_PROBLEM_FILTERS, acknowledged: 'false' };
+    }
+    // Some other page's intent (a monitor hand-off); leave it for that page.
+    return DEFAULT_PROBLEM_FILTERS;
+}
+
 export function ProblemsPage() {
-    const [filters, setFilters] = React.useState(DEFAULT_PROBLEM_FILTERS);
+    const [filters, setFilters] = React.useState(initialFilters);
     const [page, setPage] = React.useState(0);
     const [sort, setSort] = React.useState(DEFAULT_SORT);
     const [data, setData] = React.useState(null);       // { items, total }
