@@ -20,6 +20,7 @@ import org.quartz.JobExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.mirth.connect.donkey.server.channel.Channel;
 import com.mirth.connect.server.controllers.ControllerFactory;
 import com.mirth.connect.server.controllers.EngineController;
 
@@ -580,8 +581,10 @@ public class TriggerEvaluatorJob implements Job {
      *
      * <p><b>Did this trigger identity depart from a channel that stayed?</b>
      * If the channel is still present <em>and</em> was conclusively evaluated
-     * this tick, but this row's metadata id was not among what the evaluator
-     * returned, the row's subject is gone. Two ways that happens:</p>
+     * this tick, a missing metadata id may indicate departure or a rollup
+     * change. Within connector rollup we also verify that the id is absent
+     * from the deployed channel: a partial set of observations after restart
+     * cannot establish removal on its own. Two departure cases are:</p>
      *
      * <ul>
      *   <li>A destination connector was deleted from the channel and the
@@ -618,9 +621,9 @@ public class TriggerEvaluatorJob implements Job {
         }
 
         for (TriggerState state : states) {
-            // Cheap gate first: only an open problem can be auto-resolved, and
-            // skipping early avoids an isDeployed() call per healthy trigger.
-            if (state.getState() != TriggerStatus.PROBLEM || state.getOpenAlertEventId() == null) {
+            // INSUFFICIENT_DATA deliberately retains open alerts. Departure
+            // cleanup follows that reference, not the last evaluation result.
+            if (state.getOpenAlertEventId() == null) {
                 continue;
             }
 
@@ -646,6 +649,23 @@ public class TriggerEvaluatorJob implements Job {
                 Set<Integer> evaluated = evaluatedTriggers.get(state.getChannelId());
                 if (evaluated == null || evaluated.contains(state.getMetadataId())) {
                     continue; // channel not judged this tick, or this row still is
+                }
+                if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS
+                        && state.getMetadataId() != null && !evaluated.contains(null)) {
+                    // Observations can repopulate one connector at a time after
+                    // restart. Missing telemetry is not connector removal. A
+                    // null evaluated id instead proves a CHANNEL rollup change.
+                    try {
+                        Channel deployed = engineController.getDeployedChannel(state.getChannelId());
+                        List<Integer> metadataIds = deployed == null ? null : deployed.getMetaDataIds();
+                        if (metadataIds == null || metadataIds.contains(state.getMetadataId())) {
+                            continue;
+                        }
+                    } catch (Exception e) {
+                        log.warn("Cannot verify connector departure for channel {}; retaining alert {}",
+                                state.getChannelId(), state.getOpenAlertEventId(), e);
+                        continue;
+                    }
                 }
                 message = TRIGGER_LEFT_MESSAGE;
             }

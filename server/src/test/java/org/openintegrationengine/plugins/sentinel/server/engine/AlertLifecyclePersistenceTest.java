@@ -15,7 +15,10 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.*;
 
+import com.mirth.connect.donkey.server.channel.Channel;
 import com.mirth.connect.server.util.SqlConfig;
+import com.mirth.connect.server.controllers.ControllerFactory;
+import com.mirth.connect.server.controllers.EngineController;
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
 import org.apache.ibatis.datasource.unpooled.UnpooledDataSource;
 import org.apache.ibatis.mapping.Environment;
@@ -250,6 +253,184 @@ class AlertLifecyclePersistenceTest {
         breach();
         assertEquals(2, count("sentinel_alert_event"));
         assertNotEquals(event.getId(), state().getOpenAlertEventId());
+    }
+
+    private void sweep(Set<String> targets, Map<String, Set<Integer>> evaluated) throws Exception {
+        java.lang.reflect.Method sweep = TriggerEvaluatorJob.class.getDeclaredMethod(
+                "autoResolveDepartedTriggers", Monitor.class, Set.class, Map.class, Instant.class);
+        sweep.setAccessible(true);
+        // Production recordEvaluated uses HashSet, including null for channel rollups.
+        Map<String, Set<Integer>> observed = new HashMap<>();
+        evaluated.forEach((id, metadataIds) -> observed.put(id, new HashSet<>(metadataIds)));
+        sweep.invoke(null, monitor, targets, observed, now);
+    }
+
+    private AlertEvent retainedAlert(Integer metadataId) {
+        TriggerEvaluatorJob.applyOutcome(monitor, channel, metadataId,
+                EvaluationOutcome.breach("{}", "breach"), now);
+        TriggerEvaluatorJob.applyOutcome(monitor, channel, metadataId,
+                EvaluationOutcome.insufficientData("{}"), now);
+        TriggerState retained = TriggerStateRepository.getTriggerState(monitor.getId(), channel, metadataId);
+        assertEquals(TriggerStatus.INSUFFICIENT_DATA, retained.getState());
+        assertNotNull(retained.getOpenAlertEventId());
+        dispatch.reset();
+        return AlertEventRepository.getAlertEvent(retained.getOpenAlertEventId());
+    }
+
+    @Test
+    void retainedAlertResolvesOnceWhenChannelDepartsAfterDataGap() throws Exception {
+        AlertEvent event = retainedAlert(null);
+        sweep(Set.of(), Map.of());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
+        assertNull(state().getOpenAlertEventId());
+        sweep(Set.of(), Map.of());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+    }
+
+    @Test
+    void retainedConnectorRequiresConclusiveDepartureEvidence() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        AlertEvent event = retainedAlert(1);
+        ControllerFactory factory = mock(ControllerFactory.class);
+        EngineController engine = mock(EngineController.class);
+        when(factory.createEngineController()).thenReturn(engine);
+        when(engine.isDeployed(channel)).thenReturn(true);
+        Channel deployed = mock(Channel.class);
+        when(engine.getDeployedChannel(channel)).thenReturn(deployed);
+        when(deployed.getMetaDataIds()).thenReturn(List.of(0, 2));
+        try (var controllers = mockStatic(ControllerFactory.class)) {
+            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
+            // Missing evaluation is not evidence that a connector disappeared.
+            sweep(Set.of(channel), Map.of());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            // A connector still evaluated remains open even while data is insufficient.
+            sweep(Set.of(channel), Map.of(channel, Set.of(1)));
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            dispatch.verifyNoInteractions();
+            // A completed evaluation of this channel now contains only connector 2.
+            sweep(Set.of(channel), Map.of(channel, Set.of(2)));
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            assertNull(TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1).getOpenAlertEventId());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        }
+    }
+
+    @Test
+    void partialConnectorObservationsDoNotResolveStillDeployedSource() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        AlertEvent event = retainedAlert(0);
+        ControllerFactory factory = mock(ControllerFactory.class);
+        EngineController engine = mock(EngineController.class);
+        Channel deployed = mock(Channel.class);
+        when(factory.createEngineController()).thenReturn(engine);
+        when(engine.isDeployed(channel)).thenReturn(true);
+        when(engine.getDeployedChannel(channel)).thenReturn(deployed);
+        when(deployed.getMetaDataIds()).thenReturn(List.of(0, 1));
+        try (var controllers = mockStatic(ControllerFactory.class)) {
+            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
+            // Destination observations returned first after collector restart.
+            sweep(Set.of(channel), Map.of(channel, Set.of(1)));
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            assertEquals(event.getId(), TriggerStateRepository.getTriggerState(monitor.getId(), channel, 0).getOpenAlertEventId());
+            dispatch.verifyNoInteractions();
+            // Also preserve the source if the paused channel remains deployed.
+            sweep(Set.of(), Map.of());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            dispatch.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    void unavailableConnectorIdentityRetainsAlert() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        AlertEvent event = retainedAlert(1);
+        ControllerFactory factory = mock(ControllerFactory.class);
+        EngineController engine = mock(EngineController.class);
+        when(factory.createEngineController()).thenReturn(engine);
+        when(engine.isDeployed(channel)).thenReturn(true);
+        try (var controllers = mockStatic(ControllerFactory.class)) {
+            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
+            sweep(Set.of(channel), Map.of(channel, Set.of(2))); // No runtime channel available.
+            when(engine.getDeployedChannel(channel)).thenThrow(new IllegalStateException("unavailable"));
+            sweep(Set.of(channel), Map.of(channel, Set.of(2)));
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            dispatch.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    void retainedAlertsResolveWhenRollupShapeChangesInEitherDirection() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        ControllerFactory factory = mock(ControllerFactory.class);
+        EngineController engine = mock(EngineController.class);
+        when(factory.createEngineController()).thenReturn(engine);
+        when(engine.isDeployed(channel)).thenReturn(true);
+        try (var controllers = mockStatic(ControllerFactory.class)) {
+            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
+            AlertEvent connector = retainedAlert(1);
+            sweep(Set.of(channel), Map.of(channel, Collections.singleton(null)));
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(connector.getId()).getStatus());
+            assertNull(TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1).getOpenAlertEventId());
+            AlertEvent rolledUp = retainedAlert(null);
+            sweep(Set.of(channel), Map.of(channel, Set.of(1)));
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(rolledUp.getId()).getStatus());
+            assertNull(state().getOpenAlertEventId());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1)); // reset by retainedAlert
+            verify(engine, never()).getDeployedChannel(anyString());
+        }
+    }
+
+    @Test
+    void suppressedRetainedDepartureClosesWithoutNotification() throws Exception {
+        AlertEvent event = retainedAlert(null);
+        sql("UPDATE sentinel_alert_event SET suppressed = true WHERE id = " + event.getId());
+        sweep(Set.of(), Map.of());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertNull(state().getOpenAlertEventId());
+        dispatch.verifyNoInteractions();
+    }
+
+    @Test
+    void retainedConnectionAlertResolvesOnUndeployment() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        AlertEvent event = retainedAlert(1);
+        ControllerFactory factory = mock(ControllerFactory.class);
+        EngineController engine = mock(EngineController.class);
+        when(factory.createEngineController()).thenReturn(engine);
+        when(engine.isDeployed(channel)).thenReturn(false);
+        try (var controllers = mockStatic(ControllerFactory.class)) {
+            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
+            sweep(Set.of(), Map.of());
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        }
+    }
+
+    @Test
+    void retainedChannelStaysOpenWhileStillInScope() throws Exception {
+        AlertEvent event = retainedAlert(null);
+        sweep(Set.of(channel), Map.of());
+        sweep(Set.of(channel), Map.of(channel, Collections.singleton(null)));
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(event.getId(), state().getOpenAlertEventId());
+        dispatch.verifyNoInteractions();
+    }
+
+    @Test
+    void retainedDepartureRollsBackAndRetriesWithoutLostResolution() throws Exception {
+        AlertEvent event = retainedAlert(null);
+        sql("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT reject_clear CHECK (open_alert_event_id IS NOT NULL)");
+        assertThrows(java.lang.reflect.InvocationTargetException.class, () -> sweep(Set.of(), Map.of()));
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(event.getId(), state().getOpenAlertEventId());
+        assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
+        dispatch.verifyNoInteractions();
+        sql("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT reject_clear");
+        sweep(Set.of(), Map.of());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertNull(state().getOpenAlertEventId());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
     }
 
     @Test
