@@ -110,17 +110,27 @@
              #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed})
     </insert>
 
-    <update id="updateAlertEvent" parameterType="map">
+    <update id="acknowledgeAlertEvent" parameterType="map">
         UPDATE sentinel_alert_event
-        <set>
-            status = #{status},
-            <if test="resolved_time != null">resolved_time = #{resolved_time,jdbcType=TIMESTAMP},</if>
-            <if test="acknowledged_by != null">acknowledged_by = #{acknowledged_by,jdbcType=INTEGER},</if>
-            <if test="acknowledged_time != null">acknowledged_time = #{acknowledged_time,jdbcType=TIMESTAMP},</if>
-            <if test="ack_comment != null">ack_comment = #{ack_comment},</if>
-            <if test="details_json != null">details_json = #{details_json},</if>
-        </set>
-        WHERE id = #{id}
+        SET acknowledged_by = #{acknowledged_by,jdbcType=INTEGER},
+            acknowledged_time = #{acknowledged_time,jdbcType=TIMESTAMP},
+            ack_comment = #{ack_comment,jdbcType=VARCHAR}
+        WHERE id = #{id} AND status = 'PROBLEM' AND acknowledged_by IS NULL
+    </update>
+
+    <update id="resolveAlertEvent" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP}
+        WHERE id = #{id} AND status = 'PROBLEM'
+    </update>
+
+    <update id="resolveAlertEventManually" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP},
+            ack_comment = CASE WHEN acknowledged_by IS NULL THEN #{ack_comment,jdbcType=VARCHAR} ELSE ack_comment END,
+            acknowledged_time = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_time,jdbcType=TIMESTAMP} ELSE acknowledged_time END,
+            acknowledged_by = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_by,jdbcType=INTEGER} ELSE acknowledged_by END
+        WHERE id = #{id} AND status = 'PROBLEM'
     </update>
 
     <select id="getAlertEvent" parameterType="map" resultType="map">
@@ -293,11 +303,18 @@
             state = #{state},
             consecutive_breach_count = #{consecutive_breach_count},
             <if test="last_value_json != null">last_value_json = #{last_value_json},</if>
-            <if test="open_alert_event_id != null">open_alert_event_id = #{open_alert_event_id,jdbcType=BIGINT},</if>
+            open_alert_event_id = #{open_alert_event_id,jdbcType=BIGINT},
             <if test="last_change_time != null">last_change_time = #{last_change_time,jdbcType=TIMESTAMP},</if>
             <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time,jdbcType=TIMESTAMP},</if>
         </set>
         WHERE id = #{id}
+    </update>
+
+    <update id="resetTriggerStateForAlert" parameterType="map">
+        UPDATE sentinel_trigger_state
+        SET state = 'OK', consecutive_breach_count = 0, open_alert_event_id = NULL,
+            last_change_time = #{now,jdbcType=TIMESTAMP}
+        WHERE open_alert_event_id = #{alertId,jdbcType=BIGINT}
     </update>
 
     <select id="listTriggerStatesByMonitor" parameterType="map" resultType="map">

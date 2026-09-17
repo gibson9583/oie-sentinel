@@ -26,6 +26,7 @@ import com.mirth.connect.server.controllers.EngineController;
 import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
 import org.openintegrationengine.plugins.sentinel.server.alert.AlertPayload;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
 import org.openintegrationengine.plugins.sentinel.server.db.MaintenanceWindowRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
@@ -346,7 +347,7 @@ public class TriggerEvaluatorJob implements Job {
      *       an alert event (suppression decided once, at creation) and, if
      *       unsuppressed, dispatches. While already PROBLEM, runs the
      *       still-open pass instead (see
-     *       {@link #stillOpenPass(Monitor, TriggerState)}).</li>
+     *       {@link #stillOpenPass(Monitor, TriggerState, List)}).</li>
      *   <li><b>OK</b> — resolves any open alert (also covering the
      *       PROBLEM → INSUFFICIENT_DATA → OK path, where the state is no
      *       longer PROBLEM but an alert is still open) and settles the state
@@ -360,8 +361,14 @@ public class TriggerEvaluatorJob implements Job {
      *       the still-open pass — see {@link #onInsufficientData}.</li>
      * </ul>
      */
-    private static void applyOutcome(Monitor monitor, String channelId, Integer metadataId,
+    static void applyOutcome(Monitor monitor, String channelId, Integer metadataId,
             EvaluationOutcome outcome, Instant now) {
+        AlertLifecycleTransaction.execute(afterCommit ->
+                applyOutcomeInTransaction(monitor, channelId, metadataId, outcome, now, afterCommit));
+    }
+
+    private static void applyOutcomeInTransaction(Monitor monitor, String channelId, Integer metadataId,
+            EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
         TriggerState state = TriggerStateRepository.getTriggerState(monitor.getId(), channelId, metadataId);
         boolean isNew = state == null;
         if (isNew) {
@@ -376,13 +383,13 @@ public class TriggerEvaluatorJob implements Job {
 
         switch (outcome.getResult()) {
             case BREACH:
-                onBreach(monitor, state, channelId, metadataId, outcome, now);
+                onBreach(monitor, state, channelId, metadataId, outcome, now, afterCommit);
                 break;
             case OK:
-                onOk(monitor, state, now);
+                onOk(monitor, state, now, afterCommit);
                 break;
             case INSUFFICIENT_DATA:
-                onInsufficientData(monitor, state, now);
+                onInsufficientData(monitor, state, now, afterCommit);
                 break;
         }
 
@@ -397,15 +404,23 @@ public class TriggerEvaluatorJob implements Job {
 
     /** BREACH branch of {@link #applyOutcome} — see its Javadoc. */
     private static void onBreach(Monitor monitor, TriggerState state, String channelId,
-            Integer metadataId, EvaluationOutcome outcome, Instant now) {
+            Integer metadataId, EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
         int required = Math.max(1, monitor.getMinConsecutiveBreaches());
-        state.setConsecutiveBreachCount(state.getConsecutiveBreachCount() + 1);
-
         if (state.getState() == TriggerStatus.PROBLEM) {
-            // Still breaching: run the still-open pass (repeat + escalation).
-            stillOpenPass(monitor, state);
-            return;
+            AlertEvent open = state.getOpenAlertEventId() == null ? null
+                    : AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
+            if (open != null && open.getStatus() == AlertStatus.PROBLEM) {
+                stillOpenPass(monitor, state, afterCommit);
+                return;
+            }
+            // A manual reset may have failed or raced this evaluator. Rebuild
+            // hysteresis from this observation instead of staying blind forever.
+            state.setState(TriggerStatus.OK);
+            state.setConsecutiveBreachCount(0);
+            state.setOpenAlertEventId(null);
+            state.setLastChangeTime(now);
         }
+        state.setConsecutiveBreachCount(state.getConsecutiveBreachCount() + 1);
 
         if (state.getConsecutiveBreachCount() < required) {
             return; // hysteresis still counting; no transition yet
@@ -417,14 +432,14 @@ public class TriggerEvaluatorJob implements Job {
         // it instead of inserting a second event. Opening a new one here would
         // orphan the retained row forever (every resolve path follows
         // openAlertEventId, which is about to be overwritten) and double-notify
-        // the operator. A retained id pointing at a resolved event (manual
-        // resolve leaves the id stale by design) falls through to a fresh open.
+        // the operator. A retained id pointing at a resolved event (a failed manual
+        // reset can leave the id stale) falls through to a fresh open.
         if (state.getOpenAlertEventId() != null) {
             AlertEvent retained = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
             if (retained != null && retained.getStatus() == AlertStatus.PROBLEM) {
                 state.setState(TriggerStatus.PROBLEM);
                 state.setLastChangeTime(now);
-                stillOpenPass(monitor, state);
+                stillOpenPass(monitor, state, afterCommit);
                 return;
             }
         }
@@ -451,14 +466,14 @@ public class TriggerEvaluatorJob implements Job {
         state.setLastChangeTime(now);
 
         if (!suppressed) {
-            ActionDispatcher.onAlertOpened(event, AlertPayload.of(event, monitor, "PROBLEM"));
+            afterCommit.add(() -> ActionDispatcher.onAlertOpened(event, AlertPayload.of(event, monitor, "PROBLEM")));
         }
     }
 
     /** OK branch of {@link #applyOutcome} — see its Javadoc. */
-    private static void onOk(Monitor monitor, TriggerState state, Instant now) {
+    private static void onOk(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
         if (state.getOpenAlertEventId() != null) {
-            resolveOpenAlert(monitor, state, null, now);
+            resolveOpenAlert(monitor, state, null, now, afterCommit);
         }
         if (state.getState() != TriggerStatus.OK) {
             state.setLastChangeTime(now);
@@ -483,14 +498,14 @@ public class TriggerEvaluatorJob implements Job {
      * <p>This cannot over-notify: the pass is paced entirely by the dispatch
      * log, so a data gap contributes ticks, not notifications.</p>
      */
-    private static void onInsufficientData(Monitor monitor, TriggerState state, Instant now) {
+    private static void onInsufficientData(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
         if (state.getState() != TriggerStatus.INSUFFICIENT_DATA) {
             state.setLastChangeTime(now);
         }
         state.setState(TriggerStatus.INSUFFICIENT_DATA);
         state.setConsecutiveBreachCount(0);
         // openAlertEventId intentionally retained — see applyOutcome Javadoc.
-        stillOpenPass(monitor, state);
+        stillOpenPass(monitor, state, afterCommit);
     }
 
     /**
@@ -503,20 +518,20 @@ public class TriggerEvaluatorJob implements Job {
      * <p>Suppressed alerts are skipped here as well as inside the dispatcher:
      * an alert born under a maintenance window never notifies, and that
      * includes never repeating and never escalating. A state whose retained
-     * {@code openAlertEventId} points at an already-resolved event (a manual
-     * resolve leaves the id stale by design) contributes nothing.</p>
+     * {@code openAlertEventId} points at an already-resolved event (a failed manual
+     * reset can leave the id stale) contributes nothing.</p>
      *
      * <p>Cheap by construction: one event read, then an enqueue. Every
      * decision about whether to actually notify — the log read, the ceiling,
      * the chain walk — happens on the dispatch pool, never on this thread.</p>
      */
-    private static void stillOpenPass(Monitor monitor, TriggerState state) {
+    private static void stillOpenPass(Monitor monitor, TriggerState state, List<Runnable> afterCommit) {
         if (state.getOpenAlertEventId() == null) {
             return;
         }
         AlertEvent open = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
         if (open != null && open.getStatus() == AlertStatus.PROBLEM && !open.isSuppressed()) {
-            ActionDispatcher.onRepeatCheck(open, AlertPayload.of(open, monitor, "PROBLEM"));
+            afterCommit.add(() -> ActionDispatcher.onRepeatCheck(open, AlertPayload.of(open, monitor, "PROBLEM")));
         }
     }
 
@@ -530,18 +545,18 @@ public class TriggerEvaluatorJob implements Job {
      * problem history should show.
      */
     private static void resolveOpenAlert(Monitor monitor, TriggerState state,
-            String overrideMessage, Instant now) {
+            String overrideMessage, Instant now, List<Runnable> afterCommit) {
         AlertEvent event = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
         if (event != null && event.getStatus() == AlertStatus.PROBLEM) {
             event.setStatus(AlertStatus.RESOLVED);
             event.setResolvedTime(now);
-            AlertEventRepository.updateAlertEvent(event);
+            boolean resolved = AlertEventRepository.resolveAlertEvent(event);
 
-            if (!event.isSuppressed()) {
+            if (resolved && !event.isSuppressed()) {
                 if (overrideMessage != null) {
                     event.setMessage(overrideMessage);
                 }
-                ActionDispatcher.onAlertResolved(event, AlertPayload.of(event, monitor, "RESOLVED"));
+                afterCommit.add(() -> ActionDispatcher.onAlertResolved(event, AlertPayload.of(event, monitor, "RESOLVED")));
             }
         }
         state.setOpenAlertEventId(null);
@@ -635,15 +650,23 @@ public class TriggerEvaluatorJob implements Job {
                 message = TRIGGER_LEFT_MESSAGE;
             }
 
-            resolveOpenAlert(monitor, state, message, now);
-            // INSUFFICIENT_DATA, not OK: nothing was measured — the subject
-            // simply stopped being measurable. If it comes back, evaluation
-            // begins fresh rather than trusting a synthetic OK.
-            state.setState(TriggerStatus.INSUFFICIENT_DATA);
-            state.setConsecutiveBreachCount(0);
-            state.setLastChangeTime(now);
-            state.setLastEvaluatedTime(now);
-            TriggerStateRepository.updateTriggerState(state);
+            AlertLifecycleTransaction.execute(afterCommit -> {
+                TriggerState current = TriggerStateRepository.getTriggerState(
+                        monitor.getId(), state.getChannelId(), state.getMetadataId());
+                if (current == null || !java.util.Objects.equals(
+                        current.getOpenAlertEventId(), state.getOpenAlertEventId())) {
+                    return;
+                }
+                resolveOpenAlert(monitor, current, message, now, afterCommit);
+                // INSUFFICIENT_DATA, not OK: nothing was measured — the subject
+                // simply stopped being measurable. If it comes back, evaluation
+                // begins fresh rather than trusting a synthetic OK.
+                current.setState(TriggerStatus.INSUFFICIENT_DATA);
+                current.setConsecutiveBreachCount(0);
+                current.setLastChangeTime(now);
+                current.setLastEvaluatedTime(now);
+                TriggerStateRepository.updateTriggerState(current);
+            });
         }
     }
 

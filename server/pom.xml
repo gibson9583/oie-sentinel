@@ -18,6 +18,12 @@
 
     <dependencies>
         <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derby</artifactId>
+            <version>10.10.2.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.openintegrationengine</groupId>
             <artifactId>sentinel-shared</artifactId>
             <version>${revision}</version>

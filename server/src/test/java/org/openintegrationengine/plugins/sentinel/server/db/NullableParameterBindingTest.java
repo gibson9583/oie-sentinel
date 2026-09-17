@@ -41,12 +41,16 @@ class NullableParameterBindingTest {
         }
         add(cases, "insertAlertEvent", JdbcType.INTEGER, false, "metadata_id", "acknowledged_by");
         add(cases, "insertAlertEvent", JdbcType.TIMESTAMP, false, "resolved_time", "acknowledged_time");
-        add(cases, "updateAlertEvent", JdbcType.INTEGER, true, "acknowledged_by");
-        add(cases, "updateAlertEvent", JdbcType.TIMESTAMP, true, "resolved_time", "acknowledged_time");
+        for (String statement : List.of("acknowledgeAlertEvent", "resolveAlertEventManually")) {
+            add(cases, statement, JdbcType.INTEGER, false, "acknowledged_by");
+            add(cases, statement, JdbcType.TIMESTAMP, false, "acknowledged_time");
+        }
+        add(cases, "resolveAlertEvent", JdbcType.TIMESTAMP, false, "resolved_time");
+        add(cases, "resolveAlertEventManually", JdbcType.TIMESTAMP, false, "resolved_time");
         add(cases, "insertTriggerState", JdbcType.INTEGER, false, "metadata_id");
         for (String statement : List.of("insertTriggerState", "updateTriggerState")) {
             boolean conditional = statement.startsWith("update");
-            add(cases, statement, JdbcType.BIGINT, conditional, "open_alert_event_id");
+            add(cases, statement, JdbcType.BIGINT, false, "open_alert_event_id");
             add(cases, statement, JdbcType.TIMESTAMP, conditional, "last_change_time", "last_evaluated_time");
         }
         for (String statement : List.of("insertAction", "updateAction")) {

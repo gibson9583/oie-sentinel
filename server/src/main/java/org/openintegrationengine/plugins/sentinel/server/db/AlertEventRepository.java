@@ -34,8 +34,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * sufficient. Every statement here is a single MyBatis call (the paginated
  * {@link #listAlertEvents(AlertEventFilter)} runs two independent read-only
  * selects, not a write sequence that needs a shared transaction), so
- * auto-commit is fine throughout; no method opens a manual-commit {@code
- * openSession(false)} session.</p>
+ * standalone calls use auto-commit. Evaluator calls instead participate in
+ * the thread's managed {@link AlertLifecycleTransaction}.</p>
  */
 public final class AlertEventRepository {
 
@@ -90,26 +90,27 @@ public final class AlertEventRepository {
         }
     }
 
-    /**
-     * Updates an existing alert event's mutable lifecycle fields by id:
-     * {@code status}, {@code resolvedTime}, {@code acknowledgedBy}, {@code
-     * acknowledgedTime}, {@code ackComment}, and {@code detailsJson}.
-     * {@code status} is always applied; the rest are pass-through — the
-     * mapped statement's {@code <if>} blocks leave a column untouched when
-     * the corresponding field on {@code event} is {@code null}, so this
-     * method never needs to know which fields the caller actually intends to
-     * change.
-     *
-     * @param event the new state for the event; {@code id} identifies the
-     *              row to update
-     * @throws RepositoryException on persistence failure
-     */
-    public static void updateAlertEvent(AlertEvent event) {
+    /** Acknowledge only a still-open, unacknowledged row; never rewrite status. */
+    public static boolean acknowledgeAlertEvent(AlertEvent event) {
+        return conditionalUpdate("acknowledgeAlertEvent", event);
+    }
+
+    /** Resolve only a still-open row, leaving acknowledgement ownership intact. */
+    public static boolean resolveAlertEvent(AlertEvent event) {
+        return conditionalUpdate("resolveAlertEvent", event);
+    }
+
+    /** Manual resolution stamps acknowledgement only if nobody has already claimed it. */
+    public static boolean resolveAlertEventManually(AlertEvent event) {
+        return conditionalUpdate("resolveAlertEventManually", event);
+    }
+
+    private static boolean conditionalUpdate(String statement, AlertEvent event) {
         try {
-            Map<String, Object> params = toUpdateParams(event);
-            SqlConfig.getInstance().getSqlSessionManager().update(stmt("updateAlertEvent"), params);
+            return SqlConfig.getInstance().getSqlSessionManager()
+                    .update(stmt(statement), toUpdateParams(event)) == 1;
         } catch (Exception e) {
-            log.error("Failed to update alert event {}", event.getId(), e);
+            log.error("Failed {} for alert event {}", statement, event.getId(), e);
             throw new RepositoryException(e);
         }
     }
@@ -311,7 +312,7 @@ public final class AlertEventRepository {
     }
 
     /**
-     * Builds the parameter map for {@code updateAlertEvent}: {@code id} plus
+     * Builds the parameter map for conditional lifecycle updates: {@code id} plus
      * the handful of columns that statement is allowed to touch. Fields left
      * {@code null} on {@code event} still enter the map (with a null value)
      * so the mapped statement's {@code <if test="... != null">} guards can
