@@ -18,6 +18,12 @@
 
     <dependencies>
         <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derby</artifactId>
+            <version>10.10.2.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.openintegrationengine</groupId>
             <artifactId>sentinel-shared</artifactId>
             <version>${revision}</version>
@@ -158,4 +164,19 @@
             <scope>provided</scope>
         </dependency>
     </dependencies>
+    <build>
+        <testResources>
+            <testResource>
+                <directory>src/test/resources</directory>
+            </testResource>
+            <!-- Test the exact mapper files shipped in the extension. -->
+            <testResource>
+                <directory>${project.basedir}/../package/resources/mapper</directory>
+                <targetPath>mapper</targetPath>
+                <includes>
+                    <include>*-sqlmap.xml</include>
+                </includes>
+            </testResource>
+        </testResources>
+    </build>
 </project>

@@ -52,6 +52,7 @@
          column named 'id'". Relying on keyProperty alone reads the generated key positionally
          and works across all supported databases (id is the first/only auto-generated column).
          Same reasoning applies to every other useGeneratedKeys insert below. -->
+    <!-- The engine defaults untyped nulls to VARCHAR; nullable numeric and timestamp binds need explicit JDBC types. -->
     <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_monitor
             (name, description, monitor_type, scope_type, scope_id, enabled, severity,
@@ -59,8 +60,8 @@
              created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id}, #{enabled}, #{severity},
-             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id}, #{runbook_url},
-             #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id,jdbcType=INTEGER}, #{runbook_url},
+             #{created_by,jdbcType=INTEGER}, #{created_time}, #{updated_by,jdbcType=INTEGER}, #{updated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateMonitor" parameterType="map">
@@ -74,12 +75,12 @@
             severity = #{severity},
             config_json = #{config_json},
             min_consecutive_breaches = #{min_consecutive_breaches},
-            suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            suppressed_by_monitor_id = #{suppressed_by_monitor_id,jdbcType=INTEGER},
             runbook_url = #{runbook_url},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time},
-            updated_by = #{updated_by},
-            updated_time = #{updated_time}
+            updated_by = #{updated_by,jdbcType=INTEGER},
+            updated_time = #{updated_time,jdbcType=TIMESTAMP}
         WHERE id = #{id}
     </update>
 
@@ -98,21 +99,31 @@
             (monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
              resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id}, #{severity}, #{status}, #{message}, #{opened_time},
-             #{resolved_time}, #{acknowledged_by}, #{acknowledged_time}, #{ack_comment}, #{details_json}, #{suppressed})
+            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
+             #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed})
     </insert>
 
-    <update id="updateAlertEvent" parameterType="map">
+    <update id="acknowledgeAlertEvent" parameterType="map">
         UPDATE sentinel_alert_event
-        <set>
-            status = #{status},
-            <if test="resolved_time != null">resolved_time = #{resolved_time},</if>
-            <if test="acknowledged_by != null">acknowledged_by = #{acknowledged_by},</if>
-            <if test="acknowledged_time != null">acknowledged_time = #{acknowledged_time},</if>
-            <if test="ack_comment != null">ack_comment = #{ack_comment},</if>
-            <if test="details_json != null">details_json = #{details_json},</if>
-        </set>
-        WHERE id = #{id}
+        SET acknowledged_by = #{acknowledged_by,jdbcType=INTEGER},
+            acknowledged_time = #{acknowledged_time,jdbcType=TIMESTAMP},
+            ack_comment = #{ack_comment,jdbcType=VARCHAR}
+        WHERE id = #{id} AND status = 'PROBLEM' AND acknowledged_by IS NULL
+    </update>
+
+    <update id="resolveAlertEvent" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP}
+        WHERE id = #{id} AND status = 'PROBLEM'
+    </update>
+
+    <update id="resolveAlertEventManually" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP},
+            ack_comment = CASE WHEN acknowledged_by IS NULL THEN #{ack_comment,jdbcType=VARCHAR} ELSE ack_comment END,
+            acknowledged_time = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_time,jdbcType=TIMESTAMP} ELSE acknowledged_time END,
+            acknowledged_by = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_by,jdbcType=INTEGER} ELSE acknowledged_by END
+        WHERE id = #{id} AND status = 'PROBLEM'
     </update>
 
     <select id="getAlertEvent" parameterType="map" resultType="map">
@@ -269,8 +280,8 @@
             (monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
              last_value_json, open_alert_event_id, last_change_time, last_evaluated_time)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id}, #{state}, #{consecutive_breach_count},
-             #{last_value_json}, #{open_alert_event_id}, #{last_change_time}, #{last_evaluated_time})
+            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{state}, #{consecutive_breach_count},
+             #{last_value_json}, #{open_alert_event_id,jdbcType=BIGINT}, #{last_change_time,jdbcType=TIMESTAMP}, #{last_evaluated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateTriggerState" parameterType="map">
@@ -279,11 +290,18 @@
             state = #{state},
             consecutive_breach_count = #{consecutive_breach_count},
             <if test="last_value_json != null">last_value_json = #{last_value_json},</if>
-            <if test="open_alert_event_id != null">open_alert_event_id = #{open_alert_event_id},</if>
-            <if test="last_change_time != null">last_change_time = #{last_change_time},</if>
-            <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time},</if>
+            open_alert_event_id = #{open_alert_event_id,jdbcType=BIGINT},
+            <if test="last_change_time != null">last_change_time = #{last_change_time,jdbcType=TIMESTAMP},</if>
+            <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time,jdbcType=TIMESTAMP},</if>
         </set>
         WHERE id = #{id}
+    </update>
+
+    <update id="resetTriggerStateForAlert" parameterType="map">
+        UPDATE sentinel_trigger_state
+        SET state = 'OK', consecutive_breach_count = 0, open_alert_event_id = NULL,
+            last_change_time = #{now,jdbcType=TIMESTAMP}
+        WHERE open_alert_event_id = #{alertId,jdbcType=BIGINT}
     </update>
 
     <select id="listTriggerStatesByMonitor" parameterType="map" resultType="map">
@@ -394,7 +412,7 @@
         INSERT INTO sentinel_connector_status_event
             (channel_id, metadata_id, previous_state, new_state, changed_time)
         VALUES
-            (#{channel_id}, #{metadata_id}, #{previous_state}, #{new_state}, #{changed_time})
+            (#{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{previous_state}, #{new_state}, #{changed_time})
     </insert>
 
     <select id="getLatestConnectorStatusEvent" parameterType="map" resultType="map">
@@ -452,9 +470,9 @@
              config_json, created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{enabled}, #{action_type}, #{condition_json}, #{operation_mode},
-             #{repeat_interval_seconds}, #{max_repeats}, #{max_notifications_per_window}, #{rollup_window_seconds},
-             #{escalate_after_seconds}, #{escalate_to_action_id},
-             #{config_json}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+             #{repeat_interval_seconds,jdbcType=INTEGER}, #{max_repeats,jdbcType=INTEGER}, #{max_notifications_per_window,jdbcType=INTEGER}, #{rollup_window_seconds,jdbcType=INTEGER},
+             #{escalate_after_seconds,jdbcType=INTEGER}, #{escalate_to_action_id,jdbcType=INTEGER},
+             #{config_json}, #{created_by,jdbcType=INTEGER}, #{created_time}, #{updated_by,jdbcType=INTEGER}, #{updated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateAction" parameterType="map">
@@ -465,17 +483,17 @@
             action_type = #{action_type},
             condition_json = #{condition_json},
             operation_mode = #{operation_mode},
-            repeat_interval_seconds = #{repeat_interval_seconds},
-            max_repeats = #{max_repeats},
-            max_notifications_per_window = #{max_notifications_per_window},
-            rollup_window_seconds = #{rollup_window_seconds},
-            escalate_after_seconds = #{escalate_after_seconds},
-            escalate_to_action_id = #{escalate_to_action_id},
+            repeat_interval_seconds = #{repeat_interval_seconds,jdbcType=INTEGER},
+            max_repeats = #{max_repeats,jdbcType=INTEGER},
+            max_notifications_per_window = #{max_notifications_per_window,jdbcType=INTEGER},
+            rollup_window_seconds = #{rollup_window_seconds,jdbcType=INTEGER},
+            escalate_after_seconds = #{escalate_after_seconds,jdbcType=INTEGER},
+            escalate_to_action_id = #{escalate_to_action_id,jdbcType=INTEGER},
             config_json = #{config_json},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time},
-            updated_by = #{updated_by},
-            updated_time = #{updated_time}
+            updated_by = #{updated_by,jdbcType=INTEGER},
+            updated_time = #{updated_time,jdbcType=TIMESTAMP}
         WHERE id = #{id}
     </update>
 
@@ -489,7 +507,7 @@
         INSERT INTO sentinel_action_dispatch_log
             (alert_event_id, action_id, dispatch_time, success, error_message)
         VALUES
-            (#{alert_event_id}, #{action_id}, #{dispatch_time}, #{success}, #{error_message})
+            (#{alert_event_id}, #{action_id,jdbcType=INTEGER}, #{dispatch_time}, #{success}, #{error_message})
     </insert>
 
     <select id="listActionDispatchLogsForEvent" parameterType="map" resultType="map">
@@ -531,8 +549,8 @@
             enabled, created_by, created_time)
         VALUES
             (#{name}, #{scope_type}, #{scope_id}, #{window_mode}, #{repeat_type}, #{days_of_week},
-            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from}, #{active_until},
-            #{enabled}, #{created_by}, #{created_time})
+            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from,jdbcType=TIMESTAMP}, #{active_until,jdbcType=TIMESTAMP},
+            #{enabled}, #{created_by,jdbcType=INTEGER}, #{created_time})
     </insert>
 
     <update id="updateMaintenanceWindow" parameterType="map">
@@ -547,10 +565,10 @@
             start_time = #{start_time},
             end_time = #{end_time},
             timezone = #{timezone},
-            active_from = #{active_from},
-            active_until = #{active_until},
+            active_from = #{active_from,jdbcType=TIMESTAMP},
+            active_until = #{active_until,jdbcType=TIMESTAMP},
             enabled = #{enabled},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time}
         WHERE id = #{id}
     </update>

@@ -29,8 +29,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
  * {@link SqlConfig#getInstance()} directly, so unlike {@code RbacRepository}
  * this class carries no constructor-time setup and needs no singleton
  * lifecycle — plain static methods are sufficient. Every statement here is a
- * single MyBatis call, so auto-commit (the default session behavior) is fine;
- * no method needs a manual-commit {@code openSession(false)} transaction.</p>
+ * single MyBatis call. Evaluator calls participate in the thread's managed
+ * {@link AlertLifecycleTransaction}; standalone calls use auto-commit.</p>
  */
 public final class TriggerStateRepository {
 
@@ -118,6 +118,18 @@ public final class TriggerStateRepository {
             SqlConfig.getInstance().getSqlSessionManager().update(stmt("updateTriggerState"), params);
         } catch (Exception e) {
             log.error("Failed to update trigger state {}", triggerState.getId(), e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /** Reset only the state still owned by this alert, never a newer incident. */
+    public static void resetTriggerStateForAlert(long alertId, Instant now) {
+        Map<String, Object> params = new HashMap<>();
+        params.put("alertId", alertId);
+        params.put("now", toTimestamp(now));
+        try {
+            SqlConfig.getInstance().getSqlSessionManager().update(stmt("resetTriggerStateForAlert"), params);
+        } catch (Exception e) {
             throw new RepositoryException(e);
         }
     }
