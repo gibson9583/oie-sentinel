@@ -231,12 +231,13 @@
          deliberately Oracle-only — Derby's driver validates the passed column name
          case-sensitively against the catalog, so the derby mapper must keep the positional
          (no-keyColumn) form. -->
+    <!-- The engine defaults untyped nulls to VARCHAR; suppression is a nullable integer. -->
     <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
         INSERT INTO sentinel_monitor (name, description, monitor_type, scope_type, scope_id,
             enabled, severity, config_json, min_consecutive_breaches, suppressed_by_monitor_id,
             runbook_url, created_by, created_time, updated_by, updated_time)
         VALUES (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id},
-            #{enabled}, #{severity}, #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id},
+            #{enabled}, #{severity}, #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id,jdbcType=INTEGER},
             #{runbook_url}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
     </insert>
 
@@ -251,7 +252,7 @@
             severity = #{severity},
             config_json = #{config_json},
             min_consecutive_breaches = #{min_consecutive_breaches},
-            suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            suppressed_by_monitor_id = #{suppressed_by_monitor_id,jdbcType=INTEGER},
             runbook_url = #{runbook_url},
             created_by = #{created_by},
             created_time = #{created_time},

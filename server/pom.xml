@@ -158,4 +158,19 @@
             <scope>provided</scope>
         </dependency>
     </dependencies>
+    <build>
+        <testResources>
+            <testResource>
+                <directory>src/test/resources</directory>
+            </testResource>
+            <!-- Test the exact mapper files shipped in the extension. -->
+            <testResource>
+                <directory>${project.basedir}/../package/resources/mapper</directory>
+                <targetPath>mapper</targetPath>
+                <includes>
+                    <include>*-sqlmap.xml</include>
+                </includes>
+            </testResource>
+        </testResources>
+    </build>
 </project>
