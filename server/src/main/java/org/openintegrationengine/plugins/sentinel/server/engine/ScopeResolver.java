@@ -74,6 +74,18 @@ public final class ScopeResolver {
     }
 
     /**
+     * A scope-resolution result that separates usable targets from channel
+     * identities whose controller lookup failed. Evaluators retain failed ids
+     * as sweep-protected: a transient API failure is not evidence that an
+     * existing problem's subject departed.
+     */
+    public static final class ChannelResolution {
+
+        public final List<ChannelTarget> targets = new ArrayList<>();
+        public final Set<String> unresolvedChannelIds = new HashSet<>();
+    }
+
+    /**
      * Resolves a monitor's scope to the channels it should evaluate this
      * tick: only channels currently in {@code STARTED} state (see class
      * Javadoc for why paused/stopped channels are excluded).
@@ -95,7 +107,12 @@ public final class ScopeResolver {
      *         none qualify or the monitor has no usable scope
      */
     public static List<ChannelTarget> resolveStartedChannels(Monitor monitor) {
-        List<ChannelTarget> targets = new ArrayList<>();
+        return resolveStartedChannelSet(monitor).targets;
+    }
+
+    /** Started-channel resolution with per-channel failure identities. */
+    public static ChannelResolution resolveStartedChannelSet(Monitor monitor) {
+        ChannelResolution resolution = new ChannelResolution();
         ScopeType scopeType = monitor != null ? monitor.getScopeType() : null;
         if (scopeType == null) {
             // Validation prevents this on stored monitors, but the evaluator
@@ -103,40 +120,46 @@ public final class ScopeResolver {
             // skips the monitor for this tick.
             log.warn("Monitor {} has no scope type; resolving to no channels",
                     monitor != null ? monitor.getId() : null);
-            return targets;
+            return resolution;
         }
 
         switch (scopeType) {
             case ALL:
                 EngineController engineController = ControllerFactory.getFactory().createEngineController();
                 for (String channelId : engineController.getDeployedIds()) {
-                    if (isChannelStarted(channelId)) {
-                        targets.add(new ChannelTarget(channelId, channelName(channelId)));
-                    }
+                    addIfStarted(resolution, channelId, monitor);
                 }
                 break;
             case GROUP:
-                for (String channelId : groupChannelIds(monitor.getScopeId())) {
-                    if (isChannelStarted(channelId)) {
-                        targets.add(new ChannelTarget(channelId, channelName(channelId)));
-                    }
+                for (String channelId : strictGroupChannelIds(monitor.getScopeId())) {
+                    addIfStarted(resolution, channelId, monitor);
                 }
                 break;
             case TAG:
-                for (String channelId : tagChannelIds(monitor.getScopeId())) {
-                    if (isChannelStarted(channelId)) {
-                        targets.add(new ChannelTarget(channelId, channelName(channelId)));
-                    }
+                for (String channelId : strictTagChannelIds(monitor.getScopeId())) {
+                    addIfStarted(resolution, channelId, monitor);
                 }
                 break;
             case CHANNEL:
-                String channelId = monitor.getScopeId();
-                if (channelId != null && isChannelStarted(channelId)) {
-                    targets.add(new ChannelTarget(channelId, channelName(channelId)));
-                }
+                addIfStarted(resolution, monitor.getScopeId(), monitor);
                 break;
         }
-        return targets;
+        return resolution;
+    }
+
+    private static void addIfStarted(ChannelResolution resolution, String channelId, Monitor monitor) {
+        if (channelId == null) {
+            return;
+        }
+        try {
+            if (isChannelStarted(channelId)) {
+                resolution.targets.add(new ChannelTarget(channelId, channelName(channelId)));
+            }
+        } catch (Exception e) {
+            resolution.unresolvedChannelIds.add(channelId);
+            log.error("Failed to resolve started target for monitor {} channel {}; isolating channel",
+                    monitor != null ? monitor.getId() : null, channelId, e);
+        }
     }
 
     /**
@@ -165,40 +188,62 @@ public final class ScopeResolver {
      *         {@code null}) when the monitor has no usable scope
      */
     public static List<ChannelTarget> resolveScopedChannels(Monitor monitor) {
-        List<ChannelTarget> targets = new ArrayList<>();
+        return resolveScopedChannelSet(monitor).targets;
+    }
+
+    /** All-state scope resolution with per-channel failure identities. */
+    public static ChannelResolution resolveScopedChannelSet(Monitor monitor) {
+        ChannelResolution resolution = new ChannelResolution();
         ScopeType scopeType = monitor != null ? monitor.getScopeType() : null;
         if (scopeType == null) {
             log.warn("Monitor {} has no scope type; resolving to no channels",
                     monitor != null ? monitor.getId() : null);
-            return targets;
+            return resolution;
         }
 
         switch (scopeType) {
             case ALL:
                 List<Channel> channels = ChannelController.getInstance().getChannels(null);
-                if (channels != null) {
-                    for (Channel channel : channels) {
-                        if (channel.getId() != null) {
-                            targets.add(new ChannelTarget(channel.getId(), channelName(channel.getId())));
+                if (channels == null) {
+                    throw new IllegalStateException("Channel inventory is unavailable");
+                }
+                for (Channel channel : channels) {
+                    String channelId = null;
+                    try {
+                        channelId = channel.getId();
+                        if (channelId == null) {
+                            throw new IllegalStateException("Channel inventory contains an unidentified member");
                         }
+                        String channelName = channel.getName();
+                        resolution.targets.add(new ChannelTarget(channelId,
+                                channelName != null ? channelName : "(unknown)"));
+                    } catch (Exception e) {
+                        if (channelId == null) {
+                            // With no identity to preserve, a partial target list
+                            // could falsely declare this channel departed.
+                            throw new IllegalStateException("Channel inventory is incomplete", e);
+                        }
+                        resolution.unresolvedChannelIds.add(channelId);
+                        log.error("Failed to resolve scoped target for monitor {} channel {}; isolating channel",
+                                monitor != null ? monitor.getId() : null, channelId, e);
                     }
                 }
                 break;
             case GROUP:
-                for (String channelId : groupChannelIds(monitor.getScopeId())) {
-                    addIfChannelExists(targets, channelId);
+                for (String channelId : strictGroupChannelIds(monitor.getScopeId())) {
+                    addIfChannelExists(resolution, channelId, monitor);
                 }
                 break;
             case TAG:
-                for (String channelId : tagChannelIds(monitor.getScopeId())) {
-                    addIfChannelExists(targets, channelId);
+                for (String channelId : strictTagChannelIds(monitor.getScopeId())) {
+                    addIfChannelExists(resolution, channelId, monitor);
                 }
                 break;
             case CHANNEL:
-                addIfChannelExists(targets, monitor.getScopeId());
+                addIfChannelExists(resolution, monitor.getScopeId(), monitor);
                 break;
         }
-        return targets;
+        return resolution;
     }
 
     /**
@@ -208,13 +253,19 @@ public final class ScopeResolver {
      * "undeployed" forever — deleted and stopped are different facts and only
      * one of them is an incident.
      */
-    private static void addIfChannelExists(List<ChannelTarget> targets, String channelId) {
+    private static void addIfChannelExists(ChannelResolution resolution, String channelId, Monitor monitor) {
         if (channelId == null) {
             return;
         }
-        Channel channel = ChannelController.getInstance().getChannelById(channelId);
-        if (channel != null) {
-            targets.add(new ChannelTarget(channelId, channelName(channelId)));
+        try {
+            Channel channel = ChannelController.getInstance().getChannelById(channelId);
+            if (channel != null) {
+                resolution.targets.add(new ChannelTarget(channelId, channelName(channelId)));
+            }
+        } catch (Exception e) {
+            resolution.unresolvedChannelIds.add(channelId);
+            log.error("Failed to resolve scoped target for monitor {} channel {}; isolating channel",
+                    monitor != null ? monitor.getId() : null, channelId, e);
         }
     }
 
@@ -297,8 +348,46 @@ public final class ScopeResolver {
             if (groupId.equals(group.getId())) {
                 if (group.getChannels() != null) {
                     for (Channel member : group.getChannels()) {
-                        if (member.getId() != null) {
-                            channelIds.add(member.getId());
+                        try {
+                            String channelId = member.getId();
+                            if (channelId != null) {
+                                channelIds.add(channelId);
+                            }
+                        } catch (Exception e) {
+                            log.error("Failed to read one member of channel group {}; isolating member",
+                                    groupId, e);
+                        }
+                    }
+                }
+                return channelIds;
+            }
+        }
+        return channelIds;
+    }
+
+    /**
+     * Completeness-preserving group resolution for safety policy decisions.
+     * Unlike {@link #groupChannelIds(String)}, this method deliberately lets
+     * a member-access failure escape: returning a partial set is acceptable
+     * for a picker/filter, but would let a notification leak through a
+     * maintenance window that actually covers the unread member.
+     */
+    static Set<String> strictGroupChannelIds(String groupId) {
+        Set<String> channelIds = new HashSet<>();
+        if (groupId == null) {
+            return channelIds;
+        }
+        List<ChannelGroup> groups = ChannelController.getInstance().getChannelGroups(null);
+        if (groups == null) {
+            throw new IllegalStateException("Channel-group inventory is unavailable");
+        }
+        for (ChannelGroup group : groups) {
+            if (groupId.equals(group.getId())) {
+                if (group.getChannels() != null) {
+                    for (Channel member : group.getChannels()) {
+                        String channelId = member.getId();
+                        if (channelId != null) {
+                            channelIds.add(channelId);
                         }
                     }
                 }
@@ -326,6 +415,28 @@ public final class ScopeResolver {
         Set<ChannelTag> tags = ControllerFactory.getFactory().createConfigurationController().getChannelTags();
         if (tags == null) {
             return channelIds;
+        }
+        for (ChannelTag tag : tags) {
+            if (tagId.equals(tag.getId())) {
+                if (tag.getChannelIds() != null) {
+                    channelIds.addAll(tag.getChannelIds());
+                }
+                return channelIds;
+            }
+        }
+        return channelIds;
+    }
+
+    /** Completeness-preserving tag resolution for safety policy decisions. */
+    static Set<String> strictTagChannelIds(String tagId) {
+        Set<String> channelIds = new HashSet<>();
+        if (tagId == null) {
+            return channelIds;
+        }
+        Set<ChannelTag> tags = ControllerFactory.getFactory()
+                .createConfigurationController().getChannelTags();
+        if (tags == null) {
+            throw new IllegalStateException("Channel-tag inventory is unavailable");
         }
         for (ChannelTag tag : tags) {
             if (tagId.equals(tag.getId())) {

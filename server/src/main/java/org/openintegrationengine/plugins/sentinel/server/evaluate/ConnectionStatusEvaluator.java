@@ -8,10 +8,14 @@ package org.openintegrationengine.plugins.sentinel.server.evaluate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -21,8 +25,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
+import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
+import org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 
 /**
@@ -39,12 +45,14 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * which is the historical behavior, so monitors saved before rollup existed
  * are unaffected.</p>
  *
- * <p>Unlike the other evaluators this one reads no database history: its
- * source of truth is {@link CollectorState}'s live in-memory connector-state
- * map, maintained by the plugin's own {@code CONNECTION_STATUS} event
- * listener (the engine's {@code ConnectionStatusLogController} state map NPEs
- * on non-TCP connectors, so Sentinel deliberately keeps its own — see
- * architecture correction #2).</p>
+ * <p>The source of truth is the durable latest transition for every
+ * {@code (connector, node)} pair. Every cluster node runs Sentinel's event
+ * listener and writes its own identity; the elected leader evaluates their
+ * union. A connector breaches when any reporting node breaches, so evaluating
+ * on a node that happens not to host or observe the failing connector cannot
+ * hide the failure. Rows written before node identities existed use the
+ * reserved {@code legacy} identity. Rows without the current runtime
+ * deployment marker remain unknown until a fresh state event arrives.</p>
  *
  * <h2>Rollup</h2>
  *
@@ -68,12 +76,13 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  *   <li><b>BREACH</b> if <em>any</em> connector breaches — a channel with one
  *       dead destination is a channel with a problem, and waiting for all of
  *       them would make the monitor useless.</li>
- *   <li><b>INSUFFICIENT_DATA</b> if every connector is INSUFFICIENT_DATA,
+ *   <li><b>INSUFFICIENT_DATA</b> if any connector cannot be completely
+ *       judged and none breaches,
  *       including the no-state-observed case below. "We cannot know" never
  *       aggregates up into "we are fine".</li>
- *   <li><b>OK</b> otherwise, which means every connector that could be judged
- *       is healthy. The rolled-up problem therefore clears only once every
- *       connector has recovered.</li>
+ *   <li><b>OK</b> only when every current connector has a healthy
+ *       observation from each active deploying node. The rolled-up problem
+ *       therefore clears only once every connector has recovered.</li>
  * </ul>
  *
  * <p>What gets collapsed is the alert <em>fan-out</em>, not the diagnostic
@@ -87,14 +96,14 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * named now because widening the key later would be a breaking rename.</p>
  *
  * <p>If the listener has never observed the channel (plugin just started and
- * no connector has emitted a state event yet), there is nothing to judge: a
- * single {@code INSUFFICIENT_DATA} outcome is returned — under the source
- * connector's metadata id (0) per connector, or under {@code null} when
- * rolled up — so the trigger surfaces as "not evaluated yet" rather than
- * silently vanishing or falsely reporting OK.</p>
+ * no connector has emitted a state event yet), each deployed connector is
+ * {@code INSUFFICIENT_DATA}. When no deployment inventory exists yet, one
+ * such outcome uses source id 0, or {@code null} for channel rollup. Missing
+ * observations therefore cannot silently resolve an existing incident.</p>
  *
  * <p>Value JSON shape per connector: {@code {"state", "sinceIso",
- * "durationSeconds"}}. Rolled up to the channel: {@code {"rollup",
+ * "durationSeconds", "nodesEvaluated", "nodesBreaching", "nodes"}}.
+ * Rolled up to the channel: {@code {"rollup",
  * "connectorsEvaluated", "connectorsBreaching", "connectors": [per-connector
  * shape plus "metadataId" and "result"]}}.</p>
  */
@@ -154,6 +163,23 @@ public final class ConnectionStatusEvaluator {
     }
 
     /**
+     * Connection outcomes paired with the conclusive connector inventory used
+     * to produce them. State can be insufficient while inventory is certain;
+     * keeping those facts separate lets the trigger sweep retire deleted
+     * connector identities without treating an unobserved current connector
+     * as healthy.
+     */
+    public static final class ChannelEvaluation {
+        public final List<ConnectorEvaluation> evaluations;
+        public final Set<Integer> currentMetadataIds;
+
+        public ChannelEvaluation(List<ConnectorEvaluation> evaluations, Set<Integer> currentMetadataIds) {
+            this.evaluations = List.copyOf(evaluations);
+            this.currentMetadataIds = Set.copyOf(currentMetadataIds);
+        }
+    }
+
+    /**
      * Evaluates every live-observed connector of one channel against a
      * CONNECTION_STATUS monitor, then collapses the result to a single
      * channel-level evaluation when the monitor's {@code rollup} says so.
@@ -170,6 +196,67 @@ public final class ConnectionStatusEvaluator {
      *         {@code null} metadata id. Never empty.
      */
     public static List<ConnectorEvaluation> evaluate(Monitor monitor, String channelId, Instant now) {
+        return evaluateChannel(monitor, channelId, now).evaluations;
+    }
+
+    /** Evaluates one channel and preserves its action-time connector inventory for departure cleanup. */
+    public static ChannelEvaluation evaluateChannel(Monitor monitor, String channelId, Instant now) {
+        Map<Integer, Map<String, Instant>> connectorNodes = NodeLeaseRepository.listActiveConnectorDeployments(channelId);
+        if (connectorNodes.isEmpty()) {
+            return new ChannelEvaluation(evaluateStates(monitor, now, List.of()), connectorNodes.keySet());
+        }
+        List<ConnectorStatusEvent> persisted =
+                ConnectorStatusRepository.listLatestConnectorStatusEvents(channelId);
+        List<ConnectorStatusEvent> current = new ArrayList<>();
+        for (ConnectorStatusEvent event : persisted) {
+            if (event == null || !connectorNodes.containsKey(event.getMetadataId())) {
+                continue;
+            }
+            String nodeId = normalizedNodeId(event.getNodeId());
+            Instant deployment = connectorNodes.get(event.getMetadataId()).get(nodeId);
+            Instant observedAt = event.getChangedTime();
+            // The listener checked the original event timestamp against the
+            // deployment before writing. Older changed_time columns lose
+            // sub-second precision on some vendors, so compare the precise
+            // deployment marker rather than repeating that lower time bound.
+            // Historical rows without a marker remain unknown after upgrade.
+            if (deployment != null && deployment.equals(event.getDeploymentTime())
+                    && observedAt != null && !observedAt.isAfter(now)) {
+                current.add(event);
+            }
+        }
+        // The engine supplies a wall-clock deployment timestamp, not an
+        // immutable incarnation token. Matching markers reject historical
+        // rows across ordinary/backward redeploys, while the listener rejects
+        // origin times outside the current deployment's interval. Ambiguous
+        // queued events after overlapping wall-clock rollback cannot be
+        // identified perfectly without an engine-origin deployment token.
+        // Presence publishes a complete deployment snapshot, so every node
+        // listed here is known to host this channel. A missing observation
+        // is not a healthy connector: preserve it as unknown until that node
+        // reports, including while legacy history is replaced after upgrade.
+        Map<Integer, Set<String>> observedNodes = new HashMap<>();
+        for (ConnectorStatusEvent event : current) {
+            observedNodes.computeIfAbsent(event.getMetadataId(), ignored -> new HashSet<>())
+                    .add(normalizedNodeId(event.getNodeId()));
+        }
+        for (Map.Entry<Integer, Map<String, Instant>> connector : connectorNodes.entrySet()) {
+            int metadataId = connector.getKey();
+            for (String nodeId : connector.getValue().keySet()) {
+                if (!observedNodes.getOrDefault(metadataId, Set.of()).contains(nodeId)) {
+                    ConnectorStatusEvent missing = new ConnectorStatusEvent();
+                    missing.setMetadataId(metadataId);
+                    missing.setNodeId(nodeId);
+                    current.add(missing);
+                }
+            }
+        }
+        return new ChannelEvaluation(evaluateStates(monitor, now, current), connectorNodes.keySet());
+    }
+
+    /** Package-visible seam for deterministic union tests; production reads through the repository. */
+    static List<ConnectorEvaluation> evaluateStates(
+            Monitor monitor, Instant now, List<ConnectorStatusEvent> latestEvents) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         Set<String> alertOnStates = parseAlertOnStates(config);
         long minDurationSeconds = Math.max(0L, config.path("minDurationSeconds").asLong(0L));
@@ -186,10 +273,8 @@ public final class ConnectionStatusEvaluator {
         boolean rollUpToChannel = ROLLUP_CHANNEL.equalsIgnoreCase(
                 config.path("rollup").asText(ROLLUP_CONNECTOR).trim());
 
-        List<CollectorState.ConnectorState> liveStates =
-                CollectorState.getInstance().listConnectorStates(channelId);
-
-        if (liveStates.isEmpty()) {
+        Map<Integer, Map<String, ConnectorStatusEvent>> latestByConnector = latestByConnector(latestEvents);
+        if (latestByConnector.isEmpty()) {
             ObjectNode node = Json.mapper().createObjectNode();
             node.putNull("state");
             node.putNull("sinceIso");
@@ -203,48 +288,72 @@ public final class ConnectionStatusEvaluator {
                     EvaluationOutcome.insufficientData(Json.write(node))));
         }
 
-        List<ConnectorEvaluation> evaluations = new ArrayList<>(liveStates.size());
+        List<ConnectorEvaluation> evaluations = new ArrayList<>(latestByConnector.size());
         // Built only when rolling up: it is the diagnostic detail that
         // survives the collapse, so there is nothing to accumulate when every
         // connector keeps its own trigger and its own value JSON.
         ArrayNode connectors = rollUpToChannel ? Json.mapper().createArrayNode() : null;
 
-        for (CollectorState.ConnectorState live : liveStates) {
-            // name(), never toString(): ConnectionStatusEventType.toString() is
-            // overridden to capitalized display text ("Waiting For Response").
-            String stateName = live.state != null ? live.state.name() : "UNKNOWN";
-            long durationSeconds = live.since != null
-                    ? Math.max(0L, Duration.between(live.since, now).getSeconds())
-                    : 0L;
+        for (Map.Entry<Integer, Map<String, ConnectorStatusEvent>> connector : latestByConnector.entrySet()) {
+            int metadataId = connector.getKey();
+            List<ConnectorStatusEvent> active = activeNodeRows(connector.getValue());
+            List<NodeReading> readings = new ArrayList<>(active.size());
+            ArrayNode nodes = Json.mapper().createArrayNode();
 
-            ObjectNode node = Json.mapper().createObjectNode();
-            node.put("state", stateName);
-            if (live.since != null) {
-                node.put("sinceIso", live.since.toString());
-            } else {
-                node.putNull("sinceIso");
+            for (ConnectorStatusEvent event : active) {
+                String stateName = event.getNewState() != null ? event.getNewState() : "UNKNOWN";
+                long durationSeconds = event.getChangedTime() != null
+                        ? Math.max(0L, Duration.between(event.getChangedTime(), now).getSeconds())
+                        : 0L;
+                boolean breaching = alertOnStates.contains(stateName)
+                        && durationSeconds >= minDurationSeconds;
+                NodeReading reading = new NodeReading(
+                        normalizedNodeId(event.getNodeId()), stateName, event.getChangedTime(),
+                        durationSeconds, breaching, event.getNewState() != null);
+                readings.add(reading);
+
+                ObjectNode node = Json.mapper().createObjectNode();
+                node.put("nodeId", reading.nodeId());
+                node.put("state", reading.stateName());
+                putSince(node, reading.since());
+                node.put("durationSeconds", reading.durationSeconds());
+                node.put("result", reading.breaching() ? "BREACH" : reading.observed() ? "OK" : "INSUFFICIENT_DATA");
+                nodes.add(node);
             }
-            node.put("durationSeconds", durationSeconds);
-            String valueJson = Json.write(node);
+
+            NodeReading representative = representative(readings);
+            long breachingCount = readings.stream().filter(NodeReading::breaching).count();
+            ObjectNode value = Json.mapper().createObjectNode();
+            value.put("state", representative.stateName());
+            putSince(value, representative.since());
+            value.put("durationSeconds", representative.durationSeconds());
+            value.put("nodesEvaluated", readings.size());
+            value.put("nodesBreaching", breachingCount);
+            value.set("nodes", nodes);
+            String valueJson = Json.write(value);
 
             EvaluationOutcome outcome;
-            if (alertOnStates.contains(stateName) && durationSeconds >= minDurationSeconds) {
+            if (breachingCount > 0) {
+                String nodeIds = readings.stream().filter(NodeReading::breaching)
+                        .map(NodeReading::nodeId).collect(Collectors.joining(", "));
                 outcome = EvaluationOutcome.breach(valueJson,
-                        String.format("Connector %d has been %s for %ds",
-                                live.metadataId, stateName, durationSeconds));
+                        String.format("Connector %d is alerting on %d of %d nodes (node ids: %s)",
+                                metadataId, breachingCount, readings.size(), nodeIds));
+            } else if (readings.stream().anyMatch(reading -> !reading.observed())) {
+                outcome = EvaluationOutcome.insufficientData(valueJson);
             } else {
                 outcome = EvaluationOutcome.ok(valueJson);
             }
-            evaluations.add(new ConnectorEvaluation(live.metadataId, outcome));
+            evaluations.add(new ConnectorEvaluation(metadataId, outcome));
 
             if (connectors != null) {
-                // valueJson is already serialized above, so enriching the node
+                // valueJson is already serialized above, so enriching the value
                 // now adds the connector's identity and verdict to the rollup
                 // array only — which is precisely what the collapsed outcome
                 // would otherwise lose.
-                node.put("metadataId", live.metadataId);
-                node.put("result", outcome.getResult().name());
-                connectors.add(node);
+                value.put("metadataId", metadataId);
+                value.put("result", outcome.getResult().name());
+                connectors.add(value);
             }
         }
 
@@ -254,19 +363,88 @@ public final class ConnectionStatusEvaluator {
         return List.of(rollUp(evaluations, connectors));
     }
 
+    /** One node's current reading, normalized for deterministic aggregation. */
+    private record NodeReading(String nodeId, String stateName, Instant since,
+            long durationSeconds, boolean breaching, boolean observed) {
+    }
+
+    /**
+     * Defensively reduces arbitrary repository/test input to one newest row
+     * per connector/node. The mapped query already guarantees this, but doing
+     * it again keeps one duplicate row from doubling a breach count if a
+     * vendor plan or future query revision regresses.
+     */
+    private static Map<Integer, Map<String, ConnectorStatusEvent>> latestByConnector(
+            List<ConnectorStatusEvent> events) {
+        Map<Integer, Map<String, ConnectorStatusEvent>> grouped = new TreeMap<>();
+        if (events == null) {
+            return grouped;
+        }
+        for (ConnectorStatusEvent event : events) {
+            if (event == null) {
+                continue;
+            }
+            String nodeId = normalizedNodeId(event.getNodeId());
+            grouped.computeIfAbsent(event.getMetadataId(), ignored -> new TreeMap<>())
+                    .merge(nodeId, event, ConnectionStatusEvaluator::newer);
+        }
+        return grouped;
+    }
+
+    private static ConnectorStatusEvent newer(ConnectorStatusEvent left, ConnectorStatusEvent right) {
+        long leftId = left.getId() != null ? left.getId() : Long.MIN_VALUE;
+        long rightId = right.getId() != null ? right.getId() : Long.MIN_VALUE;
+        if (leftId != rightId) {
+            return leftId > rightId ? left : right;
+        }
+        // Test/defensive input can lack generated ids; production rows never
+        // do. Timestamp is only a fallback when arrival order is unavailable.
+        int byTime = Comparator.nullsFirst(Instant::compareTo)
+                .compare(left.getChangedTime(), right.getChangedTime());
+        return byTime >= 0 ? left : right;
+    }
+
+    /** Drops upgrade-only legacy state as soon as a real node has reported this connector. */
+    private static List<ConnectorStatusEvent> activeNodeRows(Map<String, ConnectorStatusEvent> byNode) {
+        List<ConnectorStatusEvent> active = new ArrayList<>(byNode.values());
+        if (active.size() > 1 && active.stream()
+                .anyMatch(event -> event.getNewState() != null
+                        && !"legacy".equals(normalizedNodeId(event.getNodeId())))) {
+            active.removeIf(event -> "legacy".equals(normalizedNodeId(event.getNodeId())));
+        }
+        active.sort(Comparator.comparing(event -> normalizedNodeId(event.getNodeId())));
+        return active;
+    }
+
+    /** Breaching nodes win; within one verdict the longest-lived reading is the summary. */
+    private static NodeReading representative(List<NodeReading> readings) {
+        return readings.stream().max(Comparator
+                .comparing(NodeReading::breaching)
+                .thenComparingLong(NodeReading::durationSeconds)
+                .thenComparing(NodeReading::nodeId, Comparator.reverseOrder()))
+                .orElseThrow();
+    }
+
+    private static String normalizedNodeId(String nodeId) {
+        return nodeId == null || nodeId.isBlank() ? "legacy" : nodeId;
+    }
+
+    private static void putSince(ObjectNode node, Instant since) {
+        if (since != null) {
+            node.put("sinceIso", since.toString());
+        } else {
+            node.putNull("sinceIso");
+        }
+    }
+
     /**
      * Aggregates one channel's per-connector evaluations into the single
      * channel-level evaluation that {@code CHANNEL} rollup emits.
      *
-     * <p>The verdict is any-breach-wins, all-insufficient-stays-insufficient,
-     * OK otherwise — see the class Javadoc for why. The
-     * INSUFFICIENT_DATA branch is unreachable from today's per-connector loop
-     * (which only ever produces BREACH or OK; the only INSUFFICIENT_DATA path
-     * short-circuits before this method), but the rule is written out rather
-     * than assumed so the aggregation stays total if a connector-level
-     * "cannot judge" verdict is ever introduced. Silently folding an unknown
-     * into OK there would resolve a live problem on no evidence, which is the
-     * one thing the three-way verdict exists to prevent.</p>
+     * <p>The verdict is any-breach-wins, incomplete-coverage-stays-insufficient,
+     * OK only with complete healthy coverage. Missing connector observations
+     * remain insufficient even when other connectors are healthy, so a
+     * partial snapshot cannot resolve a live incident.</p>
      *
      * @param evaluations the per-connector evaluations; never empty
      * @param connectors  the per-connector detail array preserved verbatim in
@@ -298,9 +476,9 @@ public final class ConnectionStatusEvaluator {
                             + " connectors in alerting state (metadata ids: " + ids + ")"));
         }
 
-        boolean allInsufficient = evaluations.stream()
-                .allMatch(e -> e.outcome.getResult() == EvaluationOutcome.Result.INSUFFICIENT_DATA);
-        return new ConnectorEvaluation(null, allInsufficient
+        boolean incomplete = evaluations.stream()
+                .anyMatch(e -> e.outcome.getResult() == EvaluationOutcome.Result.INSUFFICIENT_DATA);
+        return new ConnectorEvaluation(null, incomplete
                 ? EvaluationOutcome.insufficientData(valueJson)
                 : EvaluationOutcome.ok(valueJson));
     }

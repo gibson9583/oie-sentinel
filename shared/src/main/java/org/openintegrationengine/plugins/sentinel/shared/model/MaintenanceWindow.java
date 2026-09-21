@@ -11,7 +11,7 @@ import java.time.Instant;
  * A scheduled window over the channels identified by
  * {@link #getScopeType()}/{@link #getScopeId()}, in one of two modes
  * ({@link #getMode()}): a classic {@code SUPPRESS} maintenance window
- * (alerts born while the window is active are suppressed) or an
+ * (notification decisions made while the window is active are suppressed) or an
  * {@code ACTIVE} alerting schedule (alerts notify only while the window is
  * active). Windows are one-time or recur weekly/monthly
  * ({@link #getRepeatType()}): one-time windows are bounded by the absolute
@@ -23,7 +23,7 @@ import java.time.Instant;
  *
  * <p>Maps to {@code sentinel_maintenance_window}. Scope matching against a
  * specific channel or monitor, and the "is this window active right now"
- * schedule math, happen server-side — this DTO and its repository only carry
+ * dispatch-time schedule math, happen server-side — this DTO and its repository only carry
  * the row data (plus the response-only {@link #getActiveNow()} flag the
  * service stamps for the UI).</p>
  */

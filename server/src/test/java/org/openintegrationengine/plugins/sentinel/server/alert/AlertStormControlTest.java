@@ -215,6 +215,37 @@ class AlertStormControlTest {
         }
 
         @Test
+        @DisplayName("a SEND blocked before transport releases its ceiling slot")
+        void blockedSendReleasesItsSlot() {
+            // A dispatch-time maintenance or dependency decision can change
+            // after the ceiling verdict but before transport I/O. That
+            // candidate never attempted delivery, so it must not spend the
+            // last slot and force the next eligible notification into rollup.
+            Action action = ceilingAction(1, 600);
+
+            AlertStormControl.CeilingVerdict blocked = verdict(action);
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, blocked.outcome());
+            AlertStormControl.releaseReservation(blocked);
+
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome());
+        }
+
+        @Test
+        @DisplayName("a ROLLUP blocked before transport releases the rollup slot")
+        void blockedRollupReleasesItsSlot() {
+            // The single-rollup claim has the same rule: current policy can
+            // cancel it before I/O, and that must leave the window's one
+            // aggregate notification available to the next eligible event.
+            Action action = ceilingAction(0, 600);
+
+            AlertStormControl.CeilingVerdict blocked = verdict(action);
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, blocked.outcome());
+            AlertStormControl.releaseReservation(blocked);
+
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(action).outcome());
+        }
+
+        @Test
         @DisplayName("at the ceiling: one rollup naming the affected channels, then silence")
         void atCeilingRollsUpExactlyOnce() {
             // The rollup is the entire point of the ceiling — thirty channels

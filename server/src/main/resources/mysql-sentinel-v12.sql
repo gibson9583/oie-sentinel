@@ -1,0 +1,1 @@
+ALTER TABLE sentinel_connector_status_event ADD COLUMN deployment_time DATETIME(3)

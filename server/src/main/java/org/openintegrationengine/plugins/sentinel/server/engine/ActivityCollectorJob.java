@@ -24,6 +24,7 @@ import com.mirth.connect.server.controllers.ControllerFactory;
 import com.mirth.connect.server.controllers.EngineController;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivitySample;
 
 /**
@@ -122,7 +123,8 @@ public class ActivityCollectorJob implements Job {
      */
     @Override
     public void execute(JobExecutionContext context) {
-        if (!SentinelLeadership.isLeader()) {
+        LeaseFence fence = SentinelLeadership.captureFence();
+        if (fence == null) {
             return;
         }
         try {
@@ -132,6 +134,7 @@ public class ActivityCollectorJob implements Job {
 
             Instant now = Instant.now();
             CollectorState state = CollectorState.getInstance();
+            state.prepareCounterEpoch(fence);
 
             List<ActivitySample> samples = new ArrayList<>();
             // Insertion-ordered so the snapshot advance in flushSamples walks
@@ -161,7 +164,7 @@ public class ActivityCollectorJob implements Job {
                 }
             }
 
-            flushSamples(state, samples, observed);
+            flushSamples(state, samples, observed, fence);
 
             maintainStartedStamps(state, deployedIds, now);
             evictDepartedState(state, deployedIds);
@@ -300,13 +303,13 @@ public class ActivityCollectorJob implements Job {
      *                 commits
      */
     private static void flushSamples(CollectorState state, List<ActivitySample> samples,
-            Map<String, CollectorState.Counters> observed) {
+            Map<String, CollectorState.Counters> observed, LeaseFence fence) {
         if (samples.isEmpty()) {
             return;
         }
 
         try {
-            ActivityRepository.insertActivitySamples(samples);
+            ActivityRepository.insertActivitySamples(samples, fence);
         } catch (Exception e) {
             log.error("Failed to insert activity sample batch of {} rows; leaving all previous-counter "
                     + "snapshots unadvanced so the next successful tick covers this interval",

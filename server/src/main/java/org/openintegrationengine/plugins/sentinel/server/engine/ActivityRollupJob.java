@@ -19,6 +19,7 @@ import com.mirth.connect.model.Channel;
 import com.mirth.connect.server.controllers.ChannelController;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivitySample;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
 
@@ -96,7 +97,8 @@ public class ActivityRollupJob implements Job {
      */
     @Override
     public void execute(JobExecutionContext context) {
-        if (!SentinelLeadership.isLeader()) {
+        LeaseFence fence = SentinelLeadership.captureFence();
+        if (fence == null) {
             return;
         }
         try {
@@ -138,10 +140,14 @@ public class ActivityRollupJob implements Job {
                 hoursRolled++;
 
                 for (Channel channel : channels) {
+                    if (!SentinelLeadership.recheckFence(fence)) {
+                        log.info("Activity rollup stopped between channels because leadership epoch changed");
+                        return;
+                    }
                     // Per-channel try/catch: one channel's bad rollup must not
                     // cost every other channel its trend bucket for the hour.
                     try {
-                        if (rollupChannel(channel.getId(), hourStart, hourEndInclusive)) {
+                        if (rollupChannel(channel.getId(), hourStart, hourEndInclusive, fence)) {
                             bucketsWritten++;
                         }
                     } catch (Exception e) {
@@ -195,7 +201,8 @@ public class ActivityRollupJob implements Job {
      *
      * @return true if a bucket was written, false if the hour had no samples
      */
-    private boolean rollupChannel(String channelId, Instant hourStart, Instant hourEndInclusive) {
+    private boolean rollupChannel(String channelId, Instant hourStart, Instant hourEndInclusive,
+            LeaseFence fence) {
         List<ActivitySample> samples = ActivityRepository.listActivitySamples(channelId, hourStart, hourEndInclusive);
         if (samples.isEmpty()) {
             return false;
@@ -229,7 +236,7 @@ public class ActivityRollupJob implements Job {
         trend.setMinQueued(minQueued);
         trend.setMaxQueued(maxQueued);
 
-        ActivityRepository.replaceActivityTrendForHour(trend);
+        ActivityRepository.replaceActivityTrendForHour(trend, fence);
         return true;
     }
 }

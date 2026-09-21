@@ -8,29 +8,38 @@ package org.openintegrationengine.plugins.sentinel.server.evaluate;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
+import com.mirth.connect.server.controllers.ChannelController;
 
-import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
+import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ConnectionStatusEvaluator.ConnectorEvaluation;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
+import org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
@@ -40,14 +49,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * {@code rollup} mode that decides whether a channel with four dead
  * destinations pages once or four times.
  *
- * <p>This evaluator is the only one with no database history behind it: its
- * source of truth is {@link CollectorState}'s live connector-state map, which
- * the plugin's own status listener writes. That map is a process-wide
- * singleton with public seed ({@code putConnectorState}) and clear
- * ({@code forgetChannel}) methods, so these tests drive the real thing rather
- * than mocking it — the evaluator sees exactly the value object the listener
- * would have written. {@link #clearCollectorState()} removes the test
- * channel after every case because the singleton outlives the test class.</p>
+ * <p>The production entry point reads the durable latest row for every
+ * connector/node pair. These tests feed that same DTO list through the
+ * evaluator's package-visible seam, keeping cluster union behavior
+ * deterministic without mocking the database layer.</p>
  *
  * <p>The aggregation rule under test is deliberately asymmetric, and each
  * direction is here for a reason: <b>any</b> breach makes the channel breach
@@ -67,17 +72,28 @@ class ConnectionStatusEvaluatorTest {
     /** The evaluation instant; every seeded state is expressed as an age relative to it. */
     private static final Instant NOW = Instant.parse("2026-01-15T12:00:00Z");
 
-    @AfterEach
-    void clearCollectorState() {
-        CollectorState.getInstance().forgetChannel(CHANNEL_ID);
-    }
+    private final List<ConnectorStatusEvent> latestEvents = new ArrayList<>();
+    private long nextId = 1L;
 
     // ---------------------------------------------------------------- helpers
 
     /** Seeds one connector's live state as of {@code secondsAgo} seconds before {@link #NOW}. */
-    private static void seed(int metadataId, ConnectionStatusEventType state, long secondsAgo) {
-        CollectorState.getInstance().putConnectorState(CHANNEL_ID, metadataId, state,
-                NOW.minusSeconds(secondsAgo));
+    private void seed(int metadataId, ConnectionStatusEventType state, long secondsAgo) {
+        seedNode("node-a", metadataId, state != null ? state.name() : null, NOW.minusSeconds(secondsAgo));
+    }
+
+    private void seedNode(String nodeId, int metadataId, String state, Instant since) {
+        latestEvents.removeIf(event -> event.getMetadataId() == metadataId
+                && nodeId.equals(event.getNodeId()));
+        ConnectorStatusEvent event = new ConnectorStatusEvent();
+        event.setId(nextId++);
+        event.setChannelId(CHANNEL_ID);
+        event.setMetadataId(metadataId);
+        event.setNodeId(nodeId);
+        event.setNewState(state);
+        event.setChangedTime(since);
+        event.setDeploymentTime(Instant.EPOCH);
+        latestEvents.add(event);
     }
 
     /**
@@ -96,12 +112,178 @@ class ConnectionStatusEvaluatorTest {
         return m;
     }
 
-    private static List<ConnectorEvaluation> evaluate(String configJson) {
-        return ConnectionStatusEvaluator.evaluate(monitor(configJson), CHANNEL_ID, NOW);
+    private List<ConnectorEvaluation> evaluate(String configJson) {
+        return ConnectionStatusEvaluator.evaluateStates(monitor(configJson), NOW, latestEvents);
+    }
+
+    private static Map<Integer, Map<String, Instant>> deployments(Map<Integer, Set<String>> nodes, Instant since) {
+        Map<Integer, Map<String, Instant>> result = new java.util.HashMap<>();
+        nodes.forEach((metadata, hosts) -> {
+            Map<String, Instant> times = new java.util.HashMap<>();
+            hosts.forEach(host -> times.put(host, since));
+            result.put(metadata, times);
+        });
+        return result;
+    }
+
+    private List<ConnectorEvaluation> evaluateCluster(String configJson, Set<String> deployingNodes,
+            Map<Integer, String> connectorNames) {
+        ChannelController channels = mock(ChannelController.class);
+        when(channels.getConnectorNames(CHANNEL_ID)).thenReturn(connectorNames);
+        try (MockedStatic<ChannelController> channelSingleton = Mockito.mockStatic(ChannelController.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class);
+                MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
+            channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenReturn(new ArrayList<>(latestEvents));
+            Map<Integer, Set<String>> runtime = new java.util.HashMap<>();
+            connectorNames.keySet().forEach(id -> runtime.put(id, deployingNodes));
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(runtime, Instant.EPOCH));
+            return ConnectionStatusEvaluator.evaluate(monitor(configJson), CHANNEL_ID, NOW);
+        }
+    }
+
+    @Test
+    void healthyLeaderCannotResolveAnUnobservedDeployingFollowersConnector() {
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                result(evaluateCluster("{}", Set.of("node-a", "node-b"), Map.of(0, "Source")).get(0)));
+        seedNode("node-b", 0, "DISCONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.BREACH,
+                result(evaluateCluster("{}", Set.of("node-a", "node-b"), Map.of(0, "Source")).get(0)));
+        seedNode("node-b", 0, "CONNECTED", NOW);
+        assertEquals(EvaluationOutcome.Result.OK,
+                result(evaluateCluster("{}", Set.of("node-a", "node-b"), Map.of(0, "Source")).get(0)));
+    }
+
+    @Test
+    void channelRollupRequiresEveryCurrentConnectorToBeObserved() {
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                result(evaluateCluster("{'rollup':'CHANNEL'}", Set.of("node-a"),
+                        Map.of(0, "Source", 1, "Destination")).get(0)));
+        seedNode("node-a", 1, "DISCONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.BREACH,
+                result(evaluateCluster("{'rollup':'CHANNEL'}", Set.of("node-a"),
+                        Map.of(0, "Source", 1, "Destination")).get(0)));
+    }
+
+    @Test
+    void aHealthyPostUpgradeRowCannotClearAnUnidentifiedLegacyFailureWhileAnotherNodeIsUnobserved() {
+        seedNode("legacy", 0, "DISCONNECTED", NOW.minusSeconds(3600));
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                result(evaluateCluster("{}", Set.of("node-a", "node-b"), Map.of(0, "Source")).get(0)));
+    }
+
+    @Test
+    void followerOnlyDeploymentCanBreachWithoutAnyLeaderLocalObservation() {
+        seedNode("node-b", 0, "DISCONNECTED", NOW.minusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.BREACH,
+                result(evaluateCluster("{}", Set.of("node-b"), Map.of(0, "Source")).get(0)));
+    }
+
+    @Test
+    void differentNodeConnectorInventoriesDoNotRequireReadingsFromDisabledDestinations() {
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+        seedNode("node-b", 0, "CONNECTED", NOW.minusSeconds(60));
+        seedNode("node-a", 1, "CONNECTED", NOW.minusSeconds(60));
+        try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                    .thenReturn(deployments(Map.of(0, Set.of("node-a", "node-b"), 1, Set.of("node-a")), Instant.EPOCH));
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenReturn(new ArrayList<>(latestEvents));
+            assertEquals(EvaluationOutcome.Result.OK,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{'rollup':'CHANNEL'}"), CHANNEL_ID, NOW).get(0)));
+        }
+    }
+
+    @Test
+    void savedConfigurationCannotHideAStillDeployedFailingConnector() {
+        seedNode("node-b", 0, "CONNECTED", NOW.minusSeconds(60));
+        seedNode("node-b", 1, "DISCONNECTED", NOW.minusSeconds(60));
+        ChannelController channels = mock(ChannelController.class);
+        when(channels.getConnectorNames(CHANNEL_ID)).thenReturn(Map.of(0, "Source")); // edit saved, not redeployed
+        try (MockedStatic<ChannelController> channelSingleton = Mockito.mockStatic(ChannelController.class);
+                MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                    .thenReturn(deployments(Map.of(0, Set.of("node-b"), 1, Set.of("node-b")), Instant.EPOCH));
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenReturn(new ArrayList<>(latestEvents));
+            assertEquals(EvaluationOutcome.Result.BREACH,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{'rollup':'CHANNEL'}"), CHANNEL_ID, NOW).get(0)));
+            channelSingleton.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    void aHistoricalHealthyObservationCannotDescribeARejoinedDeployment() {
+        Instant oldDeployment = NOW.minusSeconds(300);
+        Instant newDeployment = NOW.minusSeconds(30);
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+        latestEvents.get(0).setDeploymentTime(oldDeployment);
+        try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                    .thenReturn(Map.of(0, Map.of("node-a", newDeployment)));
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenAnswer(call -> new ArrayList<>(latestEvents));
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0)));
+            seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(5));
+            latestEvents.get(0).setDeploymentTime(newDeployment);
+            assertEquals(EvaluationOutcome.Result.OK,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0)));
+        }
+    }
+
+    @Test
+    void backwardClockAcrossRedeployDoesNotMakeHistoricalHealthyStateFreshWhenTheClockCatchesUp() {
+        Instant oldDeployment = NOW.minusSeconds(100);
+        Instant backwardDeployment = NOW.minusSeconds(200);
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(50));
+        latestEvents.get(0).setDeploymentTime(oldDeployment);
+        try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                    .thenReturn(Map.of(0, Map.of("node-a", backwardDeployment)));
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenReturn(new ArrayList<>(latestEvents));
+            // The old reading is inside the new deployment's wall-clock
+            // interval; a timestamp floor alone would incorrectly return OK.
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0)));
+        }
+    }
+
+    @Test
+    void futureObservationAfterClockRollbackRemainsUnknownEvenWhenItsDeploymentMatches() {
+        seedNode("node-a", 0, "CONNECTED", NOW.plusSeconds(60));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                result(evaluateCluster("{}", Set.of("node-a"), Map.of(0, "Source")).get(0)));
+    }
+
+    @Test
+    void legacyChangedTimePrecisionDoesNotDiscardAValidMatchingDeploymentObservation() {
+        Instant deployment = NOW.minusSeconds(30).plusMillis(123);
+        seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(30)); // older MySQL changed_time truncates milliseconds
+        latestEvents.get(0).setDeploymentTime(deployment);
+        try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
+                MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                    .thenReturn(Map.of(0, Map.of("node-a", deployment)));
+            repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                    .thenReturn(new ArrayList<>(latestEvents));
+            assertEquals(EvaluationOutcome.Result.OK,
+                    result(ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0)));
+        }
     }
 
     /** The single evaluation a CHANNEL-rollup config must always produce. */
-    private static ConnectorEvaluation onlyEvaluation(String configJson) {
+    private ConnectorEvaluation onlyEvaluation(String configJson) {
         List<ConnectorEvaluation> evaluations = evaluate(configJson);
         assertEquals(1, evaluations.size(), "rollup must collapse to exactly one evaluation");
         return evaluations.get(0);
@@ -177,7 +359,7 @@ class ConnectionStatusEvaluatorTest {
             assertEquals(EvaluationOutcome.Result.OK, result(byMetadataId(evaluations, 0)));
             assertEquals(EvaluationOutcome.Result.BREACH, result(byMetadataId(evaluations, 1)));
             assertEquals(EvaluationOutcome.Result.OK, result(byMetadataId(evaluations, 2)));
-            assertEquals("Connector 1 has been DISCONNECTED for 300s",
+            assertEquals("Connector 1 is alerting on 1 of 1 nodes (node ids: node-a)",
                     byMetadataId(evaluations, 1).outcome.getMessage());
         }
 
@@ -259,8 +441,7 @@ class ConnectionStatusEvaluatorTest {
         @Test
         @DisplayName("a connector with no since stamp reads as zero duration")
         void nullSinceIsZeroDuration() {
-            CollectorState.getInstance()
-                    .putConnectorState(CHANNEL_ID, 0, ConnectionStatusEventType.DISCONNECTED, null);
+            seedNode("node-a", 0, ConnectionStatusEventType.DISCONNECTED.name(), null);
             JsonNode node = value(byMetadataId(evaluate("{}"), 0));
             assertTrue(node.path("sinceIso").isNull());
             assertEquals(0, node.path("durationSeconds").asLong());
@@ -275,10 +456,10 @@ class ConnectionStatusEvaluatorTest {
         @Test
         @DisplayName("a connector with no state reads as UNKNOWN and does not breach by default")
         void nullStateIsUnknown() {
-            CollectorState.getInstance().putConnectorState(CHANNEL_ID, 0, null, NOW.minusSeconds(60));
+            seedNode("node-a", 0, null, NOW.minusSeconds(60));
             JsonNode node = value(byMetadataId(evaluate("{}"), 0));
             assertEquals("UNKNOWN", node.path("state").asText());
-            assertEquals(EvaluationOutcome.Result.OK, result(byMetadataId(evaluate("{}"), 0)));
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(byMetadataId(evaluate("{}"), 0)));
         }
 
         @Test
@@ -291,6 +472,176 @@ class ConnectionStatusEvaluatorTest {
             seed(0, ConnectionStatusEventType.DISCONNECTED, -120);
             assertEquals(0, value(byMetadataId(evaluate("{}"), 0)).path("durationSeconds").asLong());
         }
+
+        @Test
+        @DisplayName("a failure observed on any cluster node breaches the connector")
+        void clusterUnionUsesEveryNode() {
+            seedNode("node-a", 1, "CONNECTED", NOW.minusSeconds(30));
+            seedNode("node-b", 1, "DISCONNECTED", NOW.minusSeconds(300));
+
+            ConnectorEvaluation evaluation = byMetadataId(evaluate("{}"), 1);
+            assertEquals(EvaluationOutcome.Result.BREACH, result(evaluation));
+            assertEquals("Connector 1 is alerting on 1 of 2 nodes (node ids: node-b)",
+                    evaluation.outcome.getMessage());
+            JsonNode node = value(evaluation);
+            assertEquals(2, node.path("nodesEvaluated").asInt());
+            assertEquals(1, node.path("nodesBreaching").asInt());
+            assertEquals(2, node.path("nodes").size());
+            assertEquals("node-a", node.path("nodes").get(0).path("nodeId").asText());
+            assertEquals("node-b", node.path("nodes").get(1).path("nodeId").asText());
+        }
+
+        @Test
+        @DisplayName("legacy upgrade state is ignored after a node-aware row exists")
+        void nodeAwareStateSupersedesLegacyFallback() {
+            seedNode("legacy", 1, "DISCONNECTED", NOW.minusSeconds(3600));
+            seedNode("node-a", 1, "CONNECTED", NOW.minusSeconds(30));
+
+            ConnectorEvaluation evaluation = byMetadataId(evaluate("{}"), 1);
+            assertEquals(EvaluationOutcome.Result.OK, result(evaluation));
+            assertEquals(1, value(evaluation).path("nodesEvaluated").asInt());
+            assertEquals("node-a", value(evaluation).path("nodes").get(0).path("nodeId").asText());
+        }
+
+        @Test
+        @DisplayName("legacy upgrade state remains usable until a node reports")
+        void legacyStateIsAnUpgradeFallback() {
+            seedNode("legacy", 1, "DISCONNECTED", NOW.minusSeconds(300));
+
+            ConnectorEvaluation evaluation = byMetadataId(evaluate("{}"), 1);
+            assertEquals(EvaluationOutcome.Result.BREACH, result(evaluation));
+            assertEquals("legacy", value(evaluation).path("nodes").get(0).path("nodeId").asText());
+        }
+
+        @Test
+        @DisplayName("duplicate node rows are reduced to the newest transition")
+        void duplicateNodeRowsUseNewestTransition() {
+            ConnectorStatusEvent older = new ConnectorStatusEvent();
+            older.setId(1L);
+            older.setMetadataId(1);
+            older.setNodeId("node-a");
+            older.setNewState("DISCONNECTED");
+            older.setChangedTime(NOW.minusSeconds(600));
+            latestEvents.add(older);
+            ConnectorStatusEvent newer = new ConnectorStatusEvent();
+            newer.setId(2L);
+            newer.setMetadataId(1);
+            newer.setNodeId("node-a");
+            newer.setNewState("CONNECTED");
+            newer.setChangedTime(NOW.minusSeconds(10));
+            latestEvents.add(newer);
+
+            ConnectorEvaluation evaluation = byMetadataId(evaluate("{}"), 1);
+            assertEquals(EvaluationOutcome.Result.OK, result(evaluation));
+            assertEquals(1, value(evaluation).path("nodesEvaluated").asInt());
+        }
+
+        @Test
+        @DisplayName("generated arrival order survives a backward wall-clock adjustment")
+        void newestIdWinsAfterClockRollback() {
+            ConnectorStatusEvent beforeClockRollback = new ConnectorStatusEvent();
+            beforeClockRollback.setId(10L);
+            beforeClockRollback.setMetadataId(1);
+            beforeClockRollback.setNodeId("node-a");
+            beforeClockRollback.setNewState("DISCONNECTED");
+            beforeClockRollback.setChangedTime(NOW);
+            latestEvents.add(beforeClockRollback);
+
+            ConnectorStatusEvent laterArrival = new ConnectorStatusEvent();
+            laterArrival.setId(11L);
+            laterArrival.setMetadataId(1);
+            laterArrival.setNodeId("node-a");
+            laterArrival.setNewState("CONNECTED");
+            laterArrival.setChangedTime(NOW.minusSeconds(60));
+            latestEvents.add(laterArrival);
+
+            assertEquals(EvaluationOutcome.Result.OK,
+                    result(byMetadataId(evaluate("{}"), 1)));
+        }
+
+        @Test
+        @DisplayName("the production path excludes durable rows for deleted connectors")
+        void deletedConnectorRowsAreExcluded() {
+            seed(0, ConnectionStatusEventType.CONNECTED, 60);
+            seed(9, ConnectionStatusEventType.DISCONNECTED, 600);
+            ChannelController channels = mock(ChannelController.class);
+            when(channels.getConnectorNames(CHANNEL_ID)).thenReturn(Map.of(0, "Source"));
+
+            try (MockedStatic<ChannelController> channelSingleton = Mockito.mockStatic(ChannelController.class);
+                    MockedStatic<ConnectorStatusRepository> repository =
+                            Mockito.mockStatic(ConnectorStatusRepository.class);
+                    MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
+                channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+                repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                        .thenReturn(new ArrayList<>(latestEvents));
+                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
+
+                List<ConnectorEvaluation> evaluations =
+                        ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW);
+                assertEquals(Set.of(0), metadataIds(evaluations));
+                assertEquals(EvaluationOutcome.Result.OK, result(evaluations.get(0)));
+            }
+        }
+
+        @Test
+        @DisplayName("expired node presence removes a retired node from the union")
+        void retiredNodeStateIsExcluded() {
+            seedNode("node-a", 0, "CONNECTED", NOW.minusSeconds(60));
+            seedNode("retired-node", 0, "DISCONNECTED", NOW.minusSeconds(600));
+            ChannelController channels = mock(ChannelController.class);
+            when(channels.getConnectorNames(CHANNEL_ID)).thenReturn(Map.of(0, "Source"));
+
+            try (MockedStatic<ChannelController> channelSingleton = Mockito.mockStatic(ChannelController.class);
+                    MockedStatic<ConnectorStatusRepository> repository =
+                            Mockito.mockStatic(ConnectorStatusRepository.class);
+                    MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
+                channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+                repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                        .thenReturn(new ArrayList<>(latestEvents));
+                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
+
+                ConnectorEvaluation evaluation = ConnectionStatusEvaluator
+                        .evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0);
+                assertEquals(EvaluationOutcome.Result.OK, result(evaluation));
+                assertEquals(1, value(evaluation).path("nodesEvaluated").asInt());
+                assertEquals("node-a", value(evaluation).path("nodes").get(0).path("nodeId").asText());
+            }
+        }
+
+        @Test
+        @DisplayName("retiring the last node does not resurrect its pre-upgrade legacy state")
+        void legacyStateDoesNotResurrectAfterNodeRetires() {
+            seedNode("legacy", 0, "DISCONNECTED", NOW.minusSeconds(3600));
+            seedNode("retired-node", 0, "CONNECTED", NOW.minusSeconds(60));
+            ChannelController channels = mock(ChannelController.class);
+            when(channels.getConnectorNames(CHANNEL_ID)).thenReturn(Map.of(0, "Source"));
+
+            try (MockedStatic<ChannelController> channelSingleton = Mockito.mockStatic(ChannelController.class);
+                    MockedStatic<ConnectorStatusRepository> repository =
+                            Mockito.mockStatic(ConnectorStatusRepository.class);
+                    MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
+                channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+                repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
+                        .thenReturn(new ArrayList<>(latestEvents));
+                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-b")), Instant.EPOCH));
+
+                ConnectorEvaluation evaluation = ConnectionStatusEvaluator
+                        .evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0);
+                assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(evaluation));
+            }
+        }
+
+        @Test
+        @DisplayName("an unresolved runtime inventory fails the channel instead of using stale rows")
+        void unresolvedConnectorInventoryFailsClosed() {
+            try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
+                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                        .thenThrow(new IllegalStateException("inventory unavailable"));
+                assertThrows(IllegalStateException.class,
+                        () -> ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW));
+            }
+        }
+
     }
 
     @Nested
@@ -508,8 +859,7 @@ class ConnectionStatusEvaluatorTest {
             seed(0, ConnectionStatusEventType.DISCONNECTED, 1);
             seed(1, ConnectionStatusEventType.CONNECTED, 1);
 
-            List<ConnectorEvaluation> evaluations =
-                    ConnectionStatusEvaluator.evaluate(monitor(configJson), CHANNEL_ID, NOW);
+            List<ConnectorEvaluation> evaluations = evaluate(configJson);
             assertEquals(2, evaluations.size());
             assertEquals(EvaluationOutcome.Result.BREACH, result(byMetadataId(evaluations, 0)));
             assertEquals(EvaluationOutcome.Result.OK, result(byMetadataId(evaluations, 1)));
@@ -575,16 +925,12 @@ class ConnectionStatusEvaluatorTest {
         }
 
         @Test
-        @DisplayName("one judgeable healthy connector makes the channel OK")
-        void mixedInsufficientAndOkIsOk() {
-            // "OK otherwise" means every connector that could be judged is
-            // healthy. The unjudgeable ones do not hold the verdict hostage,
-            // because a channel that never regained a full set of readings
-            // would otherwise never clear.
+        @DisplayName("one unknown connector prevents a healthy channel verdict")
+        void mixedInsufficientAndOkIsInsufficient() {
             ConnectorEvaluation rolled = rollUp(List.of(
                     evaluation(EvaluationOutcome.insufficientData("{}")),
                     evaluation(EvaluationOutcome.ok("{}"))));
-            assertEquals(EvaluationOutcome.Result.OK, result(rolled));
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(rolled));
         }
 
         @Test

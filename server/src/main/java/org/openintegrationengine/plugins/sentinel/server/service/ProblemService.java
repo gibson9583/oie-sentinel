@@ -431,6 +431,7 @@ public final class ProblemService {
         Instant now = Instant.now();
         event.setStatus(AlertStatus.RESOLVED);
         event.setResolvedTime(now);
+        event.setResolutionPending(true);
         // The database decides acknowledgement ownership at write time.
         // Keep the response snapshot's original acknowledgement if present.
         AlertEvent write = new AlertEvent();

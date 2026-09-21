@@ -17,6 +17,8 @@ import com.mirth.connect.donkey.model.event.Event;
 import com.mirth.connect.donkey.server.event.ConnectionStatusEvent;
 import com.mirth.connect.donkey.server.event.EventType;
 import com.mirth.connect.server.event.EventListener;
+import com.mirth.connect.server.controllers.ControllerFactory;
+import com.mirth.connect.donkey.server.channel.Channel;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
 
@@ -111,8 +113,26 @@ public class SentinelConnectorStatusListener extends EventListener {
             // 0 rather than dropped so the event is still attributable.
             int metadataId = statusEvent.getMetaDataId() != null ? statusEvent.getMetaDataId() : 0;
 
+            // Retain the origin timestamp. Relabeling a queued event with its
+            // processing time could make a previous deployment look current.
+            Instant occurred = Instant.ofEpochMilli(statusEvent.getDateTime());
+            Instant now = Instant.now();
+            Channel deployed = ControllerFactory.getFactory().createEngineController().getDeployedChannel(channelId);
+            if (deployed == null || deployed.getDeployDate() == null) {
+                return;
+            }
+            Instant deployedAt = deployed.getDeployDate().toInstant();
+            if (occurred.isBefore(deployedAt) || occurred.isAfter(now)) {
+                return; // old queued event or an ambiguous reading after clock rollback
+            }
+
             CollectorState collectorState = CollectorState.getInstance();
             CollectorState.ConnectorState previous = collectorState.getConnectorState(channelId, metadataId);
+            if (previous != null && (!deployedAt.equals(previous.deploymentTime)
+                    || previous.since == null || previous.since.isBefore(deployedAt)
+                    || previous.since.isAfter(occurred))) {
+                previous = null; // same state on a new deployment still needs a fresh durable observation
+            }
 
             // Enum comparison by == per the engine's overridden toString():
             // DeployedState/ConnectionStatusEventType render capitalized
@@ -121,18 +141,18 @@ public class SentinelConnectorStatusListener extends EventListener {
                 return; // steady state (e.g. repeated IDLE) — no transition to record
             }
 
-            Instant now = Instant.now();
-
             org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent row =
                     new org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent();
             row.setChannelId(channelId);
             row.setMetadataId(metadataId);
+            row.setNodeId(SentinelLeadership.nodeId());
             row.setPreviousState(previous != null ? previous.state.name() : null);
             row.setNewState(state.name());
-            row.setChangedTime(now);
+            row.setChangedTime(occurred);
+            row.setDeploymentTime(deployedAt);
             ConnectorStatusRepository.insertConnectorStatusEvent(row);
 
-            collectorState.putConnectorState(channelId, metadataId, state, now);
+            collectorState.putConnectorState(channelId, metadataId, state, occurred, deployedAt);
             collectorState.recordConnectorEvent(now);
         } catch (Throwable t) {
             // Never propagate: this thread services every connector's status

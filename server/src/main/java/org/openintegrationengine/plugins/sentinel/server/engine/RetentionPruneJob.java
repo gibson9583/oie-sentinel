@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
@@ -76,7 +77,8 @@ public class RetentionPruneJob implements Job {
      */
     @Override
     public void execute(JobExecutionContext context) {
-        if (!SentinelLeadership.isLeader()) {
+        LeaseFence fence = SentinelLeadership.captureFence();
+        if (fence == null) {
             return;
         }
         try {
@@ -84,15 +86,27 @@ public class RetentionPruneJob implements Job {
             Instant now = Instant.now();
 
             Instant sampleCutoff = now.minus(Duration.ofDays(settings.getSampleRetentionDays()));
-            int samplesDeleted = ActivityRepository.deleteActivitySamplesOlderThan(sampleCutoff);
+            int samplesDeleted = ActivityRepository.deleteActivitySamplesOlderThan(sampleCutoff, fence);
+
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
 
             Instant trendCutoff = now.minus(Duration.ofDays(settings.getTrendRetentionDays()));
-            int trendsDeleted = ActivityRepository.deleteActivityTrendOlderThan(trendCutoff);
+            int trendsDeleted = ActivityRepository.deleteActivityTrendOlderThan(trendCutoff, fence);
+
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
 
             Instant alertCutoff = now.minus(Duration.ofDays(settings.getResolvedAlertRetentionDays()));
-            int alertsDeleted = AlertEventRepository.deleteResolvedAlertEventsOlderThan(alertCutoff);
+            int alertsDeleted = AlertEventRepository.deleteResolvedAlertEventsOlderThan(alertCutoff, fence);
 
-            int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff);
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
+
+            int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff, fence);
 
             // Counts at info: pruning is destructive, so the log should
             // always answer "what did last night's run delete" without the

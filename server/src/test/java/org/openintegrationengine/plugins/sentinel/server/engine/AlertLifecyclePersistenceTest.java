@@ -18,6 +18,7 @@ import java.util.concurrent.*;
 import com.mirth.connect.donkey.server.channel.Channel;
 import com.mirth.connect.server.util.SqlConfig;
 import com.mirth.connect.server.controllers.ControllerFactory;
+import com.mirth.connect.server.controllers.ConfigurationController;
 import com.mirth.connect.server.controllers.EngineController;
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
 import org.apache.ibatis.datasource.unpooled.UnpooledDataSource;
@@ -30,6 +31,7 @@ import org.mockito.MockedStatic;
 import org.openintegrationengine.plugins.sentinel.server.alert.*;
 import org.openintegrationengine.plugins.sentinel.server.db.*;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.ConnectionStatusEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.service.*;
 import org.openintegrationengine.plugins.sentinel.shared.model.*;
 
@@ -48,16 +50,14 @@ class AlertLifecyclePersistenceTest {
     @BeforeEach
     void setup() throws Exception {
         url = "jdbc:derby:memory:lifecycle" + UUID.randomUUID().toString().replace("-", "");
-        try (Connection c = DriverManager.getConnection(url + ";create=true"); Statement sql = c.createStatement()) {
-            for (String resource : List.of("derby-sentinel-tables.sql", "derby-sentinel-v2.sql",
-                    "derby-sentinel-v3.sql", "derby-sentinel-v4.sql")) {
-                try (InputStream in = getClass().getResourceAsStream("/" + resource)) {
-                    assertNotNull(in);
-                    for (String statement : new String(in.readAllBytes(), StandardCharsets.UTF_8).split("\\r?\\n\\s*\\r?\\n")) {
-                        if (!statement.isBlank()) sql.execute(statement.trim());
-                    }
-                }
-            }
+        try (Connection c = DriverManager.getConnection(url + ";create=true");
+                MockedStatic<ConfigurationController> controllers = mockStatic(ConfigurationController.class)) {
+            ConfigurationController controller = mock(ConfigurationController.class);
+            controllers.when(ConfigurationController::getInstance).thenReturn(controller);
+            SentinelMigrator migrator = new SentinelMigrator();
+            migrator.setConnection(c);
+            migrator.setDatabaseType("derby");
+            migrator.migrate();
         }
         Configuration cfg = new Configuration(new Environment("test", new JdbcTransactionFactory(),
                 new UnpooledDataSource("org.apache.derby.jdbc.EmbeddedDriver", url, null, null)));
@@ -79,6 +79,17 @@ class AlertLifecyclePersistenceTest {
         monitor.setConfigJson("{}"); monitor.setEnabled(true); monitor.setMinConsecutiveBreaches(1);
         monitor.setCreatedTime(now); monitor.setUpdatedTime(now);
         MonitorRepository.insertMonitor(monitor);
+        try (Connection c = DriverManager.getConnection(url); PreparedStatement presence = c.prepareStatement(
+                "INSERT INTO sentinel_node_lease (lease_name,node_id,acquired_time,expires_time,lease_epoch) VALUES (?,?,?,?,?)")) {
+            presence.setString(1, "sentinel-presence-test-node"); presence.setString(2, "test-node");
+            presence.setTimestamp(3, Timestamp.from(Instant.now()));
+            presence.setTimestamp(4, Timestamp.from(Instant.now().plusSeconds(3600)));
+            presence.setLong(5, 1); presence.executeUpdate();
+        }
+        for (int metadataId : List.of(0, 1, 2)) {
+            sql("INSERT INTO sentinel_channel_presence (channel_id,node_id,metadata_id,deployed_time) VALUES ('"
+                    + channel + "','test-node'," + metadataId + ",TIMESTAMP('2026-09-01 00:00:00'))");
+        }
     }
 
     @AfterEach
@@ -104,7 +115,12 @@ class AlertLifecyclePersistenceTest {
     }
     private TriggerState state() { return TriggerStateRepository.getTriggerState(monitor.getId(), channel, null); }
     private void breach() { TriggerEvaluatorJob.applyOutcome(monitor, channel, null, EvaluationOutcome.breach("{}", "breach"), now); }
-    private AlertEvent open() { breach(); return AlertEventRepository.getAlertEvent(state().getOpenAlertEventId()); }
+    private AlertEvent open() {
+        breach();
+        AlertEvent event = AlertEventRepository.getAlertEvent(state().getOpenAlertEventId());
+        assertTrue(event.isProblemPending(), "Opening transaction must persist its notification");
+        return event;
+    }
 
     @Test
     void failedTriggerInsertRollsBackAlertAndRetryDeliversOnlyCommittedIncident() throws Exception {
@@ -178,6 +194,7 @@ class AlertLifecyclePersistenceTest {
         assertFalse(AlertEventRepository.resolveAlertEvent(event));
         AlertEvent stored = AlertEventRepository.getAlertEvent(event.getId());
         assertEquals(AlertStatus.RESOLVED, stored.getStatus());
+        assertTrue(stored.isResolutionPending());
         assertEquals(1, stored.getAcknowledgedBy());
         assertEquals("first", stored.getAckComment());
     }
@@ -188,6 +205,7 @@ class AlertLifecyclePersistenceTest {
         Map<String, Object> params = new HashMap<>();
         params.put("id", event.getId());
         params.put("resolved_time", Timestamp.from(now));
+        params.put("resolution_pending", true);
         params.put("acknowledged_by", 7);
         params.put("acknowledged_time", Timestamp.from(now));
         params.put("ack_comment", "stale acknowledgement");
@@ -211,6 +229,7 @@ class AlertLifecyclePersistenceTest {
             assertEquals(0, acknowledgement.get(5, TimeUnit.SECONDS));
             AlertEvent stored = AlertEventRepository.getAlertEvent(event.getId());
             assertEquals(AlertStatus.RESOLVED, stored.getStatus());
+            assertTrue(stored.isResolutionPending());
             assertNull(stored.getAcknowledgedBy());
         } finally {
             resolver.close();
@@ -247,6 +266,7 @@ class AlertLifecyclePersistenceTest {
         sql("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT reject_ok CHECK (state <> 'OK')");
         ProblemService.resolve(event.getId(), "done", 7);
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
         assertEquals(TriggerStatus.PROBLEM, state().getState());
         // minConsecutiveBreaches=1 repairs and opens in the same tick, so even
         // with the injected OK-write failure there is a new tracked incident.
@@ -282,6 +302,7 @@ class AlertLifecyclePersistenceTest {
         AlertEvent event = retainedAlert(null);
         sweep(Set.of(), Map.of());
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
         assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
         assertNull(state().getOpenAlertEventId());
         sweep(Set.of(), Map.of());
@@ -292,67 +313,40 @@ class AlertLifecyclePersistenceTest {
     void retainedConnectorRequiresConclusiveDepartureEvidence() throws Exception {
         monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
         AlertEvent event = retainedAlert(1);
-        ControllerFactory factory = mock(ControllerFactory.class);
-        EngineController engine = mock(EngineController.class);
-        when(factory.createEngineController()).thenReturn(engine);
-        when(engine.isDeployed(channel)).thenReturn(true);
-        Channel deployed = mock(Channel.class);
-        when(engine.getDeployedChannel(channel)).thenReturn(deployed);
-        when(deployed.getMetaDataIds()).thenReturn(List.of(0, 2));
-        try (var controllers = mockStatic(ControllerFactory.class)) {
-            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
-            // Missing evaluation is not evidence that a connector disappeared.
-            sweep(Set.of(channel), Map.of());
-            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
-            // A connector still evaluated remains open even while data is insufficient.
-            sweep(Set.of(channel), Map.of(channel, Set.of(1)));
-            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
-            dispatch.verifyNoInteractions();
-            // A completed evaluation of this channel now contains only connector 2.
-            sweep(Set.of(channel), Map.of(channel, Set.of(2)));
-            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
-            assertNull(TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1).getOpenAlertEventId());
-            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
-        }
+        sweep(Set.of(channel), Map.of());
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        sweep(Set.of(channel), Map.of(channel, Set.of(1)));
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        dispatch.verifyNoInteractions();
+        sql("DELETE FROM sentinel_channel_presence WHERE metadata_id = 1");
+        sweep(Set.of(channel), Map.of(channel, Set.of(0, 2)));
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
+        assertNull(TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1).getOpenAlertEventId());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
     }
 
     @Test
     void partialConnectorObservationsDoNotResolveStillDeployedSource() throws Exception {
         monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
         AlertEvent event = retainedAlert(0);
-        ControllerFactory factory = mock(ControllerFactory.class);
-        EngineController engine = mock(EngineController.class);
-        Channel deployed = mock(Channel.class);
-        when(factory.createEngineController()).thenReturn(engine);
-        when(engine.isDeployed(channel)).thenReturn(true);
-        when(engine.getDeployedChannel(channel)).thenReturn(deployed);
-        when(deployed.getMetaDataIds()).thenReturn(List.of(0, 1));
-        try (var controllers = mockStatic(ControllerFactory.class)) {
-            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
-            // Destination observations returned first after collector restart.
-            sweep(Set.of(channel), Map.of(channel, Set.of(1)));
-            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
-            assertEquals(event.getId(), TriggerStateRepository.getTriggerState(monitor.getId(), channel, 0).getOpenAlertEventId());
-            dispatch.verifyNoInteractions();
-            // Also preserve the source if the paused channel remains deployed.
-            sweep(Set.of(), Map.of());
-            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
-            dispatch.verifyNoInteractions();
-        }
+        sweep(Set.of(channel), Map.of(channel, Set.of(1)));
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(event.getId(), TriggerStateRepository.getTriggerState(monitor.getId(), channel, 0).getOpenAlertEventId());
+        dispatch.verifyNoInteractions();
+        // Pausing does not remove the deployed connector inventory.
+        sweep(Set.of(), Map.of());
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        dispatch.verifyNoInteractions();
     }
 
     @Test
     void unavailableConnectorIdentityRetainsAlert() throws Exception {
         monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
         AlertEvent event = retainedAlert(1);
-        ControllerFactory factory = mock(ControllerFactory.class);
-        EngineController engine = mock(EngineController.class);
-        when(factory.createEngineController()).thenReturn(engine);
-        when(engine.isDeployed(channel)).thenReturn(true);
-        try (var controllers = mockStatic(ControllerFactory.class)) {
-            controllers.when(ControllerFactory::getFactory).thenReturn(factory);
-            sweep(Set.of(channel), Map.of(channel, Set.of(2))); // No runtime channel available.
-            when(engine.getDeployedChannel(channel)).thenThrow(new IllegalStateException("unavailable"));
+        try (var inventory = mockStatic(NodeLeaseRepository.class, CALLS_REAL_METHODS)) {
+            inventory.when(() -> NodeLeaseRepository.listActiveConnectorNodes(channel))
+                    .thenThrow(new IllegalStateException("inventory unavailable"));
             sweep(Set.of(channel), Map.of(channel, Set.of(2)));
             assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
             dispatch.verifyNoInteractions();
@@ -382,19 +376,22 @@ class AlertLifecyclePersistenceTest {
     }
 
     @Test
-    void suppressedRetainedDepartureClosesWithoutNotification() throws Exception {
+    void suppressedRetainedDepartureQueuesRecoveryForCurrentPolicyCheck() throws Exception {
         AlertEvent event = retainedAlert(null);
         sql("UPDATE sentinel_alert_event SET suppressed = true WHERE id = " + event.getId());
         sweep(Set.of(), Map.of());
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
         assertNull(state().getOpenAlertEventId());
-        dispatch.verifyNoInteractions();
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
     }
 
     @Test
     void retainedConnectionAlertResolvesOnUndeployment() throws Exception {
         monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
         AlertEvent event = retainedAlert(1);
+        sql("DELETE FROM sentinel_channel_presence");
         ControllerFactory factory = mock(ControllerFactory.class);
         EngineController engine = mock(EngineController.class);
         when(factory.createEngineController()).thenReturn(engine);
@@ -403,6 +400,7 @@ class AlertLifecyclePersistenceTest {
             controllers.when(ControllerFactory::getFactory).thenReturn(factory);
             sweep(Set.of(), Map.of());
             assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+            assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
             dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
         }
     }
@@ -429,6 +427,7 @@ class AlertLifecyclePersistenceTest {
         sql("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT reject_clear");
         sweep(Set.of(), Map.of());
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
         assertNull(state().getOpenAlertEventId());
         dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
     }
@@ -449,6 +448,7 @@ class AlertLifecyclePersistenceTest {
         sql("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT reject_departure");
         sweep.invoke(null, monitor, Set.of(), Map.of(), now);
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
         assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
         assertNull(state().getOpenAlertEventId());
         dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
@@ -468,5 +468,73 @@ class AlertLifecyclePersistenceTest {
         TriggerEvaluatorJob.applyOutcome(monitor, channel, null, EvaluationOutcome.ok("{}"), now);
         assertNull(state().getOpenAlertEventId());
         dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+    }
+
+    @Test
+    void evaluatorRejectsReplacedAndExpiredLeaderBeforeLifecycleWrites() throws Exception {
+        try (Connection c = DriverManager.getConnection(url); PreparedStatement insert = c.prepareStatement(
+                "INSERT INTO sentinel_node_lease (lease_name,node_id,acquired_time,expires_time,lease_epoch) VALUES (?,?,?,?,?)")) {
+            insert.setString(1, "sentinel"); insert.setString(2, "leader");
+            insert.setTimestamp(3, Timestamp.from(Instant.now()));
+            insert.setTimestamp(4, Timestamp.from(Instant.now().plusSeconds(60)));
+            insert.setLong(5, 2); insert.executeUpdate();
+        }
+        LeaseFence stale = new LeaseFence("sentinel", "leader", 1L);
+        assertThrows(RuntimeException.class, () -> TriggerEvaluatorJob.applyOutcome(
+                monitor, channel, null, EvaluationOutcome.breach("{}", "breach"), now, stale));
+        assertEquals(0, count("sentinel_alert_event"));
+        assertEquals(0, count("sentinel_trigger_state"));
+        dispatch.verifyNoInteractions();
+
+        LeaseFence current = new LeaseFence("sentinel", "leader", 2L);
+        TriggerEvaluatorJob.applyOutcome(monitor, channel, null,
+                EvaluationOutcome.breach("{}", "breach"), now, current);
+        AlertEvent event = AlertEventRepository.getAlertEvent(state().getOpenAlertEventId());
+        assertTrue(event.isProblemPending());
+        dispatch.reset();
+        sql("UPDATE sentinel_node_lease SET expires_time = TIMESTAMP('2000-01-01 00:00:00')");
+        assertThrows(RuntimeException.class, () -> TriggerEvaluatorJob.applyOutcome(
+                monitor, channel, null, EvaluationOutcome.ok("{}"), now, current));
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertFalse(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
+        assertEquals(event.getId(), state().getOpenAlertEventId());
+        dispatch.verifyNoInteractions();
+    }
+
+    @Test
+    void remoteOnlyDeploymentIsEvaluatedAndUnknownStateCannotResolveIt() throws Exception {
+        monitor.setMonitorType(MonitorType.CONNECTION_STATUS);
+        ScopeResolver.ChannelResolution resolution = new ScopeResolver.ChannelResolution();
+        resolution.targets.add(new ScopeResolver.ChannelTarget(channel, "remote-only"));
+        try (var scopes = mockStatic(ScopeResolver.class);
+                var evaluators = mockStatic(ConnectionStatusEvaluator.class);
+                var localEngine = mockStatic(ControllerFactory.class)) {
+            scopes.when(() -> ScopeResolver.resolveScopedChannelSet(monitor)).thenReturn(resolution);
+            localEngine.when(ControllerFactory::getFactory)
+                    .thenThrow(new AssertionError("Remote inventory must not consult local deployment"));
+            evaluators.when(() -> ConnectionStatusEvaluator.evaluateChannel(monitor, channel, now))
+                    .thenReturn(new ConnectionStatusEvaluator.ChannelEvaluation(List.of(
+                            new ConnectionStatusEvaluator.ConnectorEvaluation(1,
+                                    EvaluationOutcome.breach("{}", "follower disconnected"))), Set.of(1)));
+            TriggerEvaluatorJob.evaluateMonitor(monitor, now);
+            TriggerState state = TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1);
+            assertNotNull(state);
+            Long eventId = state.getOpenAlertEventId();
+            assertNotNull(eventId);
+            assertTrue(AlertEventRepository.getAlertEvent(eventId).isProblemPending());
+
+            evaluators.when(() -> ConnectionStatusEvaluator.evaluateChannel(monitor, channel, now))
+                    .thenReturn(new ConnectionStatusEvaluator.ChannelEvaluation(List.of(
+                            new ConnectionStatusEvaluator.ConnectorEvaluation(1,
+                                    EvaluationOutcome.insufficientData("{}"))), Set.of(1)));
+            TriggerEvaluatorJob.evaluateMonitor(monitor, now);
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(eventId).getStatus());
+            assertEquals(eventId, TriggerStateRepository.getTriggerState(monitor.getId(), channel, 1).getOpenAlertEventId());
+
+            sql("DELETE FROM sentinel_channel_presence");
+            TriggerEvaluatorJob.evaluateMonitor(monitor, now);
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(eventId).getStatus());
+            assertTrue(AlertEventRepository.getAlertEvent(eventId).isResolutionPending());
+        }
     }
 }

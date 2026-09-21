@@ -60,9 +60,11 @@ public final class ConnectorStatusRepository {
             Map<String, Object> params = new HashMap<>();
             params.put("channel_id", event.getChannelId());
             params.put("metadata_id", event.getMetadataId());
+            params.put("node_id", event.getNodeId());
             params.put("previous_state", event.getPreviousState());
             params.put("new_state", event.getNewState());
             params.put("changed_time", toTimestamp(event.getChangedTime()));
+            params.put("deployment_time", toTimestamp(event.getDeploymentTime()));
 
             SqlConfig.getInstance().getSqlSessionManager().insert(stmt("insertConnectorStatusEvent"), params);
         } catch (Exception e) {
@@ -77,7 +79,7 @@ public final class ConnectorStatusRepository {
      *
      * @param channelId  the OIE channel id (a UUID string)
      * @param metadataId the connector metadata id within the channel
-     * @return the most recent event by {@code changed_time}, or {@code null}
+     * @return the most recently inserted event, or {@code null}
      *         if this connector has never recorded one
      * @throws RepositoryException on persistence failure
      */
@@ -99,8 +101,38 @@ public final class ConnectorStatusRepository {
     }
 
     /**
-     * Deletes connector status events older than a cutoff, in chunks (see
-     * {@link ChunkedDelete}). This table gains a row on every connector
+     * Fetches the latest known state for every node/connector pair in a
+     * channel. The generated row id, not the wall-clock timestamp, defines
+     * arrival order so an NTP rollback cannot resurrect an older state.
+     *
+     * @param channelId the OIE channel id
+     * @return one event per observed {@code (metadata_id, node_id)} pair,
+     *         ordered by connector and node; never {@code null}
+     * @throws RepositoryException on persistence failure
+     */
+    public static List<ConnectorStatusEvent> listLatestConnectorStatusEvents(String channelId) {
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("channelId", channelId);
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listLatestConnectorStatusEvents"), params);
+            List<ConnectorStatusEvent> results = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                results.add(toConnectorStatusEvent(row));
+            }
+            return results;
+        } catch (Exception e) {
+            log.error("Failed to list latest connector status events for channel {}", channelId, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
+     * Deletes superseded connector status events older than a cutoff, in
+     * chunks (see {@link ChunkedDelete}). The newest row for every
+     * connector/node pair is retained regardless of age because it is the
+     * durable current state consumed by the cluster evaluator. This table
+     * gains a row on every connector
      * state transition — a flapping connector writes tens of thousands a day
      * — so the nightly prune covers it like the other growth tables.
      *
@@ -110,6 +142,11 @@ public final class ConnectorStatusRepository {
      */
     public static int deleteConnectorStatusEventsOlderThan(Instant cutoff) {
         return ChunkedDelete.run(stmt("deleteConnectorStatusEventsOlderThan"), cutoff, "connector status events");
+    }
+
+    public static int deleteConnectorStatusEventsOlderThan(Instant cutoff, LeaseFence fence) {
+        return ChunkedDelete.run(
+                stmt("deleteConnectorStatusEventsOlderThan"), cutoff, "connector status events", fence);
     }
 
     /**
@@ -157,9 +194,11 @@ public final class ConnectorStatusRepository {
         Object metadataId = row.get("metadata_id");
         event.setMetadataId(metadataId != null ? ((Number) metadataId).intValue() : 0);
 
+        event.setNodeId((String) row.get("node_id"));
         event.setPreviousState((String) row.get("previous_state"));
         event.setNewState((String) row.get("new_state"));
         event.setChangedTime(toInstant(row.get("changed_time")));
+        event.setDeploymentTime(toInstant(row.get("deployment_time")));
         return event;
     }
 

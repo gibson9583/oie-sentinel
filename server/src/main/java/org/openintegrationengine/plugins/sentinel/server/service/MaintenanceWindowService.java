@@ -22,12 +22,11 @@ import org.openintegrationengine.plugins.sentinel.shared.model.WindowRepeat;
 /**
  * Business rules for maintenance-window CRUD plus the "activate now" shortcut.
  *
- * <p>Windows only influence <em>alert creation</em> (a SUPPRESS window
- * suppresses alerts born inside its active times; an ACTIVE alerting
- * schedule suppresses alerts born outside them), so all this service must
- * guarantee is that persisted windows are coherent: a name to show in the
- * log, a resolvable scope, and a schedule the evaluator can parse. The
- * evaluator's suppression check consumes windows exactly as stored — the
+ * <p>Windows influence every notification decision (a SUPPRESS window blocks
+ * while active; an ACTIVE alerting schedule blocks while inactive), so this
+ * service guarantees that persisted windows are coherent: a name to show in
+ * the log, a resolvable scope, and a schedule the dispatcher can parse. The
+ * dispatch-time suppression check consumes windows exactly as stored — the
  * only derived state is the response-only {@code activeNow} stamp on
  * reads.</p>
  *
@@ -113,10 +112,9 @@ public final class MaintenanceWindowService {
     }
 
     /**
-     * Deletes a window. Alerts suppressed while it was active keep their
-     * stored {@code suppressed} flag — suppression is decided at alert
-     * creation and never revisited, so deleting a window rewrites no
-     * history.
+     * Deletes a window. Existing alert rows are not bulk rewritten; each
+     * still-open event refreshes its stored display bit on its next
+     * dispatch-time decision, and a queued attempt rechecks before sending.
      *
      * @param id     database id of the window to delete
      * @param userId the acting user, audited

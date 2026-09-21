@@ -402,8 +402,8 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String getMaintenanceWindow(@Param("id") @PathParam("id") int id) throws ClientException;
 
     /**
-     * Creates a new maintenance window. Alerts raised for channels covered by
-     * an active window are suppressed (recorded but not dispatched).
+     * Creates a new maintenance window. Notification decisions for covered
+     * channels are re-evaluated against its current mode and active time.
      *
      * @param windowJson JSON MaintenanceWindow to create
      * @return JSON of the created MaintenanceWindow including its assigned id

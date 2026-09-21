@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 
 /**
  * In-memory state shared between the Sentinel background jobs and the REST
@@ -26,9 +27,10 @@ import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
  * classes are stateless static-method utilities): the collector job, the
  * connector-status listener thread, the evaluator job and per-request REST
  * threads all need to read and write the same maps, so the state must live
- * in one shared place. Everything here is either a {@link ConcurrentHashMap}
- * or a {@code volatile} field, so no method needs synchronization — each
- * entry is written atomically and readers tolerate slightly stale values
+ * in one shared place. Maps and status fields support concurrent reads;
+ * changing the counter epoch is synchronized so a failback cannot reuse a
+ * baseline from an earlier leadership term. Other entries are written
+ * atomically and readers tolerate slightly stale values
  * (a dashboard timestamp or connector state that lags by one tick is
  * harmless).</p>
  *
@@ -44,6 +46,7 @@ public final class CollectorState {
     private static final CollectorState INSTANCE = new CollectorState();
 
     private final ConcurrentMap<String, Counters> previousCounters = new ConcurrentHashMap<>();
+    private LeaseFence counterEpoch = LeaseFence.unmanaged();
 
     /**
      * Live connector states keyed by channel id, then connector metadata id.
@@ -115,6 +118,22 @@ public final class CollectorState {
      */
     public Counters getPreviousCounters(String channelId) {
         return previousCounters.get(channelId);
+    }
+
+    /**
+     * A former leader must take a fresh counter baseline when it wins a new
+     * epoch. Its old counters span traffic already sampled by its successor;
+     * retaining them would count that interval twice on failback. Renewal
+     * keeps the epoch and its baseline, including after a failed DB batch.
+     */
+    synchronized void prepareCounterEpoch(LeaseFence fence) {
+        if (fence == null) {
+            throw new IllegalArgumentException("A collector epoch is required");
+        }
+        if (!fence.equals(counterEpoch)) {
+            previousCounters.clear();
+            counterEpoch = fence;
+        }
     }
 
     /**
@@ -267,12 +286,19 @@ public final class CollectorState {
         public final int metadataId;
         public final ConnectionStatusEventType state;
         public final Instant since;
+        public final Instant deploymentTime;
 
         public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since) {
+            this(channelId, metadataId, state, since, null);
+        }
+
+        public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+                Instant deploymentTime) {
             this.channelId = channelId;
             this.metadataId = metadataId;
             this.state = state;
             this.since = since;
+            this.deploymentTime = deploymentTime;
         }
     }
 
@@ -316,8 +342,13 @@ public final class CollectorState {
      * @param since      when the transition was observed
      */
     public void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since) {
+        putConnectorState(channelId, metadataId, state, since, null);
+    }
+
+    public void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+            Instant deploymentTime) {
         connectorStates
                 .computeIfAbsent(channelId, id -> new ConcurrentHashMap<>())
-                .put(metadataId, new ConnectorState(channelId, metadataId, state, since));
+                .put(metadataId, new ConnectorState(channelId, metadataId, state, since, deploymentTime));
     }
 }

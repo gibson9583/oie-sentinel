@@ -13,7 +13,7 @@ Sentinel adds that missing layer as a new, standalone plugin: a Zabbix-style mon
 engine over channel activity, with its own schema, a background collector + evaluator, and a full
 multi-page web dashboard (no Swing client — server + web UI only, per the original request). Decisions
 made along the way: repo name **oie-sentinel**, monitor types **inactivity, low-volume, anomaly
-detection, connection-status**, alert delivery **Email + Channel(VM Router) + SNS** only for v1,
+detection, connection-status**, alert delivery **Email + Channel(VM Router) + SNS + Webhook**,
 **all 5 DB vendors** (derby/mysql/postgres/oracle/sqlserver), full scope in one plan (not phased),
 and **user actions audited into OIE's core event log**.
 
@@ -48,7 +48,7 @@ deliberately since the generator's exact annotation shape couldn't be verified a
 in this environment, and a hand-written `plugin.xml` is fully inspectable/deterministic. Revisit if
 the ~30+ REST operations make manual upkeep painful.
 
-## Database schema (9 tables, MyBatis, per-vendor DDL)
+## Database schema (11 tables, MyBatis, per-vendor DDL)
 
 Follows RBAC's established pattern exactly: `SentinelMigrator extends Migrator`, registered via
 `<migratorClass>` in `plugin.xml`, self-tracks its own `schema_version` under
@@ -90,13 +90,18 @@ No new CRUD, no membership table, no duplicate taxonomy to desync.
    anomaly detector's 28-day hour-of-day lookup would otherwise scan ~40k raw rows per
    channel/evaluation; against this table it's a ~672-row indexed scan. Default retention 90 days.
 5. **`sentinel_connector_status_event`** — event-driven (a row only on state transition, not every
-   poll, to avoid bloat): `channel_id, metadata_id, previous_state, new_state, changed_time`.
+   poll, to avoid bloat): `channel_id, metadata_id, node_id, previous_state, new_state,
+   changed_time, deployment_time`. Every cluster node writes its own stable identity; the leader evaluates the
+   latest row per connector/node and breaches when any node is alerting. Retention always preserves
+   that newest row even after the ordinary history cutoff.
 6. **`sentinel_alert_event`** — the "Problems" list: `monitor_id, channel_id, metadata_id, severity,
    status (PROBLEM|RESOLVED), message, opened_time, resolved_time, acknowledged_by,
-   acknowledged_time, ack_comment, details_json, suppressed` (locked at creation time from a
-   maintenance-window/dependency check, never re-evaluated later). Indexes:
+   acknowledged_time, ack_comment, details_json, suppressed, problem_pending,
+   resolution_pending`. `suppressed` is the latest durable dispatch-time policy snapshot and
+   window-entry latch; the two pending flags are ordered durable outboxes for the problem and
+   recovery edges. Indexes:
    `(monitor_id, channel_id)`, `(status)`, `(opened_time)`.
-7. **`sentinel_action`** — `id, name UNIQUE, enabled, action_type (EMAIL|CHANNEL|SNS),
+7. **`sentinel_action`** — `id, name UNIQUE, enabled, action_type (EMAIL|CHANNEL|SNS|WEBHOOK),
    condition_json` (Zabbix-style field/operator/value condition rows — `SEVERITY`, `MONITOR_TYPE`,
    `CHANNEL`, `CHANNEL_GROUP`, `EVENT_TYPE` fields with `=`/`!=`/`>=`/`IN` operators — evaluated
    against each new/resolved `alert_event`, no monitor↔action join table needed), `operation_mode
@@ -116,9 +121,29 @@ No new CRUD, no membership table, no duplicate taxonomy to desync.
    channels notify only inside the window's times. A recurring window's daily times and day set
    are read on its own `timezone`, so a 22:00–06:00 schedule stays eight hours across both DST
    transitions in the zone the rotation lives in rather than the server's.
+10. **`sentinel_node_lease`** — database-clock leases for one exclusive background-work leader and
+    one presence row per Sentinel node. Leadership rows carry a monotonically increasing fencing
+    epoch through protected writes. Presence rows are renewed by leaders and standbys alike and
+    bound membership in the durable connector-state union: a clean stop expires the row
+    immediately, while a crash is excluded after the 90-second lease timeout. Stable node ids keep
+    restarts on the same logical row instead of accumulating stale identities.
+
+11. **`sentinel_channel_presence`** — each live node's complete deployed-channel and connector inventory,
+    including the runtime deployment timestamp with millisecond precision,
+    published in the same transaction as its presence lease. The leader uses this shared inventory
+    for connector monitoring and departure checks, including follower-only deployments. Unknown
+    connector observations keep a healthy-looking aggregate insufficient until coverage is complete.
+
+Connector observations must name the same deployment timestamp as the published runtime inventory.
+The listener checks event-origin time before persistence and resets same-state deduplication when
+the deployment changes. Historical observations without a deployment timestamp remain unknown.
+The engine supplies no originating deployment token on queued events: wall-clock ambiguity across
+a backward clock adjustment cannot establish an exact event-to-deployment identity. These checks
+prevent ordinary stale-state reuse; they are not a guarantee against arbitrary clock changes.
 
 Uninstall order (FK-safe, child-first): `action_dispatch_log → alert_event → trigger_state →
-connector_status_event → activity_trend → activity_sample → action → maintenance_window → monitor`.
+connector_status_event → channel_presence → activity_trend → activity_sample → node_lease → action →
+maintenance_window → monitor`.
 
 **Pagination portability**: `sentinel_alert_event` and the activity tables will have real row
 counts, unlike RBAC's tiny tables. The engine's own message-browser pagination
@@ -146,10 +171,10 @@ wrapped in its own try/catch so one bad tick can't take down the schedule.
 
 | Job | Interval | Responsibility |
 |---|---|---|
-| `ActivityCollectorJob` | 30-60s, configurable | Poll `EngineController.getChannelStatisticsList(null, false)` (cheap in-memory counters, confirmed no DB hit). Diff against an in-memory `lastStats` map to compute deltas; write `activity_sample` rows. Connector up/down state is **not** collected here: `ConnectionStatusLogController.getConnectionStatesForServer(...)` NPEs whenever a non-TCP connector has reported state (`DefaultConnectionLogController:245` only populates its count maps from `ConnectorCountEvent`), so Sentinel instead registers its own `EventListener` on `EventType.CONNECTION_STATUS` (`SentinelConnectorStatusListener`) which maintains the live per-connector state map and writes `connector_status_event` rows on transitions — dropping only the transient `INFO`/`FAILURE` message types, so `DISCONNECTED` is a recorded state. |
+| `ActivityCollectorJob` | 30-60s, configurable | Poll `EngineController.getChannelStatisticsList(null, false)` (cheap in-memory counters, confirmed no DB hit). Diff against an in-memory `lastStats` map to compute deltas; write `activity_sample` rows. Connector up/down state is **not** collected here: `ConnectionStatusLogController.getConnectionStatesForServer(...)` NPEs whenever a non-TCP connector has reported state (`DefaultConnectionLogController:245` only populates its count maps from `ConnectorCountEvent`), so Sentinel instead registers its own `EventListener` on `EventType.CONNECTION_STATUS` (`SentinelConnectorStatusListener`) on every node. The listener maintains local deduplication state and writes node-qualified `connector_status_event` rows on transitions — dropping only transient `INFO`/`FAILURE` message types, so `DISCONNECTED` is recorded. The elected leader evaluates the durable union after filtering it against the channel's current connector metadata and the database-clock presence registry, so a retired node's last state ages out of the active union without deleting its history. |
 | `TriggerEvaluatorJob` | 60s, configurable | Resolve each enabled monitor's scope to concrete **deployed** (`DeployedState.STARTED`, not just "not undeployed" — a paused channel's source isn't polling, evaluating INACTIVITY against it is a guaranteed false positive) channel list, evaluate type-specific rule, apply hysteresis, transition trigger_state, open/resolve `alert_event`, dispatch actions (incl. escalation repeat-checks for still-open problems). Auto-resolves alerts for channels that leave STARTED. |
 | `ActivityRollupJob` | hourly at :05 | Roll the just-completed hour from `activity_sample` → `activity_trend` (delete+reinsert, idempotent — avoids vendor-inconsistent `MERGE`/`ON CONFLICT` syntax). |
-| `RetentionPruneJob` | daily | Prune `activity_sample` > 7d, `activity_trend` > 90d, **only RESOLVED** `alert_event` > 180d (open PROBLEM rows are never pruned regardless of age). Cascades `action_dispatch_log`. |
+| `RetentionPruneJob` | daily | Prune `activity_sample` > 7d, `activity_trend` > 90d, **only RESOLVED** `alert_event` > 180d (open PROBLEM rows are never pruned regardless of age). Cascades `action_dispatch_log`. Prune superseded connector transitions at the sample cutoff but retain the newest state for every connector/node pair regardless of age. |
 
 **Counter-delta correctness** (a real bug caught in review): `ChannelStatistics` counters are
 cumulative and can go backwards on channel redeploy, server restart, or an operator hitting "Clear
@@ -177,20 +202,33 @@ hour-of-day/weekend bucketing happens in Java (portable via `java.time`), not in
 just returns all trend rows in the lookback window and `BaselineResolver` does the tiering, shared by
 `AnomalyEvaluator` and `LowVolumeEvaluator`'s `BASELINE_RELATIVE` mode.
 
-**Suppression** (maintenance windows + `suppressed_by_monitor_id` dependency): evaluated once per
-alert *creation*, stored on the row (`suppressed` flag), never re-checked later — evaluation and
-hysteresis counting continue underneath even while suppressed, avoiding an alert burst the instant
-a window/dependency clears. Dependency graph must be cycle-checked on save (`MonitorService`, simple
-DFS) and evaluated in topological order each tick. A dependency on a GROUP-scoped monitor that
-doesn't cover the dependent's channel fails open (never silently swallows a real alert).
+**Suppression** (maintenance/alerting windows + `suppressed_by_monitor_id` dependency): re-evaluated
+on the dispatch worker for every open, repeat, escalation and resolution decision, and again at the
+transport boundary. The row's `suppressed` flag stores the latest result and is also a durable
+window-entry latch, so a still-open problem notifies when policy becomes eligible. Dependency graph
+cycles are rejected on save; inventory uncertainty fails the individual notification closed and is
+retried on a later tick rather than silently allowing or permanently losing it.
 
-## Alert delivery (Email, Channel, SNS)
+## Alert delivery (Email, Channel, SNS, Webhook)
 
-All three confirmed against engine source, no new plumbing needed for Email/Channel:
+All four transports share one 30-second hard wall-clock boundary in `ActionDispatcher`; Webhook and
+SNS retain their own shorter/configurable limits. Synchronous SMTP and VMRouter calls run behind a
+cancellable future on a separate no-queue transport pool, so a hung call cannot retain one of the
+bounded dispatch workers indefinitely.
 
 - **Email**: `com.mirth.connect.server.util.ServerSMTPConnectionFactory.createSMTPConnection().send(to, cc, subject, body)` — reuses the engine's already-configured SMTP settings (`ConfigurationController.getServerSettings()`), Apache Commons Email under the hood. No new SMTP config surface in Sentinel at all.
 - **Channel**: `new com.mirth.connect.server.userutil.VMRouter().routeMessageByChannelId(channelId, rawMessage)` → `EngineController.dispatchRawMessage(...)`. This is the *exact* mechanism the core alert system's `ChannelProtocol` and the VM Router/"Channel Writer" destination connector both already use — not a workaround, the canonical way to inject a message into a channel from plugin code. Alert JSON goes in the message body; alert fields also flattened into the `RawMessage`'s source map so the receiving channel's transformer can reference them without parsing JSON. This is what makes Email+Channel+SNS sufficient for v1 — a channel destination (HTTP Sender, etc.) lets users fan out to Slack/Teams/PagerDuty/SMS themselves without Sentinel building native integrations for each.
 - **SNS**: AWS SDK v2, mirroring `sqs-source-connector`'s `AwsConnectorCredentials` factory (DEFAULT/STATIC/ROLE auth types, `StsAssumeRoleCredentialsProvider` for cross-account). Unlike that connector (which stores AWS secrets in plaintext), Sentinel encrypts `secretAccessKey` via `ConfigurationController.getInstance().getEncryptor()` before persisting, and redacts `accessKeyId`/`assumeRoleArn` on read.
+- **Webhook**: JDK `HttpClient.sendAsync` after DNS/IP egress validation, with per-action HTTPS method,
+  headers, body template and 1–30 second timeout. Redirect targets are revalidated before following.
+
+Opened edges remain `problem_pending` and are reconstructed from missing per-action dispatch rows;
+resolved edges remain `resolution_pending` until the problem edge is fully accounted and every
+applicable recovery action has a durable marked row. Queue rejection, failover, restart, a
+short-lived incident and partial fan-out therefore leave database evidence for the next evaluator
+tick. Replay is idempotent once an attempt row exists. As with any transport plus local database,
+a process loss after the external side effect but before its row commits can produce an at-least-once
+duplicate; no email, VMRouter, SNS or arbitrary webhook receiver offers a common atomic transaction.
 
   **The plugin bundles `sns` and nothing else.** The engine ships the whole AWS SDK 2.15.28 core at `server-lib/aws/` (verified against the 4.6.0 GA distribution) — `apache-client`, `auth`, `sdk-core`, `aws-core`, `regions`, `profiles`, the protocol jars, `sts`, `utils`, plus netty 4.1.119 under `aws/ext/netty` — and `sns` is the one artifact it does not. Everything else is `provided`. This is safe because `MirthLauncher` walks `server-lib` *recursively* (`FileUtils.listFiles(dir, fileFilter, trueFileFilter())`) into the same `URLClassLoader` extensions are appended to, which is the same mechanism the already-working `provided` `donkey-server` (at `server-lib/donkey/`) relies on. The earlier shape — bundling the full transitive closure, 36 jars — shipped a netty five years older than the engine's inside the distributed artifact. Two guards keep the assumption honest: `build.sh` fails the build if `plugin.xml`'s `<library>` list and the staged jars disagree in either direction, and `SentinelServicePlugin.start()` probes `SnsClient`/`ApacheHttpClient` at boot so a broken classpath is one startup log line rather than a `NoClassDefFoundError` at first alert. The SDK version must stay pinned to the engine's; `minEngineVersion` is the compatibility contract.
 
@@ -372,7 +410,7 @@ fan out cleanly, with a verification pass (build + targeted manual checks) after
   `trigger_state` from `INSUFFICIENT_DATA` → `OK`.
 - Pause the channel's source or stop sending messages long enough to breach the threshold; confirm a
   `sentinel_alert_event` opens, an `sentinel_action_dispatch_log` row is written, and the configured
-  Email/Channel/SNS action actually delivers (verify the channel-delivery path lands a message in the
+  Email/Channel/SNS/Webhook action actually delivers (verify the channel-delivery path lands a message in the
   target channel; verify SES/SNS delivery via AWS console or a subscribed test endpoint).
 - Resume activity; confirm the alert auto-resolves and (if configured) a resolve notification fires.
 - Acknowledge a problem from the web UI; confirm the ack is visible in `/problems` and a curated

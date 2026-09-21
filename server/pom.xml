@@ -29,6 +29,55 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- Real-dialect persistence verification. Derby stays in ordinary
+             Surefire through the parent dependency; these four modules and
+             drivers back the opt-in db-matrix Failsafe profile below. All are
+             test-scoped, so none can enter the extension archive. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-mysql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-mssqlserver</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-oracle-free</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql-driver.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${mysql-driver.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.microsoft.sqlserver</groupId>
+            <artifactId>mssql-jdbc</artifactId>
+            <version>${mssql-driver.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc11</artifactId>
+            <version>${oracle-driver.version}</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- ==================== AWS SDK ====================
              The engine ships the ENTIRE AWS SDK 2.15.28 core on the server classpath at
              server-lib/aws/ (verified against the 4.6.0 GA distribution): annotations,
@@ -179,4 +228,39 @@
             </testResource>
         </testResources>
     </build>
+    <profiles>
+        <profile>
+            <id>db-matrix</id>
+            <dependencies>
+                <!-- Testcontainers shades Jackson databind 2.20 but deliberately
+                     uses the public annotations artifact. The engine-pinned
+                     2.14.3 annotation jar wins normal dependency mediation and
+                     lacks fields required by that shaded runtime, so override it
+                     only while this Docker-backed test profile is active. -->
+                <dependency>
+                    <groupId>com.fasterxml.jackson.core</groupId>
+                    <artifactId>jackson-annotations</artifactId>
+                    <version>${testcontainers-jackson.version}</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

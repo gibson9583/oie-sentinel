@@ -35,6 +35,8 @@ public class AlertEvent {
     private String ackComment;
     private String detailsJson;
     private boolean suppressed;
+    private boolean problemPending;
+    private boolean resolutionPending;
 
     public AlertEvent() {
     }
@@ -246,19 +248,51 @@ public class AlertEvent {
     }
 
     /**
-     * @return {@code true} if this event was suppressed by another monitor's
-     *         open state (via {@code sentinel_monitor.suppressed_by_monitor_id})
-     *         and should be hidden from default views/action dispatch
+     * @return the most recently persisted dispatch-time suppression state and
+     *         pending notify-on-entry latch. The dispatcher re-evaluates
+     *         current windows and monitor dependencies before every action
+     *         attempt and clears this bit only after durable fan-out accounting.
      */
     public boolean isSuppressed() {
         return suppressed;
     }
 
     /**
-     * @param suppressed whether this event was suppressed by another
-     *                   monitor's open state
+     * @param suppressed latest dispatch-time suppression/latch state
      */
     public void setSuppressed(boolean suppressed) {
         this.suppressed = suppressed;
+    }
+
+    /**
+     * @return whether the opened lifecycle edge still needs complete durable
+     *         per-action accounting
+     */
+    public boolean isProblemPending() {
+        return problemPending;
+    }
+
+    /**
+     * @param problemPending whether the opened edge remains in the durable
+     *                       dispatch outbox
+     */
+    public void setProblemPending(boolean problemPending) {
+        this.problemPending = problemPending;
+    }
+
+    /**
+     * @return whether the resolved lifecycle edge still needs a durable
+     *         notification-policy decision
+     */
+    public boolean isResolutionPending() {
+        return resolutionPending;
+    }
+
+    /**
+     * @param resolutionPending whether the resolved edge remains in the
+     *                          dispatch outbox
+     */
+    public void setResolutionPending(boolean resolutionPending) {
+        this.resolutionPending = resolutionPending;
     }
 }
