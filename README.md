@@ -251,7 +251,7 @@ All nodes must use the new schema and fencing protocol before monitoring resumes
    (or install from an OIE Community Store that lists this plugin).
 2. Install via the Web Administrator (Settings → Extensions) or drop the zip into the engine's
    extension install flow, then restart the server.
-3. On first start the migrator creates nine `sentinel_*` tables in the engine database (Derby,
+3. On first start the migrator creates eleven `sentinel_*` tables in the engine database (Derby,
    PostgreSQL, MySQL, Oracle, and SQL Server DDL included); schema upgrades run automatically on
    later versions.
 
@@ -267,12 +267,12 @@ Clean the archives up yourself when you are sure, for example:
 
 ```sql
 DROP TABLE sentinel_alert_event_uninstalled_20260806;
--- …and the other eight, child tables first
+-- …and the other ten, child tables first
 ```
 
 > **Derby exception:** on Derby the tables are left in place under their original names and nothing
-> is renamed. Derby refuses to rename any table referenced by a foreign key, and three of the nine
-> are; renaming only the six it permits would leave a half-schema that the migrator would correctly
+> is renamed. Derby refuses to rename any table referenced by a foreign key, and three of the eleven
+> are; renaming only the eight it permits would leave a half-schema that the migrator would correctly
 > refuse to start against. Reinstalling on Derby cleanly adopts the existing tables.
 
 Upgrading never triggers any of this — install the new version over the old one.
@@ -330,8 +330,10 @@ oie-sentinel/
 
 ## Releasing
 
+See the [1.1.1 release notes](docs/releases/1.1.1.md), including the cluster upgrade instructions.
+
 ```bash
-git tag v1.1.0 && git push origin v1.1.0
+git tag v1.1.1 && git push origin v1.1.1
 ```
 
 The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
