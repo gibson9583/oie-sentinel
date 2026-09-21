@@ -30,8 +30,6 @@ import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.ProblemDetail;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
-import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
-import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
 
 /**
  * Business rules for the Problems surface: filtered listing, single-problem
@@ -226,7 +224,9 @@ public final class ProblemService {
             throw new IllegalArgumentException("Problem " + id + " is already resolved");
         }
         applyAck(event, comment, userId);
-        AlertEventRepository.updateAlertEvent(event);
+        if (!AlertEventRepository.acknowledgeAlertEvent(event)) {
+            throw new IllegalArgumentException("Problem " + id + " was already acknowledged or resolved");
+        }
         SentinelAuditLog.problemAcknowledged(userId, event, comment);
         return event;
     }
@@ -238,12 +238,9 @@ public final class ProblemService {
      * the acknowledgment too — a manual resolve is the strongest possible
      * form of "a human has seen this".
      *
-     * <p>Note on the trigger reset: the update statement only writes
-     * {@code open_alert_event_id} when non-null, so the stored id cannot be
-     * NULLed here and goes stale instead. That is safe by design — every
-     * consumer of the id (evaluator resolve/repeat paths) first checks the
-     * referenced event's status and ignores anything not still PROBLEM, and
-     * the next genuine transition overwrites it.</p>
+     * <p>The reset is guarded by the alert id in the database so a newer
+     * incident cannot be overwritten. If it fails, the next breach repairs
+     * a PROBLEM state whose referenced alert is already resolved.</p>
      *
      * @param id      database id of the alert event
      * @param comment optional operator note
@@ -259,7 +256,9 @@ public final class ProblemService {
         if (event.getStatus() != AlertStatus.PROBLEM) {
             throw new IllegalArgumentException("Problem " + id + " is already resolved");
         }
-        applyResolve(event, comment, userId);
+        if (!applyResolve(event, comment, userId)) {
+            throw new IllegalArgumentException("Problem " + id + " was already resolved");
+        }
         SentinelAuditLog.problemResolved(userId, event, comment);
         return event;
     }
@@ -297,8 +296,9 @@ public final class ProblemService {
                     continue;
                 }
                 applyAck(event, comment, userId);
-                AlertEventRepository.updateAlertEvent(event);
-                acknowledged++;
+                if (AlertEventRepository.acknowledgeAlertEvent(event)) {
+                    acknowledged++;
+                }
             } catch (Exception e) {
                 // One bad row must not abort the batch; the count tells the
                 // client how many actually took.
@@ -358,8 +358,9 @@ public final class ProblemService {
                 if (event == null || event.getStatus() != AlertStatus.PROBLEM) {
                     continue;
                 }
-                applyResolve(event, comment, userId);
-                resolved++;
+                if (applyResolve(event, comment, userId)) {
+                    resolved++;
+                }
             } catch (Exception e) {
                 // One bad row must not abort the batch; the count tells the
                 // client how many actually took.
@@ -426,15 +427,25 @@ public final class ProblemService {
      * has seen this" — and the trigger reset is mandatory, not optional; see
      * the class Javadoc.</p>
      */
-    private static void applyResolve(AlertEvent event, String comment, int userId) {
+    private static boolean applyResolve(AlertEvent event, String comment, int userId) {
         Instant now = Instant.now();
         event.setStatus(AlertStatus.RESOLVED);
         event.setResolvedTime(now);
+        event.setResolutionPending(true);
+        // The database decides acknowledgement ownership at write time.
+        // Keep the response snapshot's original acknowledgement if present.
+        AlertEvent write = new AlertEvent();
+        write.setId(event.getId());
+        write.setResolvedTime(now);
+        applyAck(write, comment, userId);
+        if (!AlertEventRepository.resolveAlertEventManually(write)) {
+            return false;
+        }
         if (event.getAcknowledgedBy() == null) {
             applyAck(event, comment, userId);
         }
-        AlertEventRepository.updateAlertEvent(event);
         resetTriggerState(event, now);
+        return true;
     }
 
     /**
@@ -448,15 +459,7 @@ public final class ProblemService {
      */
     private static void resetTriggerState(AlertEvent event, Instant now) {
         try {
-            TriggerState state = TriggerStateRepository.getTriggerState(
-                    event.getMonitorId(), event.getChannelId(), event.getMetadataId());
-            if (state == null || !event.getId().equals(state.getOpenAlertEventId())) {
-                return;
-            }
-            state.setState(TriggerStatus.OK);
-            state.setConsecutiveBreachCount(0);
-            state.setLastChangeTime(now);
-            TriggerStateRepository.updateTriggerState(state);
+            TriggerStateRepository.resetTriggerStateForAlert(event.getId(), now);
         } catch (Exception e) {
             log.warn("Failed to reset trigger state after manual resolve of problem {} "
                     + "(monitor {}, channel {})", event.getId(), event.getMonitorId(),

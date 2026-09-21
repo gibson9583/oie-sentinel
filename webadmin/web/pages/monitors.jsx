@@ -1031,7 +1031,8 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                             </select>
                             <div className="hint">
                                 While the selected monitor has an open problem on the same channel,
-                                this monitor's new problems are suppressed.
+                                this monitor's notifications are suppressed. Its open problems are
+                                still tracked and become eligible when the dependency clears.
                             </div>
                         </div>
                         <div className="field">

@@ -59,6 +59,7 @@
          column named 'id'". Relying on keyProperty alone reads the generated key positionally
          and works across all supported databases (id is the first/only auto-generated column).
          Same reasoning applies to every other useGeneratedKeys insert below. -->
+    <!-- The engine defaults untyped nulls to VARCHAR; nullable numeric and timestamp binds need explicit JDBC types. -->
     <insert id="insertMonitor" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_monitor
             (name, description, monitor_type, scope_type, scope_id, enabled, severity,
@@ -66,8 +67,8 @@
              created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{monitor_type}, #{scope_type}, #{scope_id}, #{enabled}, #{severity},
-             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id}, #{runbook_url},
-             #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+             #{config_json}, #{min_consecutive_breaches}, #{suppressed_by_monitor_id,jdbcType=INTEGER}, #{runbook_url},
+             #{created_by,jdbcType=INTEGER}, #{created_time}, #{updated_by,jdbcType=INTEGER}, #{updated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateMonitor" parameterType="map">
@@ -81,12 +82,12 @@
             severity = #{severity},
             config_json = #{config_json},
             min_consecutive_breaches = #{min_consecutive_breaches},
-            suppressed_by_monitor_id = #{suppressed_by_monitor_id},
+            suppressed_by_monitor_id = #{suppressed_by_monitor_id,jdbcType=INTEGER},
             runbook_url = #{runbook_url},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time},
-            updated_by = #{updated_by},
-            updated_time = #{updated_time}
+            updated_by = #{updated_by,jdbcType=INTEGER},
+            updated_time = #{updated_time,jdbcType=TIMESTAMP}
         WHERE id = #{id}
     </update>
 
@@ -103,35 +104,77 @@
     <insert id="insertAlertEvent" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_alert_event
             (monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
-             resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed)
+             resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id}, #{severity}, #{status}, #{message}, #{opened_time},
-             #{resolved_time}, #{acknowledged_by}, #{acknowledged_time}, #{ack_comment}, #{details_json}, #{suppressed})
+            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
+             #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed}, #{problem_pending}, #{resolution_pending})
     </insert>
 
-    <update id="updateAlertEvent" parameterType="map">
+    <update id="acknowledgeAlertEvent" parameterType="map">
         UPDATE sentinel_alert_event
-        <set>
-            status = #{status},
-            <if test="resolved_time != null">resolved_time = #{resolved_time},</if>
-            <if test="acknowledged_by != null">acknowledged_by = #{acknowledged_by},</if>
-            <if test="acknowledged_time != null">acknowledged_time = #{acknowledged_time},</if>
-            <if test="ack_comment != null">ack_comment = #{ack_comment},</if>
-            <if test="details_json != null">details_json = #{details_json},</if>
-        </set>
-        WHERE id = #{id}
+        SET acknowledged_by = #{acknowledged_by,jdbcType=INTEGER},
+            acknowledged_time = #{acknowledged_time,jdbcType=TIMESTAMP},
+            ack_comment = #{ack_comment,jdbcType=VARCHAR}
+        WHERE id = #{id} AND status = 'PROBLEM' AND acknowledged_by IS NULL
     </update>
+
+    <update id="resolveAlertEvent" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP},
+            resolution_pending = #{resolution_pending}
+        WHERE id = #{id} AND status = 'PROBLEM'
+    </update>
+
+    <update id="resolveAlertEventManually" parameterType="map">
+        UPDATE sentinel_alert_event
+        SET status = 'RESOLVED', resolved_time = #{resolved_time,jdbcType=TIMESTAMP},
+            resolution_pending = #{resolution_pending},
+            ack_comment = CASE WHEN acknowledged_by IS NULL THEN #{ack_comment,jdbcType=VARCHAR} ELSE ack_comment END,
+            acknowledged_time = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_time,jdbcType=TIMESTAMP} ELSE acknowledged_time END,
+            acknowledged_by = CASE WHEN acknowledged_by IS NULL THEN #{acknowledged_by,jdbcType=INTEGER} ELSE acknowledged_by END
+        WHERE id = #{id} AND status = 'PROBLEM'
+    </update>
+
+    <update id="setAlertEventSuppressed" parameterType="map">
+        UPDATE sentinel_alert_event SET suppressed = #{suppressed} WHERE id = #{id}
+    </update>
+
+    <update id="setProblemPending" parameterType="map">
+        UPDATE sentinel_alert_event SET problem_pending = #{problemPending} WHERE id = #{id}
+    </update>
+
+    <update id="setResolutionPending" parameterType="map">
+        UPDATE sentinel_alert_event SET resolution_pending = #{resolutionPending} WHERE id = #{id}
+    </update>
+
+    <select id="listPendingProblemAlertEvents" resultType="map">
+        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
+               problem_pending, resolution_pending
+        FROM sentinel_alert_event
+        WHERE problem_pending = 1
+        ORDER BY opened_time ASC, id ASC
+    </select>
+
+    <select id="listPendingResolvedAlertEvents" resultType="map">
+        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
+               problem_pending, resolution_pending
+        FROM sentinel_alert_event
+        WHERE status = 'RESOLVED' AND resolution_pending = 1
+        ORDER BY resolved_time ASC, id ASC
+    </select>
 
     <select id="getAlertEvent" parameterType="map" resultType="map">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
-               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         WHERE id = #{id}
     </select>
 
     <select id="listAlertEvents" parameterType="map" resultType="map">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
-               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         <where>
             <if test="status != null">AND status = #{status}</if>
@@ -223,7 +266,7 @@
 
     <select id="listRecentAlertEvents" parameterType="map" resultType="map">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
-               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed
+               resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         ORDER BY opened_time DESC
         OFFSET 0 ROWS FETCH NEXT #{limit} ROWS ONLY
@@ -282,8 +325,8 @@
             (monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
              last_value_json, open_alert_event_id, last_change_time, last_evaluated_time)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id}, #{state}, #{consecutive_breach_count},
-             #{last_value_json}, #{open_alert_event_id}, #{last_change_time}, #{last_evaluated_time})
+            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{state}, #{consecutive_breach_count},
+             #{last_value_json}, #{open_alert_event_id,jdbcType=BIGINT}, #{last_change_time,jdbcType=TIMESTAMP}, #{last_evaluated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateTriggerState" parameterType="map">
@@ -292,11 +335,18 @@
             state = #{state},
             consecutive_breach_count = #{consecutive_breach_count},
             <if test="last_value_json != null">last_value_json = #{last_value_json},</if>
-            <if test="open_alert_event_id != null">open_alert_event_id = #{open_alert_event_id},</if>
-            <if test="last_change_time != null">last_change_time = #{last_change_time},</if>
-            <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time},</if>
+            open_alert_event_id = #{open_alert_event_id,jdbcType=BIGINT},
+            <if test="last_change_time != null">last_change_time = #{last_change_time,jdbcType=TIMESTAMP},</if>
+            <if test="last_evaluated_time != null">last_evaluated_time = #{last_evaluated_time,jdbcType=TIMESTAMP},</if>
         </set>
         WHERE id = #{id}
+    </update>
+
+    <update id="resetTriggerStateForAlert" parameterType="map">
+        UPDATE sentinel_trigger_state
+        SET state = 'OK', consecutive_breach_count = 0, open_alert_event_id = NULL,
+            last_change_time = #{now,jdbcType=TIMESTAMP}
+        WHERE open_alert_event_id = #{alertId,jdbcType=BIGINT}
     </update>
 
     <select id="listTriggerStatesByMonitor" parameterType="map" resultType="map">
@@ -400,29 +450,50 @@
 
     <insert id="insertConnectorStatusEvent" parameterType="map">
         INSERT INTO sentinel_connector_status_event
-            (channel_id, metadata_id, previous_state, new_state, changed_time)
+            (channel_id, metadata_id, node_id, previous_state, new_state, changed_time, deployment_time)
         VALUES
-            (#{channel_id}, #{metadata_id}, #{previous_state}, #{new_state}, #{changed_time})
+            (#{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{node_id}, #{previous_state}, #{new_state}, #{changed_time}, #{deployment_time,jdbcType=TIMESTAMP})
     </insert>
 
+    <select id="listLatestConnectorStatusEvents" parameterType="map" resultType="map">
+        SELECT e.id, e.channel_id, e.metadata_id, e.node_id, e.previous_state, e.new_state, e.changed_time, e.deployment_time
+        FROM sentinel_connector_status_event e
+        WHERE e.channel_id = #{channelId}
+          AND NOT EXISTS (
+              SELECT 1 FROM sentinel_connector_status_event newer
+              WHERE newer.channel_id = e.channel_id
+                AND newer.metadata_id = e.metadata_id
+                AND newer.node_id = e.node_id
+                AND newer.id &gt; e.id
+          )
+        ORDER BY e.metadata_id, e.node_id
+    </select>
+
     <select id="getLatestConnectorStatusEvent" parameterType="map" resultType="map">
-        SELECT id, channel_id, metadata_id, previous_state, new_state, changed_time
+        SELECT id, channel_id, metadata_id, node_id, previous_state, new_state, changed_time, deployment_time
         FROM sentinel_connector_status_event
         WHERE channel_id = #{channelId} AND metadata_id = #{metadataId}
-        ORDER BY changed_time DESC
+        ORDER BY id DESC
         OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
     </select>
 
     <select id="listConnectorStatusEvents" parameterType="map" resultType="map">
-        SELECT id, channel_id, metadata_id, previous_state, new_state, changed_time
+        SELECT id, channel_id, metadata_id, node_id, previous_state, new_state, changed_time, deployment_time
         FROM sentinel_connector_status_event
         WHERE channel_id = #{channelId} AND changed_time &gt;= #{from} AND changed_time &lt;= #{to}
-        ORDER BY changed_time
+        ORDER BY changed_time, id
     </select>
 
     <delete id="deleteConnectorStatusEventsOlderThan" parameterType="map">
-        DELETE TOP (${chunkSize}) FROM sentinel_connector_status_event
-        WHERE changed_time &lt; #{cutoff}
+        DELETE TOP (${chunkSize}) old FROM sentinel_connector_status_event old
+        WHERE old.changed_time &lt; #{cutoff}
+          AND EXISTS (
+              SELECT 1 FROM sentinel_connector_status_event newer
+              WHERE newer.channel_id = old.channel_id
+                AND newer.metadata_id = old.metadata_id
+                AND newer.node_id = old.node_id
+                AND newer.id &gt; old.id
+          )
     </delete>
 
     <!-- ========== ACTION (table sentinel_action) ========== -->
@@ -456,9 +527,9 @@
              config_json, created_by, created_time, updated_by, updated_time)
         VALUES
             (#{name}, #{description}, #{enabled}, #{action_type}, #{condition_json}, #{operation_mode},
-             #{repeat_interval_seconds}, #{max_repeats}, #{max_notifications_per_window}, #{rollup_window_seconds},
-             #{escalate_after_seconds}, #{escalate_to_action_id},
-             #{config_json}, #{created_by}, #{created_time}, #{updated_by}, #{updated_time})
+             #{repeat_interval_seconds,jdbcType=INTEGER}, #{max_repeats,jdbcType=INTEGER}, #{max_notifications_per_window,jdbcType=INTEGER}, #{rollup_window_seconds,jdbcType=INTEGER},
+             #{escalate_after_seconds,jdbcType=INTEGER}, #{escalate_to_action_id,jdbcType=INTEGER},
+             #{config_json}, #{created_by,jdbcType=INTEGER}, #{created_time}, #{updated_by,jdbcType=INTEGER}, #{updated_time,jdbcType=TIMESTAMP})
     </insert>
 
     <update id="updateAction" parameterType="map">
@@ -469,17 +540,17 @@
             action_type = #{action_type},
             condition_json = #{condition_json},
             operation_mode = #{operation_mode},
-            repeat_interval_seconds = #{repeat_interval_seconds},
-            max_repeats = #{max_repeats},
-            max_notifications_per_window = #{max_notifications_per_window},
-            rollup_window_seconds = #{rollup_window_seconds},
-            escalate_after_seconds = #{escalate_after_seconds},
-            escalate_to_action_id = #{escalate_to_action_id},
+            repeat_interval_seconds = #{repeat_interval_seconds,jdbcType=INTEGER},
+            max_repeats = #{max_repeats,jdbcType=INTEGER},
+            max_notifications_per_window = #{max_notifications_per_window,jdbcType=INTEGER},
+            rollup_window_seconds = #{rollup_window_seconds,jdbcType=INTEGER},
+            escalate_after_seconds = #{escalate_after_seconds,jdbcType=INTEGER},
+            escalate_to_action_id = #{escalate_to_action_id,jdbcType=INTEGER},
             config_json = #{config_json},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time},
-            updated_by = #{updated_by},
-            updated_time = #{updated_time}
+            updated_by = #{updated_by,jdbcType=INTEGER},
+            updated_time = #{updated_time,jdbcType=TIMESTAMP}
         WHERE id = #{id}
     </update>
 
@@ -493,7 +564,7 @@
         INSERT INTO sentinel_action_dispatch_log
             (alert_event_id, action_id, dispatch_time, success, error_message)
         VALUES
-            (#{alert_event_id}, #{action_id}, #{dispatch_time}, #{success}, #{error_message})
+            (#{alert_event_id}, #{action_id,jdbcType=INTEGER}, #{dispatch_time}, #{success}, #{error_message})
     </insert>
 
     <select id="listActionDispatchLogsForEvent" parameterType="map" resultType="map">
@@ -535,8 +606,8 @@
             enabled, created_by, created_time)
         VALUES
             (#{name}, #{scope_type}, #{scope_id}, #{window_mode}, #{repeat_type}, #{days_of_week},
-            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from}, #{active_until},
-            #{enabled}, #{created_by}, #{created_time})
+            #{days_of_month}, #{start_time}, #{end_time}, #{timezone}, #{active_from,jdbcType=TIMESTAMP}, #{active_until,jdbcType=TIMESTAMP},
+            #{enabled}, #{created_by,jdbcType=INTEGER}, #{created_time})
     </insert>
 
     <update id="updateMaintenanceWindow" parameterType="map">
@@ -551,10 +622,10 @@
             start_time = #{start_time},
             end_time = #{end_time},
             timezone = #{timezone},
-            active_from = #{active_from},
-            active_until = #{active_until},
+            active_from = #{active_from,jdbcType=TIMESTAMP},
+            active_until = #{active_until,jdbcType=TIMESTAMP},
             enabled = #{enabled},
-            created_by = #{created_by},
+            created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time}
         WHERE id = #{id}
     </update>
@@ -575,16 +646,17 @@
     -->
 
     <select id="getNodeLease" parameterType="map" resultType="map">
-        SELECT lease_name, node_id, acquired_time, expires_time
+        SELECT lease_name, node_id, acquired_time, expires_time, lease_epoch
         FROM sentinel_node_lease
         WHERE lease_name = #{leaseName}
     </select>
 
     <insert id="insertNodeLease" parameterType="map">
         INSERT INTO sentinel_node_lease
-            (lease_name, node_id, acquired_time, expires_time)
+            (lease_name, node_id, acquired_time, expires_time, lease_epoch)
         VALUES
-            (#{lease_name}, #{node_id}, #{acquired_time}, #{expires_time})
+            (#{lease_name}, #{node_id}, GETUTCDATE(),
+             DATEADD(SECOND, #{leaseSeconds}, GETUTCDATE()), #{lease_epoch})
     </insert>
 
     <!-- Heartbeat. Conditional on node_id so a node that lost the lease while stalled
@@ -592,8 +664,9 @@
          alone: it still records when this node's leadership began. -->
     <update id="renewNodeLease" parameterType="map">
         UPDATE sentinel_node_lease
-        SET expires_time = #{expiresTime}
+        SET expires_time = DATEADD(SECOND, #{leaseSeconds}, GETUTCDATE())
         WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
+          AND lease_epoch = #{leaseEpoch} AND expires_time &gt; GETUTCDATE()
     </update>
 
     <!-- Failover. Safe to run on every node on every tick: only one update can find the
@@ -602,14 +675,72 @@
     <update id="stealExpiredNodeLease" parameterType="map">
         UPDATE sentinel_node_lease
         SET node_id = #{nodeId},
-            acquired_time = #{acquiredTime},
-            expires_time = #{expiresTime}
-        WHERE lease_name = #{leaseName} AND expires_time &lt; #{now}
+            acquired_time = GETUTCDATE(),
+            expires_time = DATEADD(SECOND, #{leaseSeconds}, GETUTCDATE()),
+            lease_epoch = lease_epoch + 1
+        WHERE lease_name = #{leaseName} AND lease_epoch = #{expectedLeaseEpoch}
+          AND expires_time &lt;= GETUTCDATE()
     </update>
 
-    <delete id="deleteNodeLease" parameterType="map">
-        DELETE FROM sentinel_node_lease
+    <update id="releaseNodeLease" parameterType="map">
+        UPDATE sentinel_node_lease
+        SET expires_time = GETUTCDATE(), lease_epoch = lease_epoch + 1
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId} AND lease_epoch = #{leaseEpoch}
+    </update>
+
+    <select id="getDatabaseTime" resultType="java.sql.Timestamp">SELECT GETUTCDATE()</select>
+
+    <select id="listActiveSentinelNodeIds" resultType="string">
+        SELECT node_id FROM sentinel_node_lease
+        WHERE lease_name LIKE 'sentinel-presence-%' AND expires_time &gt; GETUTCDATE()
+    </select>
+
+    <select id="lockNodeLeaseFence" parameterType="map" resultType="long" useCache="false" flushCache="true">
+        SELECT lease_epoch FROM sentinel_node_lease WITH (UPDLOCK, HOLDLOCK)
         WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
+          AND lease_epoch = #{leaseEpoch}
+    </select>
+
+    <select id="checkNodeLeaseFence" parameterType="map" resultType="long" useCache="false" flushCache="true">
+        SELECT lease_epoch FROM sentinel_node_lease
+        WHERE lease_name = #{leaseName} AND node_id = #{nodeId}
+          AND lease_epoch = #{leaseEpoch} AND expires_time &gt; GETUTCDATE()
+    </select>
+
+    <!-- Complete per-node deployment snapshots share the node-presence lease transaction. -->
+    <delete id="deleteChannelPresenceByNode" parameterType="map">
+        DELETE FROM sentinel_channel_presence WHERE node_id = #{nodeId}
     </delete>
+
+    <insert id="insertChannelPresence" parameterType="map">
+        INSERT INTO sentinel_channel_presence (channel_id, node_id, metadata_id, deployed_time)
+        VALUES (#{channelId}, #{nodeId}, #{metadataId,jdbcType=INTEGER}, #{deployedTime,jdbcType=TIMESTAMP})
+    </insert>
+
+    <select id="listActiveDeployedChannelIds" resultType="string">
+        SELECT DISTINCT presence.channel_id FROM sentinel_channel_presence presence
+        INNER JOIN sentinel_node_lease lease ON lease.node_id = presence.node_id
+        WHERE lease.lease_name LIKE 'sentinel-presence-%' AND lease.expires_time &gt; GETUTCDATE()
+    </select>
+
+    <select id="listActiveDeployedNodeIds" parameterType="map" resultType="string">
+        SELECT DISTINCT presence.node_id FROM sentinel_channel_presence presence
+        INNER JOIN sentinel_node_lease lease ON lease.node_id = presence.node_id
+        WHERE presence.channel_id = #{channelId}
+          AND lease.lease_name LIKE 'sentinel-presence-%' AND lease.expires_time &gt; GETUTCDATE()
+    </select>
+
+    <resultMap id="connectorPresenceResult" type="map">
+        <result property="metadata_id" column="metadata_id" />
+        <result property="node_id" column="node_id" />
+        <result property="deployed_time" column="deployed_time" javaType="java.sql.Timestamp" />
+    </resultMap>
+
+    <select id="listActiveConnectorNodes" parameterType="map" resultMap="connectorPresenceResult">
+        SELECT presence.metadata_id, presence.node_id, presence.deployed_time FROM sentinel_channel_presence presence
+        INNER JOIN sentinel_node_lease lease ON lease.node_id = presence.node_id
+        WHERE presence.channel_id = #{channelId}
+          AND lease.lease_name LIKE 'sentinel-presence-%' AND lease.expires_time &gt; GETUTCDATE()
+    </select>
 
 </mapper>

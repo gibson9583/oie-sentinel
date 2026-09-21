@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -35,6 +36,7 @@ import com.mirth.connect.server.controllers.ControllerFactory;
 import com.mirth.connect.server.controllers.EngineController;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivitySample;
 
 /**
@@ -159,7 +161,8 @@ class ActivityCollectorJobTest {
         scopeResolver = mockStatic(ScopeResolver.class);
 
         activityRepository = mockStatic(ActivityRepository.class);
-        activityRepository.when(() -> ActivityRepository.insertActivitySamples(anyList()))
+        activityRepository.when(() -> ActivityRepository.insertActivitySamples(
+                anyList(), any(LeaseFence.class)))
                 .thenAnswer(invocation -> {
                     if (nextFlushFailure != null) {
                         RuntimeException failure = nextFlushFailure;
@@ -182,6 +185,7 @@ class ActivityCollectorJobTest {
         // class, so a case that left its channels behind would change what the
         // next one sees as a "first observation".
         forgetTestChannels();
+        CollectorState.getInstance().prepareCounterEpoch(LeaseFence.unmanaged());
         // Null-safe because @AfterEach still runs when setUp aborted on the
         // classpath assumption above, before any of these were created.
         closeQuietly(activityRepository);
@@ -252,6 +256,42 @@ class ActivityCollectorJobTest {
         assertEquals(sent, sample.getSentDelta(), "sentDelta");
         assertEquals(error, sample.getErrorDelta(), "errorDelta");
         assertEquals(filtered, sample.getFilteredDelta(), "filteredDelta");
+    }
+
+    @Test
+    void failbackStartsFreshBaselineInsteadOfCountingTheOtherLeadersTrafficAgain() {
+        try (MockedStatic<SentinelLeadership> leadership = mockStatic(SentinelLeadership.class)) {
+            LeaseFence first = new LeaseFence("sentinel-engine", "node-a", 1L);
+            LeaseFence reacquired = new LeaseFence("sentinel-engine", "node-a", 3L);
+            leadership.when(SentinelLeadership::captureFence).thenReturn(first, null, reacquired, reacquired);
+            tick(stats(CHANNEL_A, 100, 0, 0, 0, 0));
+            assertEquals(0, sampleFor(CHANNEL_A).getReceivedDelta());
+            tick(stats(CHANNEL_A, 200, 0, 0, 0, 0)); // follower interval, sampled by node-b
+            assertEquals(1, flushes.size());
+            tick(stats(CHANNEL_A, 400, 0, 0, 0, 0)); // node-a wins a new epoch
+            assertEquals(0, sampleFor(CHANNEL_A).getReceivedDelta());
+            tick(stats(CHANNEL_A, 420, 0, 0, 0, 0));
+            assertEquals(20, sampleFor(CHANNEL_A).getReceivedDelta());
+        }
+    }
+
+    @Test
+    void failedFirstBatchAfterFailbackCannotRestoreTheOldEpochsCounterBaseline() {
+        try (MockedStatic<SentinelLeadership> leadership = mockStatic(SentinelLeadership.class)) {
+            LeaseFence first = new LeaseFence("sentinel-engine", "node-a", 1L);
+            LeaseFence reacquired = new LeaseFence("sentinel-engine", "node-a", 3L);
+            leadership.when(SentinelLeadership::captureFence).thenReturn(first, reacquired, reacquired, reacquired);
+            tick(stats(CHANNEL_A, 100, 0, 0, 0, 0));
+            nextFlushFailure = new IllegalStateException("database unavailable");
+            tick(stats(CHANNEL_A, 400, 0, 0, 0, 0));
+            assertNull(CollectorState.getInstance().getPreviousCounters(CHANNEL_A));
+            assertEquals(1, flushes.size());
+            tick(stats(CHANNEL_A, 420, 0, 0, 0, 0));
+            assertEquals(0, sampleFor(CHANNEL_A).getReceivedDelta());
+            nextFlushFailure = new IllegalStateException("database unavailable during same epoch");
+            tick(stats(CHANNEL_A, 440, 0, 0, 0, 0));
+            assertEquals(420, CollectorState.getInstance().getPreviousCounters(CHANNEL_A).received);
+        }
     }
 
     @Nested

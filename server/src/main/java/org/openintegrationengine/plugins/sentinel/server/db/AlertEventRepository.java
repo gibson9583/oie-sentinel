@@ -34,8 +34,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * sufficient. Every statement here is a single MyBatis call (the paginated
  * {@link #listAlertEvents(AlertEventFilter)} runs two independent read-only
  * selects, not a write sequence that needs a shared transaction), so
- * auto-commit is fine throughout; no method opens a manual-commit {@code
- * openSession(false)} session.</p>
+ * standalone calls use auto-commit. Evaluator calls instead participate in
+ * the thread's managed {@link AlertLifecycleTransaction}.</p>
  */
 public final class AlertEventRepository {
 
@@ -90,26 +90,77 @@ public final class AlertEventRepository {
         }
     }
 
-    /**
-     * Updates an existing alert event's mutable lifecycle fields by id:
-     * {@code status}, {@code resolvedTime}, {@code acknowledgedBy}, {@code
-     * acknowledgedTime}, {@code ackComment}, and {@code detailsJson}.
-     * {@code status} is always applied; the rest are pass-through — the
-     * mapped statement's {@code <if>} blocks leave a column untouched when
-     * the corresponding field on {@code event} is {@code null}, so this
-     * method never needs to know which fields the caller actually intends to
-     * change.
-     *
-     * @param event the new state for the event; {@code id} identifies the
-     *              row to update
-     * @throws RepositoryException on persistence failure
-     */
-    public static void updateAlertEvent(AlertEvent event) {
+    /** Acknowledge only a still-open, unacknowledged row; never rewrite status. */
+    public static boolean acknowledgeAlertEvent(AlertEvent event) {
+        return conditionalUpdate("acknowledgeAlertEvent", event);
+    }
+
+    /** Resolve only a still-open row, leaving acknowledgement ownership intact. */
+    public static boolean resolveAlertEvent(AlertEvent event) {
+        event.setResolutionPending(true);
+        return conditionalUpdate("resolveAlertEvent", event);
+    }
+
+    /** Manual resolution stamps acknowledgement only if nobody has already claimed it. */
+    public static boolean resolveAlertEventManually(AlertEvent event) {
+        event.setResolutionPending(true);
+        return conditionalUpdate("resolveAlertEventManually", event);
+    }
+
+    /** Updates the latest dispatch-time policy snapshot. */
+    public static void setAlertEventSuppressed(long id, boolean suppressed) {
+        setDispatchFlag("setAlertEventSuppressed", id, "suppressed", suppressed);
+    }
+
+    /** Completes or retries the durable problem edge. */
+    public static void setProblemPending(long id, boolean pending) {
+        setDispatchFlag("setProblemPending", id, "problemPending", pending);
+    }
+
+    /** Completes or retries the durable resolution edge. */
+    public static void setResolutionPending(long id, boolean pending) {
+        setDispatchFlag("setResolutionPending", id, "resolutionPending", pending);
+    }
+
+    private static void setDispatchFlag(String statement, long id, String flag, boolean value) {
         try {
-            Map<String, Object> params = toUpdateParams(event);
-            SqlConfig.getInstance().getSqlSessionManager().update(stmt("updateAlertEvent"), params);
+            SqlConfig.getInstance().getSqlSessionManager().update(
+                    stmt(statement), Map.of("id", id, flag, value));
         } catch (Exception e) {
-            log.error("Failed to update alert event {}", event.getId(), e);
+            log.error("Failed {} for alert event {}", statement, id, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    public static List<AlertEvent> listPendingProblemAlertEvents() {
+        return listPending("listPendingProblemAlertEvents");
+    }
+
+    public static List<AlertEvent> listPendingResolvedAlertEvents() {
+        return listPending("listPendingResolvedAlertEvents");
+    }
+
+    private static List<AlertEvent> listPending(String statement) {
+        try {
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt(statement));
+            List<AlertEvent> events = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                events.add(buildAlertEvent(row));
+            }
+            return events;
+        } catch (Exception e) {
+            log.error("Failed {}", statement, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    private static boolean conditionalUpdate(String statement, AlertEvent event) {
+        try {
+            return SqlConfig.getInstance().getSqlSessionManager()
+                    .update(stmt(statement), toUpdateParams(event)) == 1;
+        } catch (Exception e) {
+            log.error("Failed {} for alert event {}", statement, event.getId(), e);
             throw new RepositoryException(e);
         }
     }
@@ -285,6 +336,11 @@ public final class AlertEventRepository {
         return ChunkedDelete.run(stmt("deleteResolvedAlertEventsOlderThan"), cutoff, "resolved alert events");
     }
 
+    public static int deleteResolvedAlertEventsOlderThan(Instant cutoff, LeaseFence fence) {
+        return ChunkedDelete.run(
+                stmt("deleteResolvedAlertEventsOlderThan"), cutoff, "resolved alert events", fence);
+    }
+
     // ========== Map <-> DTO Conversion ==========
 
     /**
@@ -307,11 +363,13 @@ public final class AlertEventRepository {
         params.put("ack_comment", event.getAckComment());
         params.put("details_json", event.getDetailsJson());
         params.put("suppressed", event.isSuppressed());
+        params.put("problem_pending", event.isProblemPending());
+        params.put("resolution_pending", event.isResolutionPending());
         return params;
     }
 
     /**
-     * Builds the parameter map for {@code updateAlertEvent}: {@code id} plus
+     * Builds the parameter map for conditional lifecycle updates: {@code id} plus
      * the handful of columns that statement is allowed to touch. Fields left
      * {@code null} on {@code event} still enter the map (with a null value)
      * so the mapped statement's {@code <if test="... != null">} guards can
@@ -320,6 +378,7 @@ public final class AlertEventRepository {
     private static Map<String, Object> toUpdateParams(AlertEvent event) {
         Map<String, Object> params = new HashMap<>();
         params.put("id", event.getId());
+        params.put("resolution_pending", event.isResolutionPending());
         params.put("status", event.getStatus() != null ? event.getStatus().name() : null);
         params.put("resolved_time", toTimestamp(event.getResolvedTime()));
         params.put("acknowledged_by", event.getAcknowledgedBy());
@@ -433,6 +492,8 @@ public final class AlertEventRepository {
         event.setAckComment((String) row.get("ack_comment"));
         event.setDetailsJson((String) row.get("details_json"));
         event.setSuppressed(toBoolean(row.get("suppressed")));
+        event.setProblemPending(toBoolean(row.get("problem_pending")));
+        event.setResolutionPending(toBoolean(row.get("resolution_pending")));
 
         return event;
     }

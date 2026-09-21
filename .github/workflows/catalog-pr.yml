@@ -66,6 +66,7 @@ jobs:
         run: |
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$TAG/oie.json" -o oie.json
           echo "MIN_ENGINE=$(node -p "JSON.parse(require('fs').readFileSync('oie.json','utf8')).minEngineVersion")" >> "$GITHUB_ENV"
+          echo "MAX_ENGINE_JSON=$(node -p "JSON.stringify(JSON.parse(require('fs').readFileSync('oie.json','utf8')).maxEngineVersion ?? null)")" >> "$GITHUB_ENV"
           echo "STORE_DOCS=$(node -p "JSON.parse(require('fs').readFileSync('oie.json','utf8')).storeDocs || 'README.md'")" >> "$GITHUB_ENV"
           echo "UI_JSON=$(node -p "JSON.stringify(JSON.parse(require('fs').readFileSync('oie.json','utf8')).ui || ['web'])")" >> "$GITHUB_ENV"
 
@@ -107,7 +108,7 @@ jobs:
               "version": "${VERSION}",
               "ui": ${UI_JSON},
               "minEngineVersion": "${MIN_ENGINE}",
-              "maxEngineVersion": null,
+              "maxEngineVersion": ${MAX_ENGINE_JSON},
               "installerUrl": "https://github.com/${{ github.repository }}/releases/download/${TAG}/${PLUGIN_ID}-${VERSION}.zip",
               "sha256": "${SHA256}",
               "restartRequired": true,

@@ -14,7 +14,7 @@
     <packaging>pom</packaging>
 
     <properties>
-        <revision>1.1.0</revision>
+        <revision>1.1.1</revision>
 
         <!-- The engine's compatibility check (ExtensionLoader.isExtensionCompatible)
              splits plugin.xml's <mirthVersion> on commas and compares each entry to
@@ -54,6 +54,12 @@
 
         <!-- Signing disabled by default. Use -Psigning to enable. -->
         <signing.skip>true</signing.skip>
+        <testcontainers.version>2.0.5</testcontainers.version>
+        <testcontainers-jackson.version>2.20</testcontainers-jackson.version>
+        <postgresql-driver.version>42.7.13</postgresql-driver.version>
+        <mysql-driver.version>9.6.0</mysql-driver.version>
+        <mssql-driver.version>13.4.0.jre11</mssql-driver.version>
+        <oracle-driver.version>23.26.3.0.0</oracle-driver.version>
     </properties>
 
     <profiles>
@@ -75,6 +81,13 @@
 
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>software.amazon.awssdk</groupId>
                 <artifactId>bom</artifactId>
@@ -206,6 +219,32 @@
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
             <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- ConfigurationController's public method signatures reference
+             PropertiesConfiguration. The engine bundles this at runtime, but
+             its locally installed Maven artifacts have no transitive metadata,
+             so Mockito needs the type supplied explicitly while loading the
+             controller for migration tests. -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-configuration2</artifactId>
+            <version>2.13.0</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Migrator.executeScript delegates JDBC cleanup to this engine-bundled
+             library. Supply the same version in tests so migration scripts run
+             through the real engine implementation. -->
+        <dependency>
+            <groupId>commons-dbutils</groupId>
+            <artifactId>commons-dbutils</artifactId>
+            <version>1.7</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.21.0</version>
             <scope>test</scope>
         </dependency>
         <!-- Test-only, and only to make the engine's own classes linkable. Maven omits

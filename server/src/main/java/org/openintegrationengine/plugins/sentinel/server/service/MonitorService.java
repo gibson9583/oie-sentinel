@@ -228,7 +228,8 @@ public final class MonitorService {
         // dry run filtered to started channels would report "no channels in
         // scope" for the stopped channel the operator is writing the monitor
         // to catch, which is the most misleading answer a test could give.
-        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE;
+        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE
+                || monitor.getMonitorType() == MonitorType.CONNECTION_STATUS;
         List<ScopeResolver.ChannelTarget> targets = watchesState
                 ? ScopeResolver.resolveScopedChannels(monitor)
                 : ScopeResolver.resolveStartedChannels(monitor);
@@ -239,6 +240,8 @@ public final class MonitorService {
             try {
                 switch (monitor.getMonitorType()) {
                     case CONNECTION_STATUS:
+                        if (!org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository
+                                .listActiveDeployedChannelIds().contains(target.channelId)) break;
                         for (ConnectionStatusEvaluator.ConnectorEvaluation evaluation
                                 : ConnectionStatusEvaluator.evaluate(monitor, target.channelId, now)) {
                             // A null metadata id is the channel-level rollup

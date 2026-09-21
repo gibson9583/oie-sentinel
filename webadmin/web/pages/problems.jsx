@@ -696,9 +696,9 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
                         <div className="panel mb-3"><div className="panel-body">
                             <span className="tag amber">Suppressed</span>{' '}
                             <span className="text-text-dim">
-                                Opened during a maintenance window, outside its alerting schedule,
-                                or while its dependency monitor was alerting — no actions were
-                                dispatched.
+                                A maintenance, alerting-schedule, or dependency decision was recorded;
+                                Sentinel rechecks current policy before every later delivery attempt.
+                                Earlier attempts, if any, remain in Dispatch History.
                             </span>
                         </div></div>
                     ) : null}

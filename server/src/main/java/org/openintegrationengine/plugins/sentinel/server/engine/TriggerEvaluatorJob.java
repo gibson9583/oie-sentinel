@@ -20,14 +20,14 @@ import org.quartz.JobExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.mirth.connect.server.controllers.ControllerFactory;
-import com.mirth.connect.server.controllers.EngineController;
 
 import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
 import org.openintegrationengine.plugins.sentinel.server.alert.AlertPayload;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.MaintenanceWindowRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.AnomalyEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.ChannelStateEvaluator;
@@ -39,13 +39,10 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvalu
 import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
-import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
-import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
-import org.openintegrationengine.plugins.sentinel.shared.model.WindowMode;
 
 /**
  * The evaluation tick: runs every enabled monitor against its resolved
@@ -146,11 +143,12 @@ public class TriggerEvaluatorJob implements Job {
         // See SentinelLeadership — a JVM whose heartbeat has never started
         // (single node, tests) reports true, so this is inert unless a lease
         // is actually in play.
-        if (!SentinelLeadership.isLeader()) {
+        LeaseFence fence = SentinelLeadership.captureFence();
+        if (fence == null) {
             return;
         }
         try {
-            runTick(Instant.now());
+            runTick(Instant.now(), fence);
         } catch (Throwable t) {
             log.error("Sentinel trigger evaluator tick failed", t);
         }
@@ -161,18 +159,69 @@ public class TriggerEvaluatorJob implements Job {
      * once so every trigger in the tick judges the same windows and every
      * timestamp written this tick agrees.
      */
-    private static void runTick(Instant now) {
+    private static void runTick(Instant now, LeaseFence fence) {
         List<Monitor> monitors = MonitorRepository.listMonitors(null, null, Boolean.TRUE, null);
 
         for (Monitor monitor : orderByDependency(monitors)) {
+            if (!SentinelLeadership.recheckFence(fence)) return;
             try {
-                evaluateMonitor(monitor, now);
+                evaluateMonitor(monitor, now, fence);
             } catch (Exception e) {
                 log.error("Evaluation failed for monitor {} ({})", monitor.getId(), monitor.getName(), e);
             }
         }
 
+        retryPendingProblems(fence);
+        retryPendingResolutions(fence);
         CollectorState.getInstance().recordEvaluatorRun(now);
+    }
+
+    /**
+     * Re-enqueues the durable opened-edge outbox independently of the enabled
+     * monitor inventory. This is what lets a queue-dropped edge survive a
+     * restart/failover or a monitor being disabled before its next ordinary
+     * still-open evaluation.
+     */
+    private static void retryPendingProblems(LeaseFence fence) {
+        for (AlertEvent event : AlertEventRepository.listPendingProblemAlertEvents()) {
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
+            try {
+                Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
+                if (event.getStatus() == AlertStatus.PROBLEM) {
+                    ActionDispatcher.onRepeatCheck(
+                            event, AlertPayload.of(event, monitor, "PROBLEM"));
+                }
+                // A resolved event is ordered by retryPendingResolutions:
+                // its worker replays the pending problem edge first.
+            } catch (Throwable t) {
+                log.error("Failed to enqueue pending problem for alert event {}",
+                        event.getId(), t);
+            }
+        }
+    }
+
+    /**
+     * Re-enqueues the durable resolution outbox. A queue rejection, process
+     * crash, policy-read failure, or partial fan-out leaves the row pending,
+     * so the next evaluator tick reconstructs the one-shot edge from the
+     * database instead of losing it in worker memory.
+     */
+    private static void retryPendingResolutions(LeaseFence fence) {
+        for (AlertEvent event : AlertEventRepository.listPendingResolvedAlertEvents()) {
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
+            try {
+                Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
+                ActionDispatcher.onAlertResolved(
+                        event, AlertPayload.of(event, monitor, "RESOLVED"));
+            } catch (Throwable t) {
+                log.error("Failed to enqueue pending resolution for alert event {}",
+                        event.getId(), t);
+            }
+        }
     }
 
     /**
@@ -247,75 +296,150 @@ public class TriggerEvaluatorJob implements Job {
      * the sweep no authority over its rows, exactly as INSUFFICIENT_DATA
      * grants {@link #applyOutcome} no authority to resolve an open alert.</p>
      */
-    private static void evaluateMonitor(Monitor monitor, Instant now) {
-        // CHANNEL_STATE is the one type whose subject IS the state, so it
-        // resolves every channel in scope rather than only the started ones —
-        // filtering to STARTED would hand it exactly the channels it has
-        // nothing to say about. See ChannelStateEvaluator.
-        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE;
-        List<ScopeResolver.ChannelTarget> targets = watchesState
-                ? ScopeResolver.resolveScopedChannels(monitor)
-                : ScopeResolver.resolveStartedChannels(monitor);
+    static void evaluateMonitor(Monitor monitor, Instant now) {
+        evaluateMonitor(monitor, now, SentinelLeadership.captureFence());
+    }
 
-        Set<String> targetChannelIds = new HashSet<>();
-        for (ScopeResolver.ChannelTarget target : targets) {
-            targetChannelIds.add(target.channelId);
+    private static void evaluateMonitor(Monitor monitor, Instant now, LeaseFence fence) {
+        // State monitors include undeployed channels. Connector monitors use
+        // the shared deployment inventory, including paused and remote-only
+        // channels. Activity monitors retain their started-channel gate.
+        boolean watchesState = monitor.getMonitorType() == MonitorType.CHANNEL_STATE;
+        boolean watchesConnections = monitor.getMonitorType() == MonitorType.CONNECTION_STATUS;
+        Set<String> deployedChannels = watchesConnections
+                ? NodeLeaseRepository.listActiveDeployedChannelIds() : Set.of();
+        List<ScopeResolver.ChannelTarget> targets;
+        Set<String> scopedChannelIds = new HashSet<>();
+        Set<String> unresolvedChannelIds;
+        if (watchesState || watchesConnections) {
+            ScopeResolver.ChannelResolution resolution =
+                    ScopeResolver.resolveScopedChannelSet(monitor);
+            List<ScopeResolver.ChannelTarget> scopedTargets = resolution.targets;
+            unresolvedChannelIds = resolution.unresolvedChannelIds;
+            for (ScopeResolver.ChannelTarget target : scopedTargets) {
+                scopedChannelIds.add(target.channelId);
+            }
+            scopedChannelIds.addAll(unresolvedChannelIds);
+            if (watchesConnections) {
+                targets = new ArrayList<>();
+                for (ScopeResolver.ChannelTarget target : scopedTargets) {
+                    try {
+                        if (deployedChannels.contains(target.channelId)) {
+                            targets.add(target);
+                        }
+                    } catch (Exception e) {
+                        // Target discovery is part of evaluating this channel.
+                        // Retain it in scopedChannelIds so the later departure
+                        // sweep has no authority over its alerts, but do not
+                        // let one corrupt runtime entry starve healthy peers.
+                        log.error("Failed to resolve runtime state for monitor {} channel {}",
+                                monitor.getId(), target.channelId, e);
+                    }
+                }
+            } else {
+                targets = scopedTargets;
+            }
+        } else {
+            ScopeResolver.ChannelResolution resolution =
+                    ScopeResolver.resolveStartedChannelSet(monitor);
+            targets = resolution.targets;
+            unresolvedChannelIds = resolution.unresolvedChannelIds;
         }
 
-        // channelId -> the metadata ids conclusively evaluated for it this
-        // tick (a single null entry for a channel-level trigger). A channel
-        // absent from this map was not judged at all — see the Javadoc.
+        Set<String> targetChannelIds = new HashSet<>(unresolvedChannelIds);
+        for (ScopeResolver.ChannelTarget target : targets) {
+            targetChannelIds.add(target.channelId);
+            if (!watchesConnections) {
+                scopedChannelIds.add(target.channelId);
+            }
+        }
+
+        // channelId -> identities proven current this tick (a single null for
+        // channel rollup). A channel absent from this map was not safely
+        // inventoried/evaluated at all — see the Javadoc.
         Map<String, Set<Integer>> evaluatedTriggers = new HashMap<>();
 
-        if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS) {
+        if (watchesConnections) {
             for (ScopeResolver.ChannelTarget target : targets) {
-                for (ConnectionStatusEvaluator.ConnectorEvaluation evaluation
-                        : ConnectionStatusEvaluator.evaluate(monitor, target.channelId, now)) {
-                    applyOutcome(monitor, target.channelId, evaluation.metadataId, evaluation.outcome, now);
-                    recordEvaluated(evaluatedTriggers, target.channelId, evaluation.metadataId,
-                            evaluation.outcome);
+                if (!SentinelLeadership.holdsFence(fence)) return;
+                try {
+                    ConnectionStatusEvaluator.ChannelEvaluation channelEvaluation =
+                            ConnectionStatusEvaluator.evaluateChannel(monitor, target.channelId, now);
+                    Set<Integer> currentIdentities = new HashSet<>();
+                    boolean channelRollup = false;
+                    for (ConnectionStatusEvaluator.ConnectorEvaluation evaluation
+                            : channelEvaluation.evaluations) {
+                        applyOutcome(monitor, target.channelId, evaluation.metadataId, evaluation.outcome, now, fence);
+                        if (evaluation.metadataId == null) {
+                            channelRollup = true;
+                        }
+                    }
+                    if (channelRollup) {
+                        currentIdentities.add(null);
+                    } else {
+                        currentIdentities.addAll(channelEvaluation.currentMetadataIds);
+                    }
+                    // Inventory certainty is independent of state sufficiency:
+                    // even when no current connector has emitted a state, ids
+                    // absent from this action-time snapshot have conclusively
+                    // departed and their old alerts may be closed.
+                    evaluatedTriggers.put(target.channelId, currentIdentities);
+                } catch (Exception e) {
+                    // A database/config/runtime failure for one channel must
+                    // neither starve later channels nor authorize the
+                    // departure sweep to prune the failed channel's rows.
+                    evaluatedTriggers.remove(target.channelId);
+                    log.error("Evaluation failed for monitor {} channel {}",
+                            monitor.getId(), target.channelId, e);
                 }
             }
         } else {
             for (ScopeResolver.ChannelTarget target : targets) {
-                EvaluationOutcome outcome;
-                switch (monitor.getMonitorType()) {
-                    case INACTIVITY:
-                        outcome = InactivityEvaluator.evaluate(monitor, target.channelId, now);
-                        break;
-                    case LOW_VOLUME:
-                        outcome = LowVolumeEvaluator.evaluate(monitor, target.channelId, now);
-                        break;
-                    case ANOMALY:
-                        outcome = AnomalyEvaluator.evaluate(monitor, target.channelId, now);
-                        break;
-                    case ERROR_RATE:
-                        outcome = ErrorRateEvaluator.evaluate(monitor, target.channelId, now);
-                        break;
-                    case QUEUE_DEPTH:
-                        outcome = QueueDepthEvaluator.evaluate(monitor, target.channelId, now);
-                        break;
-                    case CHANNEL_STATE:
-                        outcome = ChannelStateEvaluator.evaluate(monitor, target.channelId,
-                                ScopeResolver.channelState(target.channelId), now);
-                        break;
-                    default:
-                        // Recording nothing here is load-bearing: a type this
-                        // build does not understand (a newer monitor type on
-                        // an older jar) leaves the channel inconclusive, so
-                        // the sweep leaves its problems alone rather than
-                        // administratively closing real alerts over a gap in
-                        // this switch.
-                        log.warn("Monitor {} has unhandled type {}; skipping",
-                                monitor.getId(), monitor.getMonitorType());
-                        continue;
+                if (!SentinelLeadership.holdsFence(fence)) return;
+                try {
+                    EvaluationOutcome outcome;
+                    switch (monitor.getMonitorType()) {
+                        case INACTIVITY:
+                            outcome = InactivityEvaluator.evaluate(monitor, target.channelId, now);
+                            break;
+                        case LOW_VOLUME:
+                            outcome = LowVolumeEvaluator.evaluate(monitor, target.channelId, now);
+                            break;
+                        case ANOMALY:
+                            outcome = AnomalyEvaluator.evaluate(monitor, target.channelId, now);
+                            break;
+                        case ERROR_RATE:
+                            outcome = ErrorRateEvaluator.evaluate(monitor, target.channelId, now);
+                            break;
+                        case QUEUE_DEPTH:
+                            outcome = QueueDepthEvaluator.evaluate(monitor, target.channelId, now);
+                            break;
+                        case CHANNEL_STATE:
+                            outcome = ChannelStateEvaluator.evaluate(monitor, target.channelId,
+                                    ScopeResolver.channelState(target.channelId), now);
+                            break;
+                        default:
+                            // Recording nothing here is load-bearing: a type this
+                            // build does not understand (a newer monitor type on
+                            // an older jar) leaves the channel inconclusive, so
+                            // the sweep leaves its problems alone rather than
+                            // administratively closing real alerts over a gap in
+                            // this switch.
+                            log.warn("Monitor {} has unhandled type {}; skipping",
+                                    monitor.getId(), monitor.getMonitorType());
+                            continue;
+                    }
+                    applyOutcome(monitor, target.channelId, null, outcome, now, fence);
+                    recordEvaluated(evaluatedTriggers, target.channelId, null, outcome);
+                } catch (Exception e) {
+                    evaluatedTriggers.remove(target.channelId);
+                    log.error("Evaluation failed for monitor {} channel {}",
+                            monitor.getId(), target.channelId, e);
                 }
-                applyOutcome(monitor, target.channelId, null, outcome, now);
-                recordEvaluated(evaluatedTriggers, target.channelId, null, outcome);
             }
         }
 
-        autoResolveDepartedTriggers(monitor, targetChannelIds, evaluatedTriggers, now);
+        autoResolveDepartedTriggers(monitor, targetChannelIds, scopedChannelIds, evaluatedTriggers, now, fence);
     }
 
     /**
@@ -343,10 +467,10 @@ public class TriggerEvaluatorJob implements Job {
      * <ul>
      *   <li><b>BREACH</b> — increments the consecutive-breach counter. On
      *       reaching the hysteresis threshold from a non-PROBLEM state, opens
-     *       an alert event (suppression decided once, at creation) and, if
-     *       unsuppressed, dispatches. While already PROBLEM, runs the
+     *       an alert event and its durable pending notification. Current
+     *       policy gates dispatch. While already PROBLEM, runs the
      *       still-open pass instead (see
-     *       {@link #stillOpenPass(Monitor, TriggerState)}).</li>
+     *       {@link #stillOpenPass(Monitor, TriggerState, List)}).</li>
      *   <li><b>OK</b> — resolves any open alert (also covering the
      *       PROBLEM → INSUFFICIENT_DATA → OK path, where the state is no
      *       longer PROBLEM but an alert is still open) and settles the state
@@ -360,8 +484,19 @@ public class TriggerEvaluatorJob implements Job {
      *       the still-open pass — see {@link #onInsufficientData}.</li>
      * </ul>
      */
-    private static void applyOutcome(Monitor monitor, String channelId, Integer metadataId,
+    static void applyOutcome(Monitor monitor, String channelId, Integer metadataId,
             EvaluationOutcome outcome, Instant now) {
+        applyOutcome(monitor, channelId, metadataId, outcome, now, SentinelLeadership.captureFence());
+    }
+
+    static void applyOutcome(Monitor monitor, String channelId, Integer metadataId,
+            EvaluationOutcome outcome, Instant now, LeaseFence fence) {
+        AlertLifecycleTransaction.execute(fence, afterCommit ->
+                applyOutcomeInTransaction(monitor, channelId, metadataId, outcome, now, afterCommit));
+    }
+
+    private static void applyOutcomeInTransaction(Monitor monitor, String channelId, Integer metadataId,
+            EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
         TriggerState state = TriggerStateRepository.getTriggerState(monitor.getId(), channelId, metadataId);
         boolean isNew = state == null;
         if (isNew) {
@@ -376,13 +511,13 @@ public class TriggerEvaluatorJob implements Job {
 
         switch (outcome.getResult()) {
             case BREACH:
-                onBreach(monitor, state, channelId, metadataId, outcome, now);
+                onBreach(monitor, state, channelId, metadataId, outcome, now, afterCommit);
                 break;
             case OK:
-                onOk(monitor, state, now);
+                onOk(monitor, state, now, afterCommit);
                 break;
             case INSUFFICIENT_DATA:
-                onInsufficientData(monitor, state, now);
+                onInsufficientData(monitor, state, now, afterCommit);
                 break;
         }
 
@@ -397,15 +532,23 @@ public class TriggerEvaluatorJob implements Job {
 
     /** BREACH branch of {@link #applyOutcome} — see its Javadoc. */
     private static void onBreach(Monitor monitor, TriggerState state, String channelId,
-            Integer metadataId, EvaluationOutcome outcome, Instant now) {
+            Integer metadataId, EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
         int required = Math.max(1, monitor.getMinConsecutiveBreaches());
-        state.setConsecutiveBreachCount(state.getConsecutiveBreachCount() + 1);
-
         if (state.getState() == TriggerStatus.PROBLEM) {
-            // Still breaching: run the still-open pass (repeat + escalation).
-            stillOpenPass(monitor, state);
-            return;
+            AlertEvent open = state.getOpenAlertEventId() == null ? null
+                    : AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
+            if (open != null && open.getStatus() == AlertStatus.PROBLEM) {
+                stillOpenPass(monitor, state, afterCommit);
+                return;
+            }
+            // A manual reset may have failed or raced this evaluator. Rebuild
+            // hysteresis from this observation instead of staying blind forever.
+            state.setState(TriggerStatus.OK);
+            state.setConsecutiveBreachCount(0);
+            state.setOpenAlertEventId(null);
+            state.setLastChangeTime(now);
         }
+        state.setConsecutiveBreachCount(state.getConsecutiveBreachCount() + 1);
 
         if (state.getConsecutiveBreachCount() < required) {
             return; // hysteresis still counting; no transition yet
@@ -417,22 +560,21 @@ public class TriggerEvaluatorJob implements Job {
         // it instead of inserting a second event. Opening a new one here would
         // orphan the retained row forever (every resolve path follows
         // openAlertEventId, which is about to be overwritten) and double-notify
-        // the operator. A retained id pointing at a resolved event (manual
-        // resolve leaves the id stale by design) falls through to a fresh open.
+        // the operator. A retained id pointing at a resolved event (a failed manual
+        // reset can leave the id stale) falls through to a fresh open.
         if (state.getOpenAlertEventId() != null) {
             AlertEvent retained = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
             if (retained != null && retained.getStatus() == AlertStatus.PROBLEM) {
                 state.setState(TriggerStatus.PROBLEM);
                 state.setLastChangeTime(now);
-                stillOpenPass(monitor, state);
+                stillOpenPass(monitor, state, afterCommit);
                 return;
             }
         }
 
-        // Transition to PROBLEM: open the alert. Suppression is decided once,
-        // here at creation, and stored on the row — evaluation continues
-        // underneath a maintenance window, but this alert will never notify.
-        boolean suppressed = isSuppressedAtCreation(monitor, channelId, now);
+        // Persist the opening edge with its trigger. Current notification
+        // policy is rechecked by the worker, including after maintenance ends.
+        boolean suppressed = NotificationSuppression.isSuppressed(monitor, channelId, now);
 
         AlertEvent event = new AlertEvent();
         event.setMonitorId(monitor.getId());
@@ -444,21 +586,20 @@ public class TriggerEvaluatorJob implements Job {
         event.setOpenedTime(now);
         event.setDetailsJson(outcome.getValueJson());
         event.setSuppressed(suppressed);
+        event.setProblemPending(true);
         AlertEventRepository.insertAlertEvent(event);
 
         state.setOpenAlertEventId(event.getId());
         state.setState(TriggerStatus.PROBLEM);
         state.setLastChangeTime(now);
 
-        if (!suppressed) {
-            ActionDispatcher.onAlertOpened(event, AlertPayload.of(event, monitor, "PROBLEM"));
-        }
+        afterCommit.add(() -> ActionDispatcher.onAlertOpened(event, AlertPayload.of(event, monitor, "PROBLEM")));
     }
 
     /** OK branch of {@link #applyOutcome} — see its Javadoc. */
-    private static void onOk(Monitor monitor, TriggerState state, Instant now) {
+    private static void onOk(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
         if (state.getOpenAlertEventId() != null) {
-            resolveOpenAlert(monitor, state, null, now);
+            resolveOpenAlert(monitor, state, null, now, afterCommit);
         }
         if (state.getState() != TriggerStatus.OK) {
             state.setLastChangeTime(now);
@@ -483,14 +624,14 @@ public class TriggerEvaluatorJob implements Job {
      * <p>This cannot over-notify: the pass is paced entirely by the dispatch
      * log, so a data gap contributes ticks, not notifications.</p>
      */
-    private static void onInsufficientData(Monitor monitor, TriggerState state, Instant now) {
+    private static void onInsufficientData(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
         if (state.getState() != TriggerStatus.INSUFFICIENT_DATA) {
             state.setLastChangeTime(now);
         }
         state.setState(TriggerStatus.INSUFFICIENT_DATA);
         state.setConsecutiveBreachCount(0);
         // openAlertEventId intentionally retained — see applyOutcome Javadoc.
-        stillOpenPass(monitor, state);
+        stillOpenPass(monitor, state, afterCommit);
     }
 
     /**
@@ -500,48 +641,48 @@ public class TriggerEvaluatorJob implements Job {
      * escalation to a different one ({@code escalateAfterSeconds} /
      * {@code escalateToActionId}).
      *
-     * <p>Suppressed alerts are skipped here as well as inside the dispatcher:
-     * an alert born under a maintenance window never notifies, and that
-     * includes never repeating and never escalating. A state whose retained
-     * {@code openAlertEventId} points at an already-resolved event (a manual
-     * resolve leaves the id stale by design) contributes nothing.</p>
+     * <p>Suppressed alerts also reach the worker: it rechecks current policy
+     * so an incident can notify after maintenance ends. A state whose retained
+     * {@code openAlertEventId} points at an already-resolved event (a failed manual
+     * reset can leave the id stale) contributes nothing.</p>
      *
      * <p>Cheap by construction: one event read, then an enqueue. Every
      * decision about whether to actually notify — the log read, the ceiling,
      * the chain walk — happens on the dispatch pool, never on this thread.</p>
      */
-    private static void stillOpenPass(Monitor monitor, TriggerState state) {
+    private static void stillOpenPass(Monitor monitor, TriggerState state, List<Runnable> afterCommit) {
         if (state.getOpenAlertEventId() == null) {
             return;
         }
         AlertEvent open = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
-        if (open != null && open.getStatus() == AlertStatus.PROBLEM && !open.isSuppressed()) {
-            ActionDispatcher.onRepeatCheck(open, AlertPayload.of(open, monitor, "PROBLEM"));
+        if (open != null && open.getStatus() == AlertStatus.PROBLEM) {
+            afterCommit.add(() -> ActionDispatcher.onRepeatCheck(open, AlertPayload.of(open, monitor, "PROBLEM")));
         }
     }
 
     /**
      * Resolves the trigger's open alert event and dispatches the resolution
-     * (unless the alert was suppressed at creation — a never-announced
-     * problem must not announce its recovery). {@code overrideMessage}, when
+     * through the durable pending edge. The worker checks current policy and
+     * prior problem deliveries before announcing recovery. {@code overrideMessage}, when
      * set, replaces the message in the outgoing notification payload only:
      * the stored row keeps its original opening message (the update
      * statement does not touch the message column), which is what the
      * problem history should show.
      */
     private static void resolveOpenAlert(Monitor monitor, TriggerState state,
-            String overrideMessage, Instant now) {
+            String overrideMessage, Instant now, List<Runnable> afterCommit) {
         AlertEvent event = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
         if (event != null && event.getStatus() == AlertStatus.PROBLEM) {
             event.setStatus(AlertStatus.RESOLVED);
             event.setResolvedTime(now);
-            AlertEventRepository.updateAlertEvent(event);
+            event.setResolutionPending(true);
+            boolean resolved = AlertEventRepository.resolveAlertEvent(event);
 
-            if (!event.isSuppressed()) {
+            if (resolved) {
                 if (overrideMessage != null) {
                     event.setMessage(overrideMessage);
                 }
-                ActionDispatcher.onAlertResolved(event, AlertPayload.of(event, monitor, "RESOLVED"));
+                afterCommit.add(() -> ActionDispatcher.onAlertResolved(event, AlertPayload.of(event, monitor, "RESOLVED")));
             }
         }
         state.setOpenAlertEventId(null);
@@ -565,8 +706,10 @@ public class TriggerEvaluatorJob implements Job {
      *
      * <p><b>Did this trigger identity depart from a channel that stayed?</b>
      * If the channel is still present <em>and</em> was conclusively evaluated
-     * this tick, but this row's metadata id was not among what the evaluator
-     * returned, the row's subject is gone. Two ways that happens:</p>
+     * this tick, a missing metadata id may indicate departure or a rollup
+     * change. Within connector rollup we also verify that the id is absent
+     * from the deployed channel: a partial set of observations after restart
+     * cannot establish removal on its own. Two departure cases are:</p>
      *
      * <ul>
      *   <li>A destination connector was deleted from the channel and the
@@ -592,26 +735,34 @@ public class TriggerEvaluatorJob implements Job {
      */
     private static void autoResolveDepartedTriggers(Monitor monitor, Set<String> targetChannelIds,
             Map<String, Set<Integer>> evaluatedTriggers, Instant now) {
+        autoResolveDepartedTriggers(monitor, targetChannelIds, null, evaluatedTriggers, now,
+                SentinelLeadership.captureFence());
+    }
+
+    private static void autoResolveDepartedTriggers(Monitor monitor, Set<String> targetChannelIds,
+            Set<String> scopedChannelIds, Map<String, Set<Integer>> evaluatedTriggers, Instant now,
+            LeaseFence fence) {
         List<TriggerState> states = TriggerStateRepository.listTriggerStatesByMonitor(monitor.getId());
         if (states.isEmpty()) {
             return;
         }
 
-        EngineController engineController = null;
-        if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS) {
-            engineController = ControllerFactory.getFactory().createEngineController();
-        }
+        boolean watchesConnections = monitor.getMonitorType() == MonitorType.CONNECTION_STATUS;
+        Set<String> deployedChannels = watchesConnections
+                ? NodeLeaseRepository.listActiveDeployedChannelIds() : Set.of();
 
         for (TriggerState state : states) {
-            // Cheap gate first: only an open problem can be auto-resolved, and
-            // skipping early avoids an isDeployed() call per healthy trigger.
-            if (state.getState() != TriggerStatus.PROBLEM || state.getOpenAlertEventId() == null) {
+            if (!SentinelLeadership.holdsFence(fence)) return;
+            // INSUFFICIENT_DATA deliberately retains open alerts. Departure
+            // cleanup follows that reference, not the last evaluation result.
+            if (state.getOpenAlertEventId() == null) {
                 continue;
             }
 
             boolean channelDeparted;
             if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS) {
-                channelDeparted = !engineController.isDeployed(state.getChannelId());
+                channelDeparted = (scopedChannelIds != null && !scopedChannelIds.contains(state.getChannelId()))
+                        || !deployedChannels.contains(state.getChannelId());
             } else {
                 channelDeparted = !targetChannelIds.contains(state.getChannelId());
             }
@@ -632,115 +783,56 @@ public class TriggerEvaluatorJob implements Job {
                 if (evaluated == null || evaluated.contains(state.getMetadataId())) {
                     continue; // channel not judged this tick, or this row still is
                 }
+                if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS
+                        && state.getMetadataId() != null && !evaluated.contains(null)) {
+                    // Observations can repopulate one connector at a time after
+                    // restart. Missing telemetry is not connector removal. A
+                    // null evaluated id instead proves a CHANNEL rollup change.
+                    try {
+                        if (NodeLeaseRepository.listActiveConnectorNodes(state.getChannelId())
+                                .containsKey(state.getMetadataId())) {
+                            continue;
+                        }
+                    } catch (Exception e) {
+                        log.warn("Cannot verify connector departure for channel {}; retaining alert {}",
+                                state.getChannelId(), state.getOpenAlertEventId(), e);
+                        continue;
+                    }
+                }
                 message = TRIGGER_LEFT_MESSAGE;
             }
 
-            resolveOpenAlert(monitor, state, message, now);
-            // INSUFFICIENT_DATA, not OK: nothing was measured — the subject
-            // simply stopped being measurable. If it comes back, evaluation
-            // begins fresh rather than trusting a synthetic OK.
-            state.setState(TriggerStatus.INSUFFICIENT_DATA);
-            state.setConsecutiveBreachCount(0);
-            state.setLastChangeTime(now);
-            state.setLastEvaluatedTime(now);
-            TriggerStateRepository.updateTriggerState(state);
-        }
-    }
-
-    /**
-     * The at-creation suppression check: an alert is born suppressed when
-     * the mode-aware window check ({@link #suppressedByWindows}) says so, or
-     * when the monitor's suppression parent already has an open,
-     * unsuppressed problem on the <em>same channel</em> (dependency ordering
-     * in {@link #runTick} guarantees the parent's state is current). A
-     * parent that does not cover this channel at all contributes nothing —
-     * the check fails open, because silently swallowing a real alert is
-     * worse than a redundant one.
-     */
-    private static boolean isSuppressedAtCreation(Monitor monitor, String channelId, Instant now) {
-        return suppressedByWindows(channelId, now) || dependencyOpen(monitor, channelId);
-    }
-
-    /**
-     * The mode-aware window check. An alert on this channel is suppressed
-     * when a covering SUPPRESS window is active right now, or when at least
-     * one covering ACTIVE alerting schedule exists and <em>none</em> of them
-     * is active right now (outside every alerting schedule = quiet hours).
-     *
-     * <p>Malformed schedules ({@code isActiveNow == null}) fail open in
-     * whichever direction lets alerts through: a broken SUPPRESS window does
-     * not suppress, a broken ACTIVE window counts as in-schedule — see
-     * {@link WindowSchedule}'s class Javadoc. Rows written before modes
-     * existed have a null mode and behave as SUPPRESS.</p>
-     */
-    private static boolean suppressedByWindows(String channelId, Instant now) {
-        boolean hasAlertingSchedule = false;
-        boolean insideAlertingSchedule = false;
-        for (MaintenanceWindow window : MaintenanceWindowRepository.listEnabledMaintenanceWindows()) {
-            if (!window.isEnabled() || !windowCoversChannel(window, channelId)) {
-                continue; // enabled check is defensive; the query already filters
-            }
-            Boolean activeNow = WindowSchedule.isActiveNow(window, now);
-            if (window.getMode() == WindowMode.ACTIVE) {
-                hasAlertingSchedule = true;
-                if (activeNow == null || activeNow) {
-                    insideAlertingSchedule = true;
+            AlertLifecycleTransaction.execute(fence, afterCommit -> {
+                TriggerState current = TriggerStateRepository.getTriggerState(
+                        monitor.getId(), state.getChannelId(), state.getMetadataId());
+                if (current == null || !java.util.Objects.equals(
+                        current.getOpenAlertEventId(), state.getOpenAlertEventId())) {
+                    return;
                 }
-            } else if (Boolean.TRUE.equals(activeNow)) {
-                return true;
-            }
+                // Deployment inventory may have changed since target discovery.
+                // Recheck a proposed undeployment inside the fenced transaction.
+                if (watchesConnections && !deployedChannels.contains(state.getChannelId())
+                        && NodeLeaseRepository.listActiveDeployedChannelIds().contains(state.getChannelId())) {
+                    return;
+                }
+                if (watchesConnections && TRIGGER_LEFT_MESSAGE.equals(message)
+                        && state.getMetadataId() != null
+                        && !evaluatedTriggers.getOrDefault(state.getChannelId(), java.util.Collections.emptySet()).contains(null)
+                        && NodeLeaseRepository.listActiveConnectorNodes(state.getChannelId())
+                                .containsKey(state.getMetadataId())) {
+                    return;
+                }
+                resolveOpenAlert(monitor, current, message, now, afterCommit);
+                // INSUFFICIENT_DATA, not OK: nothing was measured — the subject
+                // simply stopped being measurable. If it comes back, evaluation
+                // begins fresh rather than trusting a synthetic OK.
+                current.setState(TriggerStatus.INSUFFICIENT_DATA);
+                current.setConsecutiveBreachCount(0);
+                current.setLastChangeTime(now);
+                current.setLastEvaluatedTime(now);
+                TriggerStateRepository.updateTriggerState(current);
+            });
         }
-        return hasAlertingSchedule && !insideAlertingSchedule;
     }
 
-    /**
-     * Whether the window's scope (ALL / CHANNEL / GROUP / TAG membership)
-     * covers the channel. Group and tag membership resolve live via
-     * {@link ScopeResolver}, so edits apply to the next evaluation.
-     */
-    private static boolean windowCoversChannel(MaintenanceWindow window, String channelId) {
-        ScopeType scope = window.getScopeType();
-        if (scope == ScopeType.ALL) {
-            return true;
-        }
-        if (scope == ScopeType.CHANNEL && channelId.equals(window.getScopeId())) {
-            return true;
-        }
-        if (scope == ScopeType.GROUP
-                && ScopeResolver.groupChannelIds(window.getScopeId()).contains(channelId)) {
-            return true;
-        }
-        return scope == ScopeType.TAG
-                && ScopeResolver.tagChannelIds(window.getScopeId()).contains(channelId);
-    }
-
-    /**
-     * Whether the monitor's suppression parent has an open, unsuppressed
-     * problem on the same channel. Any failure while consulting the parent
-     * fails open (returns {@code false}) — a broken dependency lookup must
-     * never suppress a real alert.
-     */
-    private static boolean dependencyOpen(Monitor monitor, String channelId) {
-        Integer parentId = monitor.getSuppressedByMonitorId();
-        if (parentId == null) {
-            return false;
-        }
-        try {
-            for (TriggerState parentState : TriggerStateRepository.listTriggerStatesByMonitor(parentId)) {
-                if (!channelId.equals(parentState.getChannelId())
-                        || parentState.getState() != TriggerStatus.PROBLEM
-                        || parentState.getOpenAlertEventId() == null) {
-                    continue;
-                }
-                AlertEvent open = AlertEventRepository.getAlertEvent(parentState.getOpenAlertEventId());
-                if (open != null && open.getStatus() == AlertStatus.PROBLEM && !open.isSuppressed()) {
-                    return true;
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Dependency suppression check failed for monitor {} (parent {}); failing open",
-                    monitor.getId(), parentId, e);
-        }
-        return false;
-    }
 }

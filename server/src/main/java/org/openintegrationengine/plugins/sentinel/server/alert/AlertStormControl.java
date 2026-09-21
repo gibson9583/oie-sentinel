@@ -231,7 +231,12 @@ final class AlertStormControl {
      * {@link CeilingOutcome#ROLLUP} should report; both are empty/zero for
      * {@link CeilingOutcome#SEND}.
      */
-    record CeilingVerdict(CeilingOutcome outcome, int sent, int windowSeconds, List<String> channels) {
+    record CeilingVerdict(CeilingOutcome outcome, int sent, int windowSeconds, List<String> channels,
+            Reservation reservation) {
+
+        CeilingVerdict(CeilingOutcome outcome, int sent, int windowSeconds, List<String> channels) {
+            this(outcome, sent, windowSeconds, channels, null);
+        }
 
         private static final CeilingVerdict SEND =
                 new CeilingVerdict(CeilingOutcome.SEND, 0, 0, List.of());
@@ -239,6 +244,10 @@ final class AlertStormControl {
         private static CeilingVerdict silent(int sent, int windowSeconds) {
             return new CeilingVerdict(CeilingOutcome.SILENT, sent, windowSeconds, List.of());
         }
+    }
+
+    private record Reservation(Snapshot snapshot, Integer actionId,
+            CeilingOutcome outcome, Instant at) {
     }
 
     /**
@@ -298,13 +307,15 @@ final class AlertStormControl {
             Snapshot snap = snapshotFor(now, windowSeconds);
 
             if (snap.reserveSendIfUnder(actionId, from, max)) {
-                return CeilingVerdict.SEND;
+                return new CeilingVerdict(CeilingOutcome.SEND, 0, 0, List.of(),
+                        new Reservation(snap, actionId, CeilingOutcome.SEND, now));
             }
             int sent = snap.sentInWindow(actionId, from);
             if (!snap.reserveRollupIfNone(actionId, from, now)) {
                 return CeilingVerdict.silent(sent, windowSeconds);
             }
-            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, snap.channels());
+            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, snap.channels(),
+                    new Reservation(snap, actionId, CeilingOutcome.ROLLUP, now));
         } catch (Throwable t) {
             // Fail open: a ceiling that cannot be computed must not silence
             // the action it was meant to pace.
@@ -312,6 +323,19 @@ final class AlertStormControl {
                     action != null ? action.getId() : null,
                     action != null ? action.getName() : null, t);
             return CeilingVerdict.SEND;
+        }
+    }
+
+    /** Releases a reservation when the final policy/lifecycle gate blocks before transport I/O. */
+    static void releaseReservation(CeilingVerdict verdict) {
+        Reservation reservation = verdict != null ? verdict.reservation() : null;
+        if (reservation == null) {
+            return;
+        }
+        if (reservation.outcome() == CeilingOutcome.SEND) {
+            reservation.snapshot().releaseSend(reservation.actionId());
+        } else if (reservation.outcome() == CeilingOutcome.ROLLUP) {
+            reservation.snapshot().releaseRollup(reservation.actionId(), reservation.at());
         }
     }
 
@@ -528,8 +552,9 @@ final class AlertStormControl {
      * inside it however long ago they opened). Events that are both older than
      * the window and already resolved are skipped without a query.</p>
      *
-     * <p>The affected-channel list is built from the same pass: the distinct,
-     * unsuppressed channels that opened a problem inside the window. That is
+     * <p>The affected-channel list is built from the same pass: the distinct
+     * channels whose latest dispatch-time suppression bit is clear and that
+     * opened a problem inside the window. That is
      * the set an operator reading a rollup wants — "what is broken right
      * now" — and it deliberately does not re-run each action's condition
      * filter against every event, which would cost a condition evaluation per
@@ -725,6 +750,13 @@ final class AlertStormControl {
             }
         }
 
+        private void releaseSend(Integer actionId) {
+            AtomicInteger count = reserved.get(actionId);
+            if (count != null) {
+                count.updateAndGet(value -> Math.max(0, value - 1));
+            }
+        }
+
         /**
          * Claims the window's single rollup slot if no rollup has gone out yet
          * — neither logged nor claimed by a concurrent caller.
@@ -754,6 +786,10 @@ final class AlertStormControl {
                 return at;
             });
             return claimed[0];
+        }
+
+        private void releaseRollup(Integer actionId, Instant at) {
+            reservedRollups.remove(actionId, at);
         }
 
         private List<String> channels() {
