@@ -36,7 +36,7 @@ const SCOPE_TYPES = [
 const MODES = [
     {
         key: 'SUPPRESS', label: 'Suppress alerts',
-        hint: 'Alerts opened while the window is active are suppressed.',
+        hint: 'Open, repeat, escalation, and recovery notifications are suppressed while the window is active.',
     },
     {
         key: 'ACTIVE', label: 'Alerting schedule',

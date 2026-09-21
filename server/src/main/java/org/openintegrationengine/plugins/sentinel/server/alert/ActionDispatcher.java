@@ -16,8 +16,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.slf4j.Logger;
@@ -25,6 +30,12 @@ import org.slf4j.LoggerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
+import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
+import org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionTestResult;
@@ -33,6 +44,7 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.OperationMode;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
+import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 
 /**
  * Fans an alert-event lifecycle edge out to every enabled, matching action —
@@ -59,8 +71,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * submitting thread — the evaluator thread — which would quietly restore the
  * exact stall this pool exists to prevent, and would do it at the worst
  * possible moment, since the queue can only fill during a mass breach or a
- * transport outage. A lost notification with a loud WARN is recoverable by an
- * operator reading the log; a stalled evaluator is not recoverable at all.</p>
+ * transport outage. Open and resolution rows stay pending when enqueue is
+ * rejected, so a later evaluator tick reconstructs the edge; the WARN
+ * explains why delivery was delayed. A stalled evaluator is not recoverable
+ * at all.</p>
  *
  * <p>The overriding contract, honored by every public method here: <b>never
  * throw</b>. For the three asynchronous hooks that contract lives inside the
@@ -86,16 +100,18 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * correctness, with one ordering caveat: because {@link #onRepeatCheck} reads
  * the log to decide whether to send, two ticks whose tasks overlap could both
  * read it before either writes its row and double-notify. The
- * {@link #inFlightPacedSends} set closes that window in memory; see
- * {@link #attemptPaced} for why its entries cannot leak.</p>
+ * {@link #inFlightPacedSends} ownership map closes that window in memory; see
+ * {@link #attemptPaced} for why its entries cannot leak. Whole repeat passes
+ * are also serialized per event so two stale tasks cannot both consume the
+ * durable window-entry latch.</p>
  *
  * <p><b>The order the gates apply.</b> Every candidate notification passes
  * through the same three stages, in this order, and an operator who has
  * configured all of them needs to know it is this order and not another:</p>
  *
  * <ol>
- *   <li><b>Suppress.</b> {@code event.isSuppressed()} (maintenance window or
- *       dependency), acknowledgment on the repeat path, and flap detection
+ *   <li><b>Suppress.</b> Current maintenance/alerting windows and monitor
+ *       dependencies, acknowledgment on the repeat path, and flap detection
  *       (see {@link AlertStormControl#flapCheck}). A notification stopped
  *       here does not happen at all — it is not counted, not rolled up and
  *       not escalated, because a suppressed alert must be invisible to
@@ -121,14 +137,16 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * the problem to a different one, and an action may have either, both or
  * neither. An acknowledged problem does neither.</p>
  *
- * <p>Suppression is enforced by the evaluator before calling the lifecycle
- * hooks, but each hook re-checks {@code event.isSuppressed()} as defense in
- * depth: a suppressed alert that produced notifications anyway would defeat
- * the entire point of maintenance windows.</p>
+ * <p>Suppression is re-evaluated on the dispatch worker and again immediately
+ * before each transport call. The alert row's {@code suppressed} column is
+ * both the latest durable snapshot and a pending window-entry latch; it is
+ * cleared only after every applicable action has a durable attempt row.
+ * Queued work can cross a window boundary or outlive a parent problem, so the
+ * stored bit is never dispatch authority by itself.</p>
  *
  * <p>Static utility (private constructor) per the plugin's house style; the
  * shared sender instances are themselves stateless. The only mutable state is
- * the dispatch pool and its in-flight set, whose lifecycle hangs off
+ * the bounded executors and their in-flight sets, whose lifecycle hangs off
  * {@code SentinelServicePlugin.start()} / {@code stop()} alongside the
  * scheduler's.</p>
  */
@@ -147,6 +165,9 @@ public final class ActionDispatcher {
      * the odd non-ASCII character.
      */
     private static final int MAX_ERROR_LENGTH = 1000;
+
+    /** Dispatch-log marker that makes resolution retries per-action idempotent. */
+    static final String RESOLUTION_MARKER = "[SENTINEL_RESOLVED]";
 
     /**
      * Senders are stateless (per {@link AlertSender}) so one shared instance
@@ -177,6 +198,21 @@ public final class ActionDispatcher {
     private static final int DISPATCH_QUEUE_CAPACITY = 500;
 
     /**
+     * Hard wall-clock ceiling around every transport implementation.
+     *
+     * <p>Individual transports may be stricter (the webhook action can choose
+     * 1–30 seconds and the SNS SDK uses a 10-second API call timeout), but no
+     * Email, Channel, SNS or Webhook call may retain a dispatch worker beyond
+     * this common upper bound. The call runs on the separate transport pool
+     * and the waiting future is cancelled at expiry. Cancellation cannot
+     * force a third-party socket implementation to honor interruption, so
+     * transport threads are daemon and the pool has no queue: four calls that
+     * ignore cancellation make later attempts fail fast instead of building a
+     * second invisible backlog behind the dispatch queue.</p>
+     */
+    static final long TRANSPORT_TIMEOUT_SECONDS = 30;
+
+    /**
      * Idle pool threads retire after this long, so a quiet engine carries no
      * parked dispatch threads at all (they are created on demand).
      */
@@ -191,6 +227,9 @@ public final class ActionDispatcher {
 
     /** Numbers the pool threads so thread dumps read "sentinel-dispatch-1", "-2"... */
     private static final AtomicInteger DISPATCH_THREAD_SEQUENCE = new AtomicInteger();
+
+    /** Numbers the isolated I/O threads so a stuck transport is obvious in a thread dump. */
+    private static final AtomicInteger TRANSPORT_THREAD_SEQUENCE = new AtomicInteger();
 
     /**
      * How many links of an escalation chain one repeat check will walk.
@@ -214,13 +253,36 @@ public final class ActionDispatcher {
     private static volatile ThreadPoolExecutor dispatchExecutor;
 
     /**
+     * Executes the synchronous transport APIs behind a cancellable future.
+     * Kept separate from {@link #dispatchExecutor}: submitting a transport to
+     * the same fixed pool while all of its workers wait on the result would
+     * deadlock immediately.
+     */
+    private static volatile ThreadPoolExecutor transportExecutor;
+
+    /**
      * {@code alertEventId:actionId} keys for log-paced sends (repeats and
      * escalations) that have passed their "should I send?" decision but have
      * not yet written the dispatch log row that decision reads. See
      * {@link #attemptPaced} — including why membership is added on the worker
      * thread and not at submit time.
      */
-    private static final Set<String> inFlightPacedSends = ConcurrentHashMap.newKeySet();
+    private static final Map<String, Object> inFlightPacedSends = new ConcurrentHashMap<>();
+
+    /**
+     * Tokens identify the owner of every claim. A stopped worker may return
+     * after shutdown cleared the maps and a new worker claimed the same key;
+     * compare-and-remove preserves the new owner's exclusion in that case.
+     * This map owns problem/open/repeat decisions for each event.
+     */
+    private static final Map<Long, Object> inFlightProblemDecisions = new ConcurrentHashMap<>();
+
+    /** Resolution outbox decisions currently being made for each event. */
+    private static final Map<Long, Object> inFlightResolutionDecisions = new ConcurrentHashMap<>();
+
+    /** Leadership epoch captured when the current worker task was enqueued. */
+    private static final ThreadLocal<LeaseFence> dispatchFence =
+            ThreadLocal.withInitial(LeaseFence::unmanaged);
 
     private ActionDispatcher() {
     }
@@ -248,6 +310,14 @@ public final class ActionDispatcher {
             return;
         }
 
+        ThreadPoolExecutor transports = new ThreadPoolExecutor(
+                DISPATCH_THREADS, DISPATCH_THREADS,
+                DISPATCH_THREAD_KEEPALIVE_SECONDS, TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                ActionDispatcher::newTransportThread,
+                new ThreadPoolExecutor.AbortPolicy());
+        transports.allowCoreThreadTimeOut(true);
+
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
                 DISPATCH_THREADS, DISPATCH_THREADS,
                 DISPATCH_THREAD_KEEPALIVE_SECONDS, TimeUnit.SECONDS,
@@ -255,6 +325,7 @@ public final class ActionDispatcher {
                 ActionDispatcher::newDispatchThread,
                 ActionDispatcher::dropAndLog);
         executor.allowCoreThreadTimeOut(true);
+        transportExecutor = transports;
         dispatchExecutor = executor;
 
         log.info("Sentinel dispatch executor started ({} threads, queue capacity {}); "
@@ -281,12 +352,16 @@ public final class ActionDispatcher {
      */
     public static synchronized void shutdownDispatchExecutor() {
         ThreadPoolExecutor executor = dispatchExecutor;
-        if (executor == null) {
+        ThreadPoolExecutor transports = transportExecutor;
+        if (executor == null && transports == null) {
             return;
         }
         dispatchExecutor = null;
 
         try {
+            if (executor == null) {
+                return;
+            }
             executor.shutdown();
             if (executor.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
                 log.info("Sentinel dispatch executor shut down");
@@ -297,18 +372,33 @@ public final class ActionDispatcher {
                         SHUTDOWN_WAIT_SECONDS, abandoned.size());
             }
         } catch (InterruptedException e) {
-            List<Runnable> abandoned = executor.shutdownNow();
+            List<Runnable> abandoned = executor != null ? executor.shutdownNow() : List.of();
             log.warn("Interrupted while draining the Sentinel dispatch executor; {} queued alert "
                     + "notification(s) abandoned", abandoned.size());
             Thread.currentThread().interrupt();
         } catch (Throwable t) {
             log.warn("Failed to shut down the Sentinel dispatch executor cleanly", t);
         } finally {
-            // Belt and braces: every task removes its own key in a finally,
-            // so this should already be empty. Clearing anyway guarantees a
-            // restart within the same JVM cannot inherit a stale entry, which
-            // would silence that (event, action) repeat pairing permanently.
+            // Keep this handle published while the dispatch pool drains: a
+            // task already accepted before shutdown still owns its chance to
+            // call the transport. Hiding it earlier turns graceful drain into
+            // a synthetic "executor not running" failure row, which then
+            // suppresses durable replay despite no I/O having occurred.
+            transportExecutor = null;
+            if (transports != null) {
+                List<Runnable> abandoned = transports.shutdownNow();
+                if (!abandoned.isEmpty() || !transports.isTerminated()) {
+                    log.warn("Sentinel transport executor stopped with {} unstarted call(s); "
+                                    + "an in-flight transport may still be ignoring interruption",
+                            abandoned.size());
+                }
+            }
+            // Give a restarted executor fresh claims even if a stopped JDBC
+            // worker ignores interruption. Every finally removes only its own
+            // token, so that old worker cannot release a successor's claim.
             inFlightPacedSends.clear();
+            inFlightProblemDecisions.clear();
+            inFlightResolutionDecisions.clear();
             // Same reasoning for the storm-control window: a snapshot taken
             // before the stop describes a window that has passed by the time
             // the plugin starts again, and its reservations would be charged
@@ -329,7 +419,7 @@ public final class ActionDispatcher {
      *                immutable, so handing it to another thread is safe
      */
     public static void onAlertOpened(AlertEvent event, AlertPayload payload) {
-        submit("alert-opened dispatch for alert event " + eventId(event),
+        submitFenced("alert-opened dispatch for alert event " + eventId(event),
                 () -> dispatchLifecycle(event, payload, false));
     }
 
@@ -343,7 +433,7 @@ public final class ActionDispatcher {
      * @param payload the display-resolved snapshot (eventType "RESOLVED")
      */
     public static void onAlertResolved(AlertEvent event, AlertPayload payload) {
-        submit("alert-resolved dispatch for alert event " + eventId(event),
+        submitFenced("alert-resolved dispatch for alert event " + eventId(event),
                 () -> dispatchLifecycle(event, payload, true));
     }
 
@@ -361,13 +451,14 @@ public final class ActionDispatcher {
      * that nobody is looking at it, is the single most annoying thing this
      * class could do.</p>
      *
-     * <p>For an action that opted into repeats, the dispatch log decides what
-     * happens:</p>
+     * <p>The dispatch log decides what happens. Every applicable action gets
+     * its missing initial/entry attempt reconstructed; rows after the first
+     * are controlled by repeat configuration:</p>
      *
      * <ul>
-     *   <li>No rows for this (event, action) yet — send now. This covers an
-     *       action created (or re-enabled) after the alert opened, which
-     *       would otherwise stay silent for the alert's whole lifetime.</li>
+     *   <li>No rows for this (event, action) yet — send now. The missing row
+     *       reconstructs initial/entry work after queue loss, restart, or
+     *       failover even when the action did not opt into repeats.</li>
      *   <li>Rows exist — re-send only when the attempt count is still under
      *       {@code 1 + maxRepeats} (a {@code null} maxRepeats means
      *       unlimited) AND the newest attempt is at least
@@ -389,7 +480,7 @@ public final class ActionDispatcher {
      * @param payload the display-resolved snapshot (eventType "PROBLEM")
      */
     public static void onRepeatCheck(AlertEvent event, AlertPayload payload) {
-        submit("repeat check for alert event " + eventId(event),
+        submitFenced("repeat check for alert event " + eventId(event),
                 () -> runRepeatCheck(event, payload));
     }
 
@@ -401,15 +492,36 @@ public final class ActionDispatcher {
      */
     // Package-private (not private) purely so tests can drive the check synchronously.
     static void runRepeatCheck(AlertEvent event, AlertPayload payload) {
+        Long id = eventId(event);
+        if (id == null) {
+            log.warn("Repeat check invoked without a persisted alert event; ignoring");
+            return;
+        }
+        Object claim = new Object();
+        if (inFlightProblemDecisions.putIfAbsent(id, claim) != null) {
+            log.debug("Problem dispatch for alert event {} is already in flight; skipping stale overlap", id);
+            return;
+        }
         try {
-            if (event == null || event.getId() == null) {
-                log.warn("Repeat check invoked without a persisted alert event; ignoring");
+            // Refresh after taking the event claim. A task that was queued
+            // while the event was suppressed may run after an earlier pass
+            // consumed the latch; trusting its captured object would send the
+            // same entry notification twice.
+            AlertEvent current = AlertEventRepository.getAlertEvent(id);
+            if (current == null) {
                 return;
             }
-            if (event.isSuppressed()) {
-                // See class Javadoc: a suppressed alert must produce no
-                // notifications — including a "first" repeat send for an
-                // action with no log rows yet.
+            if (current.getStatus() != AlertStatus.PROBLEM) {
+                return;
+            }
+            event = current;
+            // Capture before currentDecision refreshes the stored display bit.
+            // A true value means this is the first eligible pass after a
+            // maintenance/dependency interval and enables one no-row initial
+            // send even for actions that did not opt into repeats.
+            boolean notifyOnWindowEntry = entryPending(event);
+            boolean problemPending = event.isProblemPending();
+            if (currentDecision(event) != NotificationSuppression.Decision.ALLOW) {
                 return;
             }
             if (event.getAcknowledgedBy() != null) {
@@ -417,11 +529,37 @@ public final class ActionDispatcher {
                 // The alert stays open (ack never resolves), so the trigger
                 // cannot re-fire a duplicate while the condition persists,
                 // and the resolve notification still goes out when it clears.
+                // Acknowledgment is also a final policy outcome for any
+                // queue-dropped opened edge; consume that outbox so it does
+                // not remain pending forever.
+                if (problemPending) {
+                    completeProblem(event);
+                }
                 return;
+            }
+
+            Instant now = Instant.now();
+            AlertPayload effectivePayload = payload;
+            AlertStormControl.FlapCheck flap = AlertStormControl.flapCheck(event, now, false);
+            if (flap.outcome() == AlertStormControl.FlapOutcome.SUPPRESSED) {
+                log.info("Still-open alert event {} belongs to a flapping trigger "
+                                + "({} cycles in {} minutes); replay/repeats stay suppressed",
+                        event.getId(), flap.cycles(), flap.windowMinutes());
+                return;
+            }
+            if (flap.outcome() == AlertStormControl.FlapOutcome.ONSET) {
+                effectivePayload = withMessage(payload,
+                        AlertStormControl.flappingMessage(flap, payload.getMessage()));
             }
 
             List<Action> actions = ActionRepository.listActions(Boolean.TRUE);
             if (actions == null || actions.isEmpty()) {
+                if (problemPending) {
+                    completeProblem(event);
+                }
+                if (notifyOnWindowEntry) {
+                    completeEntryPass(event);
+                }
                 return;
             }
             // One log read shared by all actions for this event; the per-tick
@@ -438,7 +576,7 @@ public final class ActionDispatcher {
             // escalation and once by its own "no rows yet, send now" repeat
             // rule. Both consult this set on top of the log.
             Set<Integer> notifiedThisPass = new HashSet<>();
-            Instant now = Instant.now();
+            boolean entryPassComplete = true;
 
             for (Action action : actions) {
                 try {
@@ -448,50 +586,74 @@ public final class ActionDispatcher {
                     if (!ActionConditionMatcher.matches(action, payload)) {
                         continue;
                     }
-                    maybeRepeat(action, allRows, notifiedThisPass, event, payload, now);
-                    maybeEscalate(action, byId, allRows, notifiedThisPass, event, payload, now);
+                    if (!maybeRepeat(action, allRows, notifiedThisPass,
+                            event, effectivePayload, now,
+                            problemPending || notifyOnWindowEntry)) {
+                        entryPassComplete = false;
+                    }
+                    maybeEscalate(action, byId, allRows, notifiedThisPass,
+                            event, effectivePayload, now);
                 } catch (Throwable t) {
+                    entryPassComplete = false;
                     log.error("Repeat check failed for action {} ('{}') on alert event {}",
                             action.getId(), action.getName(), event.getId(), t);
+                }
+            }
+            if (entryPassComplete) {
+                if (problemPending) {
+                    completeProblem(event);
+                }
+                if (notifyOnWindowEntry) {
+                    completeEntryPass(event);
                 }
             }
         } catch (Throwable t) {
             log.error("Repeat check failed for alert event {}",
                     event != null ? event.getId() : null, t);
+        } finally {
+            inFlightProblemDecisions.remove(id, claim);
         }
     }
 
     /**
-     * The re-notification half of {@link #runRepeatCheck} for one matched
-     * action — the rules are spelled out on {@link #onRepeatCheck}. Actions
-     * that did not opt into repeats return immediately; they may still
-     * escalate.
+     * The initial-reconstruction/re-notification half of
+     * {@link #runRepeatCheck} for one matched action — the rules are spelled
+     * out on {@link #onRepeatCheck}. Non-repeat actions send only while their
+     * durable row is absent; afterwards they may still escalate.
      */
-    private static void maybeRepeat(Action action, List<ActionDispatchLog> allRows,
-            Set<Integer> notifiedThisPass, AlertEvent event, AlertPayload payload, Instant now) {
-        if (action.getRepeatIntervalSeconds() == null) {
-            return;
-        }
+    private static boolean maybeRepeat(Action action, List<ActionDispatchLog> allRows,
+            Set<Integer> notifiedThisPass, AlertEvent event, AlertPayload payload, Instant now,
+            boolean initialEdgePending) {
         if (notifiedThisPass.contains(action.getId())) {
-            return; // an escalation earlier in this pass already routed here
+            return true; // an escalation earlier in this pass already routed here
         }
 
         List<ActionDispatchLog> rows = rowsForAction(allRows, action);
         if (rows.isEmpty()) {
+            if (!initialEdgePending) {
+                return true;
+            }
+            // No row means this action has never been durably accounted for.
+            // Reconstruct that work on every still-open pass, even when a
+            // snapshot write, process, queue, or leader failed at the window
+            // boundary. This is the restart-safe notify-on-entry rule.
             notifiedThisPass.add(action.getId());
-            attemptPaced(action, event, payload);
-            return;
+            return attemptPaced(action, event, payload);
+        }
+        if (action.getRepeatIntervalSeconds() == null) {
+            return true;
         }
 
         Integer maxRepeats = action.getMaxRepeats();
         if (maxRepeats != null && rows.size() >= 1 + maxRepeats) {
-            return;
+            return true;
         }
         Instant newest = newestDispatchTime(rows);
         if (!newest.isAfter(now.minusSeconds(action.getRepeatIntervalSeconds()))) {
             notifiedThisPass.add(action.getId());
             attemptPaced(action, event, payload);
         }
+        return true;
     }
 
     /**
@@ -637,7 +799,8 @@ public final class ActionDispatcher {
                     null, "Sentinel test", null, Severity.INFORMATION, "TEST",
                     "This is a test notification sent from OIE Sentinel to verify action delivery.",
                     now, "{\"test\":true}");
-            sender.send(action, syntheticEvent(now), payload);
+            sendWithWallClock(sender, action, syntheticEvent(now), payload,
+                    TRANSPORT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             result.setSuccess(true);
             result.setMessage("Test notification sent via " + action.getActionType());
@@ -668,6 +831,22 @@ public final class ActionDispatcher {
      *                    the task's {@code toString()}, so the rejection
      *                    handler can name exactly what was dropped
      */
+    private static void submitFenced(String description, Runnable task) {
+        LeaseFence fence = SentinelLeadership.captureFence();
+        if (fence == null) {
+            log.warn("Sentinel leadership is not held; {} was not queued", description);
+            return;
+        }
+        submit(description, () -> {
+            dispatchFence.set(fence);
+            try {
+                task.run();
+            } finally {
+                dispatchFence.remove();
+            }
+        });
+    }
+
     private static void submit(String description, Runnable task) {
         ThreadPoolExecutor executor = dispatchExecutor;
         if (executor == null) {
@@ -723,6 +902,105 @@ public final class ActionDispatcher {
         return thread;
     }
 
+    /** Named daemon thread for the isolated, cancellable transport call. */
+    private static Thread newTransportThread(Runnable task) {
+        Thread thread = new Thread(task,
+                "sentinel-transport-" + TRANSPORT_THREAD_SEQUENCE.incrementAndGet());
+        thread.setDaemon(true);
+        return thread;
+    }
+
+    /**
+     * Invokes any of the four transports under one hard wall-clock contract.
+     *
+     * <p>The transport APIs do not share an asynchronous interface: Webhook
+     * has {@code HttpClient.sendAsync}, SNS has SDK timeouts, while SMTP and
+     * VMRouter are synchronous. Running the common {@link AlertSender} call
+     * on the isolated executor makes their behavior uniform at the dispatch
+     * boundary: the caller waits at most {@code timeout}, cancels the future,
+     * records a failed attempt, and returns its dispatch worker to the pool.
+     * A transport's own shorter timeout remains effective.</p>
+     *
+     * <p>Package-private with an explicit time unit so tests can prove timeout
+     * and cancellation without sleeping for the production 30 seconds.</p>
+     */
+    static void sendWithWallClock(AlertSender sender, Action action, AlertEvent event,
+            AlertPayload payload, long timeout, TimeUnit unit) throws Exception {
+        sendWithWallClock(sender, action, event, payload, timeout, unit, () -> { });
+    }
+
+    /**
+     * The guard runs on the transport thread immediately before external I/O.
+     * It may defer a stale/blocked edge without recording a transport attempt.
+     */
+    static void sendWithWallClock(AlertSender sender, Action action, AlertEvent event,
+            AlertPayload payload, long timeout, TimeUnit unit, Runnable beforeTransport) throws Exception {
+        if (timeout <= 0 || unit == null) {
+            throw new IllegalArgumentException("Transport timeout must be positive");
+        }
+        ThreadPoolExecutor executor = transportExecutor;
+        if (executor == null || executor.isShutdown()) {
+            throw new DispatchDeferredException("Sentinel transport executor is not running");
+        }
+
+        // 0 = policy gate, 1 = transport started, 2 = cancelled before send.
+        AtomicInteger transportState = new AtomicInteger();
+        Future<Void> future;
+        try {
+            future = executor.submit(() -> {
+                beforeTransport.run();
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new DispatchDeferredException("Transport was cancelled before delivery");
+                }
+                if (!transportState.compareAndSet(0, 1)) {
+                    throw new DispatchDeferredException("Transport was cancelled before delivery");
+                }
+                sender.send(action, event, payload);
+                return null;
+            });
+        } catch (RejectedExecutionException e) {
+            throw new DispatchDeferredException("Sentinel transport capacity is exhausted; "
+                    + "previous calls may be ignoring cancellation", e);
+        }
+
+        try {
+            future.get(timeout, unit);
+        } catch (TimeoutException e) {
+            boolean cancelledBeforeSend = transportState.compareAndSet(0, 2);
+            future.cancel(true);
+            if (cancelledBeforeSend) {
+                throw new DispatchDeferredException("Timed out before transport delivery began", e);
+            }
+            throw new Exception(transportName(action) + " did not complete within "
+                    + timeout + " " + unit.name().toLowerCase(), e);
+        } catch (InterruptedException e) {
+            boolean cancelledBeforeSend = transportState.compareAndSet(0, 2);
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            if (cancelledBeforeSend) {
+                throw new DispatchDeferredException("Interrupted before transport delivery began", e);
+            }
+            throw new Exception("Interrupted while waiting for " + transportName(action), e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new Exception(cause != null ? cause : e);
+        }
+    }
+
+    /** Operator-facing identity for timeout/interruption errors. */
+    private static String transportName(Action action) {
+        String type = action != null && action.getActionType() != null
+                ? action.getActionType().name() : "Unknown transport";
+        String name = action != null ? action.getName() : null;
+        return name == null || name.isBlank() ? type : type + " action '" + name + "'";
+    }
+
     /**
      * The rejection policy: drop the notification and say so loudly. See the
      * class Javadoc for why this is not {@code CallerRunsPolicy} — running
@@ -737,9 +1015,8 @@ public final class ActionDispatcher {
         }
         log.warn("Sentinel dispatch queue is full ({} queued across {} threads) — DROPPING {}. "
                         + "Notifications are being produced faster than the transports can deliver them; "
-                        + "look for a hung SMTP/SNS endpoint or an alert storm. This notification is lost "
-                        + "on purpose: blocking here would stall the monitor evaluator and stop all "
-                        + "monitoring.",
+                        + "look for a hung SMTP/SNS endpoint or an alert storm. Its durable pending "
+                        + "edge remains available for a later evaluator tick to retry.",
                 executor.getQueue().size(), executor.getPoolSize(), task);
     }
 
@@ -765,24 +1042,115 @@ public final class ActionDispatcher {
      *                      BOTH fire), {@code true} for the resolved edge
      *                      (ON_RESOLVE / BOTH fire)
      */
-    private static void dispatchLifecycle(AlertEvent event, AlertPayload payload, boolean resolvedPhase) {
+    // Package-private so policy/action-time regression tests can drive the
+    // worker body synchronously without involving the executor.
+    static void dispatchLifecycle(AlertEvent event, AlertPayload payload, boolean resolvedPhase) {
+        Long id = eventId(event);
+        if (id == null) {
+            log.warn("Dispatch invoked without a persisted alert event; ignoring");
+            return;
+        }
+        Map<Long, Object> decisionClaims = resolvedPhase
+                ? inFlightResolutionDecisions : inFlightProblemDecisions;
+        Object claim = new Object();
+        boolean decisionClaimed = decisionClaims.putIfAbsent(id, claim) == null;
+        if (!decisionClaimed) {
+            log.debug("{} dispatch for alert event {} is already in flight; skipping overlap",
+                    resolvedPhase ? "Resolution" : "Problem", id);
+            return;
+        }
+        boolean problemReplayClaimed = false;
         try {
-            if (event == null || event.getId() == null) {
-                log.warn("Dispatch invoked without a persisted alert event; ignoring");
+            AlertEvent current = AlertEventRepository.getAlertEvent(id);
+            AlertStatus expected = resolvedPhase ? AlertStatus.RESOLVED : AlertStatus.PROBLEM;
+            if (current == null || current.getStatus() != expected) {
                 return;
             }
-            if (event.isSuppressed()) {
-                // Defense in depth — the evaluator already skips suppressed
-                // events, but notifications leaking through a maintenance
-                // window would be a policy violation, not just a bug.
+            event = current;
+            if (resolvedPhase) {
+                if (!event.isResolutionPending()) {
+                    return;
+                }
+                Boolean superseded = supersededByNewerProblem(event);
+                if (superseded == null) {
+                    return; // repository uncertainty: durable outbox retries
+                }
+                if (superseded) {
+                    if (completeProblem(event)) {
+                        completeResolution(event);
+                    }
+                    return;
+                }
+            } else if (!event.isProblemPending()) {
+                return;
+            }
+
+            boolean notifyOnWindowEntry = entryPending(event);
+            NotificationSuppression.Decision policy = currentDecision(event);
+            if (policy != NotificationSuppression.Decision.ALLOW) {
+                if (resolvedPhase && policy == NotificationSuppression.Decision.SUPPRESS) {
+                    if (completeProblem(event)) {
+                        completeResolution(event);
+                    }
+                }
                 return;
             }
 
             List<Action> actions = ActionRepository.listActions(Boolean.TRUE);
             if (actions == null || actions.isEmpty()) {
-                // Nothing to deliver to, so nothing is worth deciding about:
-                // return before the flap history read rather than after it.
+                if (resolvedPhase) {
+                    if (completeProblem(event)) {
+                        completeResolution(event);
+                    }
+                } else {
+                    completeProblem(event);
+                    if (notifyOnWindowEntry) {
+                        completeEntryPass(event);
+                    }
+                }
                 return;
+            }
+
+            List<ActionDispatchLog> priorRows =
+                    ActionDispatchLogRepository.listActionDispatchLogsForEvent(event.getId());
+
+            if (resolvedPhase && event.isProblemPending()) {
+                // Resolution replay and an already-running still-open task
+                // are separate lifecycle workers. Share the problem claim so
+                // they cannot both observe a missing row and externalize the
+                // same delayed problem edge concurrently.
+                if (inFlightProblemDecisions.putIfAbsent(id, claim) != null) {
+                    return;
+                }
+                problemReplayClaimed = true;
+                AlertEvent replayCurrent = AlertEventRepository.getAlertEvent(id);
+                if (replayCurrent == null || replayCurrent.getStatus() != AlertStatus.RESOLVED
+                        || !replayCurrent.isResolutionPending()) {
+                    return;
+                }
+                event = replayCurrent;
+                priorRows = ActionDispatchLogRepository
+                        .listActionDispatchLogsForEvent(event.getId());
+
+                // A queue-dropped/abandoned open may resolve before the next
+                // still-open tick. The resolution row is the durable outbox
+                // for that short-lived incident too: replay every missing
+                // problem action first, and leave resolution_pending set if
+                // any one cannot be durably accounted. The next outbox tick
+                // tries the same ordering again.
+                if (event.isProblemPending()) {
+                    if (!replayMissingProblemEdge(event, payload, actions, priorRows)) {
+                        return;
+                    }
+                    if (!completeProblem(event)) {
+                        return;
+                    }
+                    // The problem sends above wrote rows synchronously.
+                    // Refresh so BOTH recovery decisions in this same worker
+                    // observe those rows and never become first-and-only.
+                    priorRows = ActionDispatchLogRepository
+                            .listActionDispatchLogsForEvent(event.getId());
+                }
             }
 
             AlertPayload effectivePayload = payload;
@@ -792,6 +1160,9 @@ public final class ActionDispatcher {
                 log.info("Alert event {} belongs to a flapping trigger ({} cycles in {} minutes); "
                                 + "notifications stay suppressed until it stabilizes",
                         event.getId(), flap.cycles(), flap.windowMinutes());
+                if (resolvedPhase) {
+                    completeResolution(event);
+                }
                 return;
             }
             if (flap.outcome() == AlertStormControl.FlapOutcome.ONSET) {
@@ -802,6 +1173,7 @@ public final class ActionDispatcher {
                         AlertStormControl.flappingMessage(flap, payload.getMessage()));
             }
 
+            boolean entryPassComplete = true;
             for (Action action : actions) {
                 try {
                     if (!firesOnPhase(action.getOperationMode(), resolvedPhase)) {
@@ -810,16 +1182,99 @@ public final class ActionDispatcher {
                     if (!ActionConditionMatcher.matches(action, payload)) {
                         continue;
                     }
-                    gatedAttempt(action, event, effectivePayload);
+                    if (!resolvedPhase && hasProblemRow(priorRows, action.getId())) {
+                        continue; // stale/duplicate open task: already accounted
+                    }
+                    if (resolvedPhase && hasResolutionRow(priorRows, action.getId())) {
+                        continue; // retry after partial fan-out: already accounted
+                    }
+                    if (resolvedPhase && action.getOperationMode() == OperationMode.BOTH
+                            && !hasProblemRow(priorRows, action.getId())) {
+                        continue; // never send a first-and-only recovery
+                    }
+                    if (!gatedAttempt(action, event, effectivePayload, resolvedPhase)) {
+                        entryPassComplete = false;
+                    }
                 } catch (Throwable t) {
+                    entryPassComplete = false;
                     log.error("Dispatch failed for action {} ('{}') on alert event {}",
                             action.getId(), action.getName(), event.getId(), t);
+                }
+            }
+            if (entryPassComplete) {
+                if (resolvedPhase) {
+                    completeResolution(event);
+                    completeEntryPass(event);
+                } else {
+                    completeProblem(event);
+                    if (notifyOnWindowEntry) {
+                        completeEntryPass(event);
+                    }
                 }
             }
         } catch (Throwable t) {
             log.error("Alert action dispatch failed for event {}",
                     event != null ? event.getId() : null, t);
+        } finally {
+            if (problemReplayClaimed) {
+                inFlightProblemDecisions.remove(id, claim);
+            }
+            if (decisionClaimed) {
+                decisionClaims.remove(id, claim);
+            }
         }
+    }
+
+    /**
+     * Replays the missing problem half of an already-resolved incident.
+     *
+     * <p>The durable resolution flag is intentionally not cleared here. It
+     * orders the two edges: only a fully accounted problem pass lets the
+     * caller continue into resolution fan-out. ON_RESOLVE actions are not
+     * involved; BOTH actions acquire a problem row here before their recovery
+     * is considered, and ON_PROBLEM actions get the one edge they requested.</p>
+     */
+    private static boolean replayMissingProblemEdge(AlertEvent event, AlertPayload resolutionPayload,
+            List<Action> actions, List<ActionDispatchLog> priorRows) {
+        // Acknowledgement is a final policy outcome for the opened edge even
+        // when resolution committed before its next ordinary repeat check.
+        // ON_RESOLVE still follows its configured recovery subscription; BOTH
+        // requires its own earlier problem row below.
+        if (event.getAcknowledgedBy() != null) {
+            return true;
+        }
+        AlertPayload problemPayload = withEventType(resolutionPayload, "PROBLEM");
+        AlertPayload effectivePayload = problemPayload;
+        AlertStormControl.FlapCheck flap = AlertStormControl.flapCheck(event, Instant.now(), false);
+        if (flap.outcome() == AlertStormControl.FlapOutcome.SUPPRESSED) {
+            log.info("Resolved alert event {} has a missing problem edge, but its trigger is "
+                            + "flapping ({} cycles in {} minutes); treating that edge as suppressed",
+                    event.getId(), flap.cycles(), flap.windowMinutes());
+            return true;
+        }
+        if (flap.outcome() == AlertStormControl.FlapOutcome.ONSET) {
+            effectivePayload = withMessage(problemPayload,
+                    AlertStormControl.flappingMessage(flap, problemPayload.getMessage()));
+        }
+
+        boolean complete = true;
+        for (Action action : actions) {
+            try {
+                if (!firesOnPhase(action.getOperationMode(), false)
+                        || !ActionConditionMatcher.matches(action, problemPayload)
+                        || hasProblemRow(priorRows, action.getId())) {
+                    continue;
+                }
+                if (!gatedAttempt(action, event, effectivePayload, false)) {
+                    complete = false;
+                }
+            } catch (Throwable t) {
+                complete = false;
+                log.error("Problem-edge replay failed for action {} ('{}') on resolved alert event {}",
+                        action.getId(), action.getName(), event.getId(), t);
+            }
+        }
+        return complete;
     }
 
     /**
@@ -836,23 +1291,46 @@ public final class ActionDispatcher {
      * and escalations, so the ceiling is a bound on the action's total
      * notification volume rather than on any one problem's.</p>
      */
-    private static void gatedAttempt(Action action, AlertEvent event, AlertPayload payload) {
+    private static boolean gatedAttempt(Action action, AlertEvent event, AlertPayload payload,
+            boolean resolvedPhase) {
+        // A fan-out or repeat/escalation decision can spend time on repository
+        // reads before reaching this point. Re-read policy per actual attempt
+        // so a window activated while the task was queued takes effect before
+        // the transport call, not on the next evaluator tick.
+        if (!lifecycleStillCurrent(event, resolvedPhase)) {
+            return false;
+        }
+        NotificationSuppression.Decision policy = currentDecision(event);
+        if (policy != NotificationSuppression.Decision.ALLOW) {
+            return event.getStatus() == AlertStatus.RESOLVED
+                    && policy == NotificationSuppression.Decision.SUPPRESS;
+        }
         AlertStormControl.CeilingVerdict verdict =
                 AlertStormControl.ceilingVerdict(action, Instant.now());
+        boolean[] transportAttempted = {false};
+        boolean accounted;
         switch (verdict.outcome()) {
             case SEND:
-                attempt(action, event, payload, null);
-                return;
+                accounted = attempt(action, event, payload,
+                        resolvedPhase ? RESOLUTION_MARKER : null,
+                        transportAttempted, resolvedPhase);
+                break;
             case ROLLUP:
-                attemptRollup(action, event, payload, verdict);
-                return;
+                accounted = attemptRollup(action, event, payload, verdict,
+                        transportAttempted, resolvedPhase);
+                break;
             case SILENT:
             default:
                 log.debug("Action {} ('{}') is over its ceiling ({} in {}s) and has already sent this "
                                 + "window's rollup; alert event {} produces no notification",
                         action.getId(), action.getName(), verdict.sent(), verdict.windowSeconds(),
                         event.getId());
+                return false;
         }
+        if (!transportAttempted[0]) {
+            AlertStormControl.releaseReservation(verdict);
+        }
+        return accounted;
     }
 
     /**
@@ -871,13 +1349,14 @@ public final class ActionDispatcher {
      * one per suppressed send.</p>
      *
      * <p>The individual sends the ceiling suppressed write no rows at all.
-     * That is deliberate: an action with {@code repeatIntervalSeconds} set
-     * therefore still sees "no rows for this event" on later ticks and will
-     * deliver the notification for real once the window clears — the ceiling
-     * defers those alerts rather than losing them.</p>
+     * That is deliberate: repeat-enabled actions, and every action whose
+     * event is crossing from policy-suppressed to eligible, still see "no
+     * rows for this event" on later ticks and can deliver once the ceiling
+     * clears rather than losing the notification.</p>
      */
-    private static void attemptRollup(Action action, AlertEvent event, AlertPayload payload,
-            AlertStormControl.CeilingVerdict verdict) {
+    private static boolean attemptRollup(Action action, AlertEvent event, AlertPayload payload,
+            AlertStormControl.CeilingVerdict verdict, boolean[] transportAttempted,
+            boolean resolvedPhase) {
         log.warn("Action {} ('{}') reached its ceiling of {} notification(s) per {}s; sending one "
                         + "rollup for {} affected channel(s) instead of individual notifications",
                 action.getId(), action.getName(), verdict.sent(), verdict.windowSeconds(),
@@ -887,8 +1366,11 @@ public final class ActionDispatcher {
                 payload.getMonitorType(), payload.getChannelId(), payload.getChannelName(),
                 payload.getMetadataId(), payload.getSeverity(), "ROLLUP",
                 AlertStormControl.rollupMessage(verdict), payload.getOpenedTime(),
-                payload.getValueJson());
-        attempt(action, event, rollup, AlertStormControl.ROLLUP_MARKER);
+                payload.getValueJson(), payload.getRunbookUrl());
+        String marker = resolvedPhase
+                ? AlertStormControl.ROLLUP_MARKER + " " + RESOLUTION_MARKER
+                : AlertStormControl.ROLLUP_MARKER;
+        return attempt(action, event, rollup, marker, transportAttempted, resolvedPhase);
     }
 
     /**
@@ -925,17 +1407,189 @@ public final class ActionDispatcher {
      * resolved edges are one-shot transitions driven by trigger state, not by
      * reading the log back, so they have no such window.</p>
      */
-    private static void attemptPaced(Action action, AlertEvent event, AlertPayload payload) {
+    private static boolean attemptPaced(Action action, AlertEvent event, AlertPayload payload) {
         String key = event.getId() + ":" + action.getId();
-        if (!inFlightPacedSends.add(key)) {
+        Object claim = new Object();
+        if (inFlightPacedSends.putIfAbsent(key, claim) != null) {
             log.debug("Paced send for alert event {} / action {} is already in flight; "
                     + "skipping until the next tick", event.getId(), action.getId());
+            return false;
+        }
+        try {
+            return gatedAttempt(action, event, payload, false);
+        } finally {
+            inFlightPacedSends.remove(key, claim);
+        }
+    }
+
+    /**
+     * Applies current policy and advances the durable snapshot into the
+     * suppressed state. Clearing is intentionally owned by the whole-pass
+     * completion path below. Policy uncertainty fails closed everywhere;
+     * repeating problems reconstruct missing work from dispatch rows, while
+     * resolved edges remain in their durable outbox for a later retry.
+     */
+    private static NotificationSuppression.Decision currentDecision(AlertEvent event) {
+        NotificationSuppression.Decision decision =
+                NotificationSuppression.decision(event, Instant.now());
+        if (decision == NotificationSuppression.Decision.SUPPRESS
+                && event != null && event.getId() != null && !event.isSuppressed()) {
+            try {
+                persistDispatchState(() -> AlertEventRepository.setAlertEventSuppressed(event.getId(), true));
+                event.setSuppressed(true);
+            } catch (Throwable t) {
+                // Policy itself is authoritative, so the notification stays
+                // blocked. A later still-open no-row scan reconstructs the
+                // entry work even if this display/latch write never lands.
+                log.error("Failed to persist current suppression state for alert event {}",
+                        event.getId(), t);
+            }
+        }
+        return decision;
+    }
+
+    /** True when the durable suppression snapshot still needs consuming. */
+    private static boolean entryPending(AlertEvent event) {
+        return event != null && event.getId() != null && event.isSuppressed();
+    }
+
+    /**
+     * Clears the entry latch only after the full pass has either written an
+     * attempt row for every applicable never-notified action or determined
+     * that the action was not applicable. A failed clear is harmless: rows
+     * already written make the next pass idempotent, and the remaining latch
+     * lets it retry the state update without re-sending.
+     */
+    private static void completeEntryPass(AlertEvent event) {
+        if (event == null || event.getId() == null) {
             return;
         }
         try {
-            gatedAttempt(action, event, payload);
-        } finally {
-            inFlightPacedSends.remove(key);
+            if (event.isSuppressed()) {
+                persistDispatchState(() -> AlertEventRepository.setAlertEventSuppressed(event.getId(), false));
+                event.setSuppressed(false);
+            }
+        } catch (Throwable t) {
+            log.error("Failed to clear the completed suppression-entry latch for alert event {}; "
+                    + "a later pass will retry", event.getId(), t);
+        }
+    }
+
+    /** A former leader cannot consume the durable work owned by its successor. */
+    private static void persistDispatchState(Runnable mutation) {
+        LeaseFence fence = dispatchFence.get();
+        if (!SentinelLeadership.recheckFence(fence)) {
+            throw new IllegalStateException("Leadership changed before dispatch state persistence");
+        }
+        if (fence.isManaged()) {
+            AlertLifecycleTransaction.execute(fence, afterCommit -> mutation.run());
+        } else {
+            mutation.run();
+        }
+    }
+
+    /** Local capacity/policy failure before any send; leave its durable edge pending. */
+    static final class DispatchDeferredException extends RuntimeException {
+        DispatchDeferredException(String message) {
+            super(message);
+        }
+
+        DispatchDeferredException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /** Completes the durable opened-edge outbox after full per-action accounting. */
+    private static boolean completeProblem(AlertEvent event) {
+        if (event == null || event.getId() == null || !event.isProblemPending()) {
+            return true;
+        }
+        try {
+            persistDispatchState(() -> AlertEventRepository.setProblemPending(event.getId(), false));
+            event.setProblemPending(false);
+            return true;
+        } catch (Throwable t) {
+            log.error("Failed to complete problem dispatch for alert event {}; "
+                    + "the durable outbox will retry", event.getId(), t);
+            return false;
+        }
+    }
+
+    /** Completes the durable resolution outbox only after a final outcome. */
+    private static void completeResolution(AlertEvent event) {
+        if (event == null || event.getId() == null || !event.isResolutionPending()) {
+            return;
+        }
+        try {
+            persistDispatchState(() -> AlertEventRepository.setResolutionPending(event.getId(), false));
+            event.setResolutionPending(false);
+        } catch (Throwable t) {
+            log.error("Failed to complete resolution dispatch for alert event {}; "
+                    + "the durable outbox will retry", event.getId(), t);
+        }
+    }
+
+    /**
+     * @return true when a different open event now owns this trigger identity,
+     *         false when this recovery is still current, or null on lookup
+     *         uncertainty (the outbox retries)
+     */
+    private static Boolean supersededByNewerProblem(AlertEvent event) {
+        try {
+            TriggerState state = TriggerStateRepository.getTriggerState(
+                    event.getMonitorId(), event.getChannelId(), event.getMetadataId());
+            if (state == null || state.getOpenAlertEventId() == null
+                    || state.getOpenAlertEventId().equals(event.getId())) {
+                return false;
+            }
+            AlertEvent newer = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
+            return newer != null && newer.getStatus() == AlertStatus.PROBLEM;
+        } catch (Throwable t) {
+            log.error("Failed to verify whether resolution {} was superseded; retrying later",
+                    event != null ? event.getId() : null, t);
+            return null;
+        }
+    }
+
+    /**
+     * Rejects stale asynchronous work immediately before transport I/O. An
+     * open/repeat/escalation task queued before recovery must not page after
+     * the row resolved, and an acknowledgment arriving during a multi-action
+     * fan-out must stop the remaining problem notifications. Repository
+     * uncertainty fails closed for this attempt.
+     */
+    private static boolean lifecycleStillCurrent(AlertEvent event, boolean resolvedPhase) {
+        if (event == null || event.getId() == null || event.getStatus() == null) {
+            return false;
+        }
+        try {
+            if (!SentinelLeadership.recheckFence(dispatchFence.get())) {
+                return false;
+            }
+            AlertEvent current = AlertEventRepository.getAlertEvent(event.getId());
+            if (current == null) {
+                return false;
+            }
+            if (resolvedPhase) {
+                return current.getStatus() == AlertStatus.RESOLVED
+                        && current.isResolutionPending()
+                        && Boolean.FALSE.equals(supersededByNewerProblem(current));
+            }
+            if (current.getStatus() == AlertStatus.PROBLEM) {
+                return current.getAcknowledgedBy() == null;
+            }
+            // A short-lived incident may have resolved while its open task
+            // was still queued or dropped. resolution_pending owns that
+            // delayed problem edge too, and orders it before recovery.
+            return current.getStatus() == AlertStatus.RESOLVED
+                    && current.getAcknowledgedBy() == null
+                    && current.isProblemPending()
+                    && current.isResolutionPending()
+                    && Boolean.FALSE.equals(supersededByNewerProblem(current));
+        } catch (Throwable t) {
+            log.error("Failed to verify current lifecycle state for alert event {}; "
+                    + "suppressing this notification attempt", event.getId(), t);
+            return false;
         }
     }
 
@@ -947,6 +1601,13 @@ public final class ActionDispatcher {
      * only logged: losing one bookkeeping row must not cascade into losing the
      * remaining actions' deliveries.
      *
+     * <p>The durable replay contract is at-least-once at the boundary between
+     * an external transport and this local log. Once the row exists, later
+     * passes skip it. If the process disappears after the receiver accepts a
+     * message but before this insert commits, replay can duplicate it; there
+     * is no atomic transaction shared by SMTP, VMRouter, SNS, arbitrary
+     * webhooks and the Sentinel database.</p>
+     *
      * <p>{@code marker}, when non-null, is prefixed to the row's
      * {@code error_message} to classify the row for later reads —
      * {@link AlertStormControl#ROLLUP_MARKER} is the only one, and it is what
@@ -954,7 +1615,21 @@ public final class ActionDispatcher {
      * one. It is prefixed rather than substituted so a marked send that
      * <em>fails</em> still carries its real failure reason.</p>
      */
-    private static void attempt(Action action, AlertEvent event, AlertPayload payload, String marker) {
+    private static boolean attempt(Action action, AlertEvent event, AlertPayload payload, String marker,
+            boolean[] transportAttempted, boolean resolvedPhase) {
+        // ceilingVerdict can perform an uncached history scan. Recheck after
+        // that work, at the final transport boundary, so an intervening
+        // window/dependency/lifecycle change cannot leak a stale send. The
+        // earlier gate remains important because suppressed candidates must
+        // not consume or roll up storm budget.
+        if (!lifecycleStillCurrent(event, resolvedPhase)) {
+            return false;
+        }
+        NotificationSuppression.Decision policy = currentDecision(event);
+        if (policy != NotificationSuppression.Decision.ALLOW) {
+            return event.getStatus() == AlertStatus.RESOLVED
+                    && policy == NotificationSuppression.Decision.SUPPRESS;
+        }
         boolean success;
         String errorMessage = null;
         try {
@@ -962,8 +1637,28 @@ public final class ActionDispatcher {
             if (sender == null) {
                 throw new Exception("Unknown action type: " + action.getActionType());
             }
-            sender.send(action, event, payload);
+            LeaseFence fence = dispatchFence.get();
+            sendWithWallClock(sender, action, event, payload,
+                    TRANSPORT_TIMEOUT_SECONDS, TimeUnit.SECONDS, () -> {
+                        dispatchFence.set(fence);
+                        try {
+                            if (!lifecycleStillCurrent(event, resolvedPhase)
+                                    || currentDecision(event) != NotificationSuppression.Decision.ALLOW
+                                    || !SentinelLeadership.recheckFence(fence)) {
+                                throw new DispatchDeferredException(
+                                        "Lifecycle, notification policy, or leadership changed before delivery");
+                            }
+                            transportAttempted[0] = true;
+                        } finally {
+                            dispatchFence.remove();
+                        }
+                    });
             success = true;
+        } catch (DispatchDeferredException deferred) {
+            transportAttempted[0] = false;
+            log.debug("Delivery deferred for action {} on alert event {}: {}",
+                    action.getId(), event.getId(), deferred.getMessage());
+            return false;
         } catch (Throwable t) {
             success = false;
             errorMessage = exceptionMessage(t);
@@ -979,9 +1674,11 @@ public final class ActionDispatcher {
             row.setSuccess(success);
             row.setErrorMessage(truncate(mark(marker, errorMessage)));
             ActionDispatchLogRepository.insertActionDispatchLog(row);
+            return true;
         } catch (Throwable t) {
             log.error("Failed to record dispatch log for action {} on alert event {}",
                     action.getId(), event.getId(), t);
+            return false;
         }
     }
 
@@ -1028,6 +1725,34 @@ public final class ActionDispatcher {
         return false;
     }
 
+    private static boolean hasResolutionRow(List<ActionDispatchLog> rows, Integer actionId) {
+        if (rows == null || actionId == null) {
+            return false;
+        }
+        for (ActionDispatchLog row : rows) {
+            String marker = row.getErrorMessage();
+            if (actionId.equals(row.getActionId()) && marker != null
+                    && marker.contains(RESOLUTION_MARKER)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasProblemRow(List<ActionDispatchLog> rows, Integer actionId) {
+        if (rows == null || actionId == null) {
+            return false;
+        }
+        for (ActionDispatchLog row : rows) {
+            String marker = row.getErrorMessage();
+            if (actionId.equals(row.getActionId())
+                    && (marker == null || !marker.contains(RESOLUTION_MARKER))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Copies a payload with a different message. Used where the dispatcher
      * needs to say something about the notification itself (it is a flap
@@ -1039,7 +1764,17 @@ public final class ActionDispatcher {
         return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(),
                 payload.getMonitorName(), payload.getMonitorType(), payload.getChannelId(),
                 payload.getChannelName(), payload.getMetadataId(), payload.getSeverity(),
-                payload.getEventType(), message, payload.getOpenedTime(), payload.getValueJson());
+                payload.getEventType(), message, payload.getOpenedTime(), payload.getValueJson(),
+                payload.getRunbookUrl());
+    }
+
+    /** Copies a payload for the other lifecycle edge without changing its incident facts. */
+    private static AlertPayload withEventType(AlertPayload payload, String eventType) {
+        return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(),
+                payload.getMonitorName(), payload.getMonitorType(), payload.getChannelId(),
+                payload.getChannelName(), payload.getMetadataId(), payload.getSeverity(),
+                eventType, payload.getMessage(), payload.getOpenedTime(), payload.getValueJson(),
+                payload.getRunbookUrl());
     }
 
     /**

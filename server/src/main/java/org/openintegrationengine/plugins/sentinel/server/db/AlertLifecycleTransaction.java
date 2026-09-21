@@ -16,6 +16,19 @@ public final class AlertLifecycleTransaction {
     private AlertLifecycleTransaction() { }
 
     public static void execute(Consumer<List<Runnable>> work) {
+        execute(LeaseFence.unmanaged(), work);
+    }
+
+    /**
+     * Holds the captured leadership lease row for the entire transaction.
+     * A successor cannot acquire the lease until this work commits or rolls
+     * back; a paused worker whose lease expired rolls back before commit.
+     * Callers must carry the fence captured when their work was scheduled.
+     */
+    public static void execute(LeaseFence fence, Consumer<List<Runnable>> work) {
+        if (fence == null) {
+            throw new IllegalStateException("No leadership fence for alert lifecycle work");
+        }
         SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
         if (sessions.isManagedSessionStarted()) {
             throw new IllegalStateException("Nested alert lifecycle transaction");
@@ -24,7 +37,9 @@ public final class AlertLifecycleTransaction {
         sessions.startManagedSession(false);
         Throwable failure = null;
         try {
+            NodeLeaseRepository.requireFence(sessions, fence);
             work.accept(afterCommit);
+            NodeLeaseRepository.requireFence(sessions, fence);
             sessions.commit();
         } catch (RuntimeException | Error error) {
             failure = error;

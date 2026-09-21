@@ -27,9 +27,16 @@ public class ConnectorStatusEvent {
     private Long id;
     private String channelId;
     private int metadataId;
+    private String nodeId;
     private String previousState;
     private String newState;
     private Instant changedTime;
+    private Instant deploymentTime;
+
+    /** Runtime deployment timestamp observed by the listener; absent on historical rows. */
+    public Instant getDeploymentTime() { return deploymentTime; }
+
+    public void setDeploymentTime(Instant deploymentTime) { this.deploymentTime = deploymentTime; }
 
     /**
      * Creates an empty connector status event. Callers populate fields via
@@ -84,6 +91,23 @@ public class ConnectorStatusEvent {
      */
     public void setMetadataId(int metadataId) {
         this.metadataId = metadataId;
+    }
+
+    /**
+     * @return the stable engine-node identity that observed this transition;
+     *         {@code "legacy"} identifies rows written before per-node state
+     *         tracking was introduced
+     */
+    public String getNodeId() {
+        return nodeId;
+    }
+
+    /**
+     * @param nodeId the stable engine-node identity that observed this
+     *               transition
+     */
+    public void setNodeId(String nodeId) {
+        this.nodeId = nodeId;
     }
 
     /**

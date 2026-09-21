@@ -27,13 +27,17 @@ console, riding its existing session (no separate login).
 - Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency
   suppression (a parent monitor's open problem silences its dependents on the same channel).
 
-### Channel state is the one monitor evaluated against stopped channels
+### Channel state and connector monitoring follow deployment state
 
-Every other type is evaluated only against channels in `STARTED`, and that gate is correct for all
-of them — a stopped channel's source is not polling, so an inactivity or volume breach against it
+Activity monitors evaluate channels in `STARTED`: a stopped channel's source is not polling,
+so an inactivity or volume breach against it
 would be measuring the operator's own decision. The consequence is that stopping a production
 channel raises no alarm; it *silences* the alarms that channel already had, which the evaluator
 closes with "Channel is no longer started".
+
+A **Connection status** monitor evaluates deployed connectors, including paused channels and
+channels deployed only on another live cluster node. Missing observations remain insufficient data
+until the deployment inventory and connector state can be established.
 
 A **Channel state** monitor watches the state itself, so it is resolved against every channel in
 scope whatever state it is in. It defaults to the resting states — `STOPPED`, `PAUSED`,
@@ -61,6 +65,12 @@ immediately.
 **Actions (alert delivery)**
 - Email (engine SMTP), Channel (route the alert payload into an OIE channel via VM Router), AWS
   SNS, and Webhook (HTTPS POST to Slack, Teams, PagerDuty, Alertmanager…) senders.
+- Every transport call has the same 30-second hard wall-clock ceiling (a transport may use a
+  shorter one); expiry cancels the call and releases the bounded dispatch worker.
+- Open and resolution notifications use ordered durable outbox flags and reconcile missing
+  per-action dispatch rows. A full dispatch queue, restart, short-lived incident, or partial fan-out
+  therefore delays a one-shot edge instead of losing it. A crash between an external send and its
+  dispatch-log commit can cause a duplicate on retry.
 - **Storm control**: a per-action notification ceiling over a rolling window, past which individual
   sends are held and one rollup notification names the affected channels; plus flap detection, so a
   trigger bouncing between problem and OK notifies once and then goes quiet until it settles.
@@ -75,9 +85,15 @@ immediately.
   `${message}`) for the email subject template.
 
 **Schedules** (the *Schedules* tab)
-- **Suppress** schedules — classic maintenance windows: alerts born inside the window never notify.
+- **Suppress** schedules — classic maintenance windows: notification decisions made while the
+  window is active stay silent. A problem still open when maintenance ends gets its first
+  notification then.
 - **Alerting schedule** windows: the inverse — alerts on covered channels notify *only inside* the
-  window (business hours, on-call rotations).
+  window (business hours, on-call rotations). Problems that opened during quiet hours are checked
+  on every tick and notify on window entry if they remain open.
+- Suppression is checked on the dispatch worker for opens, repeats, escalations and resolutions,
+  so schedule edits and parent-monitor recovery take effect before a queued transport call rather
+  than being frozen into the alert's creation-time state.
 - One-time, weekly (days of week), or monthly (days of month) recurrence with start/end times on a
   **per-window time zone** — pick the zone your on-call rotation lives in and the schedule keeps its
   length across daylight-saving changes there; leave it blank to follow the OIE server's own clock.
@@ -206,14 +222,28 @@ that gate, two nodes sharing a database would each write a full set of activity 
 every message delta and corrupting every volume baseline, while both evaluators raced on the same
 trigger rows.
 
-The REST API and dashboard serve from **any** node, leader or not — only the scheduled work is
-gated.
+The REST API and dashboard serve from **any** node, leader or not. Only scheduled work is
+leadership-gated.
+
+Connector transitions are node-qualified and every node maintains its own database-clock presence
+lease, including standbys. Each heartbeat atomically publishes that node's deployed-channel
+inventory with its presence lease. The leader evaluates connector state across the live nodes
+that deploy the channel. A clean stop removes that node immediately, while an unclean loss removes it after the 90-second
+presence lease expires. Historical rows are retained for diagnostics but a permanently retired
+node cannot keep a connector problem open forever. Leadership epochs are checked inside database
+transactions and immediately before notification transport starts. Pending notifications survive
+queue saturation and failover. Configure a stable engine server id on every cluster member;
+when the engine does not provide one, Sentinel derives a restart-stable fallback
+from the hostname and that installation's application-data directory.
 
 Failover is automatic. A clean shutdown hands the lease over within about 30 seconds; an abrupt
 node loss takes up to about 2 minutes (a 90-second lease plus the next node's heartbeat). The new
 leader's first collector tick records zero deltas rather than counting each channel's lifetime
 total as one interval, so one tick of sampling is lost on failover by design. Leadership changes
 are logged at INFO, naming the node — the first thing to check during an HA incident.
+
+For a clustered upgrade from 1.1.0, stop Sentinel on every node before starting the updated plugin.
+All nodes must use the new schema and fencing protocol before monitoring resumes.
 
 ## Install
 

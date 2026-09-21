@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.apache.ibatis.session.SqlSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -87,6 +88,15 @@ final class ChunkedDelete {
      *                             correct — they were past retention
      */
     static int run(String statementId, Instant cutoff, String what) {
+        return run(statementId, cutoff, what, LeaseFence.unmanaged());
+    }
+
+    /**
+     * Fenced variant used by leader-only jobs. Every pass validates and locks
+     * the epoch in the same transaction as its bounded delete; losing the lease
+     * stops the loop before the next mutation while retaining completed passes.
+     */
+    static int run(String statementId, Instant cutoff, String what, LeaseFence fence) {
         if (CHUNK_SIZE < 1) {
             throw new IllegalStateException("CHUNK_SIZE must be positive");
         }
@@ -99,11 +109,32 @@ final class ChunkedDelete {
                 // Literal, not a bind: see the class Javadoc and the mappers.
                 params.put("chunkSize", CHUNK_SIZE);
 
-                // Each pass is its own committed transaction (the session
-                // manager auto-commits per statement), which is the entire
-                // point — locks and undo are released between chunks.
-                int deleted = SqlConfig.getInstance().getSqlSessionManager()
-                        .delete(statementId, params);
+                // Validate and lock the exact epoch in the same transaction
+                // as the delete. A takeover either completes first (this pass
+                // aborts) or waits for this bounded pass to commit.
+                int deleted;
+                SqlSession session = null;
+                try {
+                    session = SqlConfig.getInstance().getSqlSessionManager().openSession(false);
+                    if (!NodeLeaseRepository.lockFence(session, fence)) {
+                        session.rollback();
+                        log.warn("Prune of {} stopped after {} rows because leadership epoch changed",
+                                what, total);
+                        return total;
+                    }
+                    deleted = session.delete(statementId, params);
+                    NodeLeaseRepository.requireFence(session, fence);
+                    session.commit();
+                } catch (Exception e) {
+                    if (session != null) {
+                        session.rollback();
+                    }
+                    throw e;
+                } finally {
+                    if (session != null) {
+                        session.close();
+                    }
+                }
                 total += deleted;
 
                 if (deleted < CHUNK_SIZE) {

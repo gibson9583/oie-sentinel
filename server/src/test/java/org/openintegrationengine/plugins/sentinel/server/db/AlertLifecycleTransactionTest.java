@@ -64,4 +64,46 @@ class AlertLifecycleTransactionTest {
             verify(sessions, never()).close();
         }
     }
+
+    @Test
+    void staleFenceCannotStartLifecycleWrites() {
+        LeaseFence fence = new LeaseFence("sentinel", "former-leader", 2L);
+        try (var config = mockStatic(SqlConfig.class); var leases = mockStatic(NodeLeaseRepository.class)) {
+            SqlConfig engine = mock(SqlConfig.class);
+            SqlSessionManager sessions = mock(SqlSessionManager.class);
+            config.when(SqlConfig::getInstance).thenReturn(engine);
+            when(engine.getSqlSessionManager()).thenReturn(sessions);
+            RuntimeException expired = new RuntimeException("stale lease");
+            leases.when(() -> NodeLeaseRepository.requireFence(sessions, fence)).thenThrow(expired);
+            assertSame(expired, assertThrows(RuntimeException.class,
+                    () -> AlertLifecycleTransaction.execute(fence, after -> fail("stale owner wrote"))));
+            verify(sessions).rollback();
+            verify(sessions, never()).commit();
+            verify(sessions).close();
+        }
+    }
+
+    @Test
+    void leaseExpiryDuringWorkRollsBackAndNeverDispatches() {
+        LeaseFence fence = new LeaseFence("sentinel", "leader", 2L);
+        try (var config = mockStatic(SqlConfig.class); var leases = mockStatic(NodeLeaseRepository.class)) {
+            SqlConfig engine = mock(SqlConfig.class);
+            SqlSessionManager sessions = mock(SqlSessionManager.class);
+            config.when(SqlConfig::getInstance).thenReturn(engine);
+            when(engine.getSqlSessionManager()).thenReturn(sessions);
+            java.util.concurrent.atomic.AtomicInteger checks = new java.util.concurrent.atomic.AtomicInteger();
+            RuntimeException expired = new RuntimeException("lease expired while paused");
+            leases.when(() -> NodeLeaseRepository.requireFence(sessions, fence)).thenAnswer(call -> {
+                if (checks.incrementAndGet() == 2) throw expired;
+                return null;
+            });
+            Runnable delivery = mock(Runnable.class);
+            assertSame(expired, assertThrows(RuntimeException.class,
+                    () -> AlertLifecycleTransaction.execute(fence, after -> after.add(delivery))));
+            assertEquals(2, checks.get());
+            verify(sessions).rollback();
+            verify(sessions, never()).commit();
+            verifyNoInteractions(delivery);
+        }
+    }
 }

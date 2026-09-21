@@ -11,11 +11,12 @@ package org.openintegrationengine.plugins.sentinel.shared.model;
  * ({@code window_mode} VARCHAR(16)).
  *
  * <ul>
- *   <li>{@link #SUPPRESS} — classic maintenance: alerts born while the
- *       window is active are flagged suppressed and never notify.</li>
+ *   <li>{@link #SUPPRESS} — classic maintenance: notification decisions made
+ *       while the window is active are suppressed. A still-open problem is
+ *       eligible again after the window ends.</li>
  *   <li>{@link #ACTIVE} — an alerting schedule: alerts on covered channels
- *       notify only while the window is active; an alert born <em>outside</em>
- *       the window's times is the one that gets suppressed. A channel covered
+ *       notify only while the window is active. A problem born outside the
+ *       window is reconsidered on entry if it remains open. A channel covered
  *       by several ACTIVE windows alerts when any one of them is active.</li>
  * </ul>
  */

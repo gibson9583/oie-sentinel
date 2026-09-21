@@ -7,6 +7,7 @@ package org.openintegrationengine.plugins.sentinel.server.alert;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 
 import java.time.Instant;
@@ -24,6 +25,8 @@ import org.mockito.Mockito;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
+import org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -65,6 +68,8 @@ class ActionDispatcherRepeatTest {
 
     private MockedStatic<ActionRepository> actionRepository;
     private MockedStatic<ActionDispatchLogRepository> dispatchLogRepository;
+    private MockedStatic<AlertEventRepository> alertRepository;
+    private MockedStatic<NotificationSuppression> suppression;
 
     /** The enabled actions the pass will see. */
     private final List<Action> actions = new ArrayList<>();
@@ -80,10 +85,19 @@ class ActionDispatcherRepeatTest {
         dispatchLogRepository = Mockito.mockStatic(ActionDispatchLogRepository.class);
         dispatchLogRepository.when(() -> ActionDispatchLogRepository
                 .listActionDispatchLogsForEvent(EVENT_ID)).thenReturn(existingRows);
+        alertRepository = Mockito.mockStatic(AlertEventRepository.class);
+        alertRepository.when(() -> AlertEventRepository.getAlertEvent(EVENT_ID))
+                .thenReturn(openEvent(5_000));
+        suppression = Mockito.mockStatic(NotificationSuppression.class);
+        suppression.when(() -> NotificationSuppression.decision(
+                any(AlertEvent.class), any(Instant.class)))
+                .thenReturn(NotificationSuppression.Decision.ALLOW);
     }
 
     @AfterEach
     void tearDown() {
+        suppression.close();
+        alertRepository.close();
         dispatchLogRepository.close();
         actionRepository.close();
     }
@@ -124,6 +138,7 @@ class ActionDispatcherRepeatTest {
         event.setChannelId(CHANNEL_ID);
         event.setSeverity(Severity.HIGH);
         event.setStatus(AlertStatus.PROBLEM);
+        event.setProblemPending(true);
         event.setMessage("No messages received in 3600s");
         event.setOpenedTime(Instant.now().minusSeconds(openedSecondsAgo));
         return event;
@@ -133,7 +148,12 @@ class ActionDispatcherRepeatTest {
      * Runs one still-open pass. The payload is built through the
      * package-private constructor so no engine cache is consulted.
      */
-    private static void runPass(AlertEvent event) {
+    private void runPass(AlertEvent event) {
+        alertRepository.when(() -> AlertEventRepository.getAlertEvent(EVENT_ID)).thenReturn(event);
+        runQueuedPass(event);
+    }
+
+    private static void runQueuedPass(AlertEvent event) {
         AlertPayload payload = new AlertPayload(EVENT_ID, 7, "Nightly ADT feed",
                 MonitorType.INACTIVITY, CHANNEL_ID, "ADT Inbound", null, Severity.HIGH,
                 "PROBLEM", event.getMessage(), event.getOpenedTime(), null);
@@ -222,6 +242,192 @@ class ActionDispatcherRepeatTest {
             row(1, 3_600L, true);
             runPass(openEvent(5_000));
             assertNothingSent();
+        }
+
+        @Test
+        @DisplayName("an action with no prior row gets the first post-window notification without repeats")
+        void noRowsMeansFirstSendEvenWithoutRepeatConfiguration() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            event.setSuppressed(true);
+
+            runPass(event);
+
+            assertSentOnceTo(1);
+            alertRepository.verify(() -> AlertEventRepository.setAlertEventSuppressed(EVENT_ID, false));
+        }
+
+        @Test
+        @DisplayName("an entry-pass repository failure keeps the durable latch for retry")
+        void windowEntryActionLookupFailureRetries() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            event.setSuppressed(true);
+            actionRepository.when(() -> ActionRepository.listActions(Boolean.TRUE))
+                    .thenThrow(new RuntimeException("action inventory unavailable"));
+
+            runPass(event);
+
+            assertNothingSent();
+            alertRepository.verify(() -> AlertEventRepository.setAlertEventSuppressed(
+                    EVENT_ID, false), never());
+
+            actionRepository.when(() -> ActionRepository.listActions(Boolean.TRUE)).thenReturn(actions);
+            runPass(event);
+            assertSentOnceTo(1);
+        }
+
+        @Test
+        @DisplayName("a failed latch update suppresses the attempt and remains retryable")
+        void windowEntryStateWriteFailureRetries() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            event.setSuppressed(true);
+            dispatchLogRepository.when(() -> ActionDispatchLogRepository
+                    .insertActionDispatchLog(any(ActionDispatchLog.class)))
+                    .thenAnswer(invocation -> {
+                        existingRows.add(invocation.getArgument(0));
+                        return null;
+                    });
+            alertRepository.when(() -> AlertEventRepository.setAlertEventSuppressed(EVENT_ID, false))
+                    .thenThrow(new RuntimeException("suppression state write unavailable"));
+
+            runPass(event);
+
+            assertSentOnceTo(1);
+            assertTrue(event.isSuppressed());
+
+            alertRepository.when(() -> AlertEventRepository.setAlertEventSuppressed(EVENT_ID, false))
+                    .thenAnswer(invocation -> null);
+            runPass(event);
+            assertEquals(1, insertedRows().size(), "the durable first attempt must not be repeated");
+            assertEquals(false, event.isSuppressed());
+        }
+
+        @Test
+        @DisplayName("a partial fan-out keeps the latch until every action has a durable row")
+        void partialWindowEntryFanoutRetriesOnlyTheUnaccountedAction() {
+            action(1, null, null);
+            action(2, null, null);
+            AlertEvent event = openEvent(5_000);
+            event.setSuppressed(true);
+            boolean[] failSecondOnce = {true};
+            dispatchLogRepository.when(() -> ActionDispatchLogRepository
+                    .insertActionDispatchLog(any(ActionDispatchLog.class)))
+                    .thenAnswer(invocation -> {
+                        ActionDispatchLog row = invocation.getArgument(0);
+                        if (Integer.valueOf(2).equals(row.getActionId()) && failSecondOnce[0]) {
+                            failSecondOnce[0] = false;
+                            throw new RuntimeException("dispatch log unavailable");
+                        }
+                        existingRows.add(row);
+                        return null;
+                    });
+
+            runPass(event);
+            assertTrue(event.isSuppressed(), "an unaccounted action must retain the entry latch");
+
+            runPass(event);
+
+            List<ActionDispatchLog> attempts = insertedRows();
+            assertEquals(List.of(1, 2, 2), attempts.stream()
+                    .map(ActionDispatchLog::getActionId).toList());
+            assertEquals(false, event.isSuppressed());
+        }
+
+        @Test
+        @DisplayName("a silent ceiling retains the entry notification until capacity returns")
+        void silentCeilingDoesNotConsumeWindowEntry() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            event.setSuppressed(true);
+            try (MockedStatic<AlertStormControl> storm = Mockito.mockStatic(AlertStormControl.class)) {
+                storm.when(() -> AlertStormControl.flapCheck(
+                        any(AlertEvent.class), any(Instant.class), Mockito.eq(false)))
+                        .thenReturn(new AlertStormControl.FlapCheck(
+                                AlertStormControl.FlapOutcome.NOT_FLAPPING, 0, 0));
+                storm.when(() -> AlertStormControl.ceilingVerdict(
+                        any(Action.class), any(Instant.class)))
+                        .thenReturn(new AlertStormControl.CeilingVerdict(
+                                        AlertStormControl.CeilingOutcome.SILENT, 1, 60, List.of()),
+                                new AlertStormControl.CeilingVerdict(
+                                        AlertStormControl.CeilingOutcome.SEND, 0, 60, List.of()));
+
+                runPass(event);
+                assertNothingSent();
+                assertTrue(event.isSuppressed());
+
+                runPass(event);
+                assertSentOnceTo(1);
+                assertEquals(false, event.isSuppressed());
+            }
+        }
+
+        @Test
+        @DisplayName("a still-open recovery pass preserves flap suppression")
+        void missingProblemReplayDoesNotBypassFlapSuppression() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            try (MockedStatic<AlertStormControl> storm = Mockito.mockStatic(AlertStormControl.class)) {
+                storm.when(() -> AlertStormControl.flapCheck(
+                        any(AlertEvent.class), any(Instant.class), Mockito.eq(false)))
+                        .thenReturn(new AlertStormControl.FlapCheck(
+                                AlertStormControl.FlapOutcome.SUPPRESSED, 4, 10));
+
+                runPass(event);
+
+                assertNothingSent();
+                assertTrue(event.isProblemPending(),
+                        "suppressed replay must remain pending for a later stable pass");
+                storm.verify(() -> AlertStormControl.ceilingVerdict(
+                        any(Action.class), any(Instant.class)), Mockito.never());
+            }
+        }
+
+        @Test
+        @DisplayName("a failed false-to-true snapshot still remembers the crossed window")
+        void failedSuppressionSnapshotStillNotifiesAfterWindowExit() {
+            action(1, null, null);
+            AlertEvent event = openEvent(5_000);
+            suppression.when(() -> NotificationSuppression.decision(
+                    any(AlertEvent.class), any(Instant.class)))
+                    .thenReturn(NotificationSuppression.Decision.SUPPRESS);
+            alertRepository.when(() -> AlertEventRepository.setAlertEventSuppressed(EVENT_ID, true))
+                    .thenThrow(new RuntimeException("suppression state write unavailable"));
+
+            runPass(event);
+            assertNothingSent();
+
+            suppression.when(() -> NotificationSuppression.decision(
+                    any(AlertEvent.class), any(Instant.class)))
+                    .thenReturn(NotificationSuppression.Decision.ALLOW);
+            runPass(event);
+
+            assertSentOnceTo(1);
+        }
+
+        @Test
+        @DisplayName("a stale queued entry task refreshes the consumed durable latch")
+        void staleQueuedEntryTaskCannotDuplicateTheNotification() {
+            action(1, null, null);
+            AlertEvent persisted = openEvent(5_000);
+            persisted.setSuppressed(true);
+            dispatchLogRepository.when(() -> ActionDispatchLogRepository
+                    .insertActionDispatchLog(any(ActionDispatchLog.class)))
+                    .thenAnswer(invocation -> {
+                        existingRows.add(invocation.getArgument(0));
+                        return null;
+                    });
+
+            runPass(persisted);
+
+            AlertEvent staleQueued = openEvent(5_000);
+            staleQueued.setSuppressed(true);
+            alertRepository.when(() -> AlertEventRepository.getAlertEvent(EVENT_ID))
+                    .thenReturn(persisted);
+            runQueuedPass(staleQueued);
+
+            assertSentOnceTo(1);
         }
     }
 
@@ -334,19 +540,48 @@ class ActionDispatcherRepeatTest {
             event.setAcknowledgedBy(42);
             runPass(event);
             assertNothingSent();
+            alertRepository.verify(() -> AlertEventRepository.setProblemPending(EVENT_ID, false));
         }
 
         @Test
-        @DisplayName("a suppressed alert produces nothing, including a first send")
-        void suppressedIsFullySilent() {
-            // The no-rows-yet rule would otherwise deliver a "first"
-            // notification for an alert born under a maintenance window —
-            // through the one path that skips the at-creation suppression.
+        @DisplayName("a pending problem with no enabled actions reaches a final outcome")
+        void noActionsCompletesProblemOutbox() {
+            AlertEvent event = openEvent(5_000);
+
+            runPass(event);
+
+            assertNothingSent();
+            alertRepository.verify(() -> AlertEventRepository.setProblemPending(EVENT_ID, false));
+        }
+
+        @Test
+        @DisplayName("current policy suppression produces nothing, including a first send")
+        void currentPolicySuppressionIsFullySilent() {
             action(1, 600, null);
             AlertEvent event = openEvent(5_000);
-            event.setSuppressed(true);
+            suppression.when(() -> NotificationSuppression.decision(
+                    any(AlertEvent.class), any(Instant.class)))
+                    .thenReturn(NotificationSuppression.Decision.SUPPRESS);
             runPass(event);
             assertNothingSent();
+            alertRepository.verify(() -> AlertEventRepository.setAlertEventSuppressed(EVENT_ID, true));
+        }
+
+        @Test
+        @DisplayName("suppression is rechecked before each actual action attempt")
+        void policyChangeDuringFanoutStopsLaterAttempt() {
+            action(1, 600, null);
+            action(2, 600, null);
+            suppression.when(() -> NotificationSuppression.decision(
+                    any(AlertEvent.class), any(Instant.class)))
+                    .thenReturn(NotificationSuppression.Decision.ALLOW,
+                            NotificationSuppression.Decision.ALLOW,
+                            NotificationSuppression.Decision.ALLOW,
+                            NotificationSuppression.Decision.SUPPRESS);
+
+            runPass(openEvent(5_000));
+
+            assertSentOnceTo(1);
         }
 
         @Test
@@ -373,6 +608,7 @@ class ActionDispatcherRepeatTest {
             source.setEscalateAfterSeconds(600);
             source.setEscalateToActionId(2);
             action(2, null, null);
+            row(1, 30L, true);
 
             runPass(openEvent(1_000));
             assertSentOnceTo(2);
@@ -385,6 +621,8 @@ class ActionDispatcherRepeatTest {
             source.setEscalateAfterSeconds(2_000);
             source.setEscalateToActionId(2);
             action(2, null, null);
+            row(1, 30L, true);
+            row(2, 30L, true);
 
             runPass(openEvent(1_000));
             assertNothingSent();
@@ -401,6 +639,7 @@ class ActionDispatcherRepeatTest {
             source.setEscalateAfterSeconds(600);
             source.setEscalateToActionId(2);
             action(2, null, null);
+            row(1, 30L, true);
             row(2, 30L, true);
 
             runPass(openEvent(1_000));
@@ -418,6 +657,7 @@ class ActionDispatcherRepeatTest {
             source.setEscalateAfterSeconds(600);
             source.setEscalateToActionId(2);
             action(2, 300, null);
+            row(1, 30L, true);
 
             runPass(openEvent(1_000));
             assertSentOnceTo(2);
@@ -432,6 +672,7 @@ class ActionDispatcherRepeatTest {
             Action source = action(1, null, null);
             source.setEscalateAfterSeconds(600);
             source.setEscalateToActionId(1);
+            row(1, 30L, true);
 
             runPass(openEvent(5_000));
             assertNothingSent();

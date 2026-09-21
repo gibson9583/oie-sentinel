@@ -97,12 +97,62 @@ public final class AlertEventRepository {
 
     /** Resolve only a still-open row, leaving acknowledgement ownership intact. */
     public static boolean resolveAlertEvent(AlertEvent event) {
+        event.setResolutionPending(true);
         return conditionalUpdate("resolveAlertEvent", event);
     }
 
     /** Manual resolution stamps acknowledgement only if nobody has already claimed it. */
     public static boolean resolveAlertEventManually(AlertEvent event) {
+        event.setResolutionPending(true);
         return conditionalUpdate("resolveAlertEventManually", event);
+    }
+
+    /** Updates the latest dispatch-time policy snapshot. */
+    public static void setAlertEventSuppressed(long id, boolean suppressed) {
+        setDispatchFlag("setAlertEventSuppressed", id, "suppressed", suppressed);
+    }
+
+    /** Completes or retries the durable problem edge. */
+    public static void setProblemPending(long id, boolean pending) {
+        setDispatchFlag("setProblemPending", id, "problemPending", pending);
+    }
+
+    /** Completes or retries the durable resolution edge. */
+    public static void setResolutionPending(long id, boolean pending) {
+        setDispatchFlag("setResolutionPending", id, "resolutionPending", pending);
+    }
+
+    private static void setDispatchFlag(String statement, long id, String flag, boolean value) {
+        try {
+            SqlConfig.getInstance().getSqlSessionManager().update(
+                    stmt(statement), Map.of("id", id, flag, value));
+        } catch (Exception e) {
+            log.error("Failed {} for alert event {}", statement, id, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    public static List<AlertEvent> listPendingProblemAlertEvents() {
+        return listPending("listPendingProblemAlertEvents");
+    }
+
+    public static List<AlertEvent> listPendingResolvedAlertEvents() {
+        return listPending("listPendingResolvedAlertEvents");
+    }
+
+    private static List<AlertEvent> listPending(String statement) {
+        try {
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt(statement));
+            List<AlertEvent> events = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                events.add(buildAlertEvent(row));
+            }
+            return events;
+        } catch (Exception e) {
+            log.error("Failed {}", statement, e);
+            throw new RepositoryException(e);
+        }
     }
 
     private static boolean conditionalUpdate(String statement, AlertEvent event) {
@@ -286,6 +336,11 @@ public final class AlertEventRepository {
         return ChunkedDelete.run(stmt("deleteResolvedAlertEventsOlderThan"), cutoff, "resolved alert events");
     }
 
+    public static int deleteResolvedAlertEventsOlderThan(Instant cutoff, LeaseFence fence) {
+        return ChunkedDelete.run(
+                stmt("deleteResolvedAlertEventsOlderThan"), cutoff, "resolved alert events", fence);
+    }
+
     // ========== Map <-> DTO Conversion ==========
 
     /**
@@ -308,6 +363,8 @@ public final class AlertEventRepository {
         params.put("ack_comment", event.getAckComment());
         params.put("details_json", event.getDetailsJson());
         params.put("suppressed", event.isSuppressed());
+        params.put("problem_pending", event.isProblemPending());
+        params.put("resolution_pending", event.isResolutionPending());
         return params;
     }
 
@@ -321,6 +378,7 @@ public final class AlertEventRepository {
     private static Map<String, Object> toUpdateParams(AlertEvent event) {
         Map<String, Object> params = new HashMap<>();
         params.put("id", event.getId());
+        params.put("resolution_pending", event.isResolutionPending());
         params.put("status", event.getStatus() != null ? event.getStatus().name() : null);
         params.put("resolved_time", toTimestamp(event.getResolvedTime()));
         params.put("acknowledged_by", event.getAcknowledgedBy());
@@ -434,6 +492,8 @@ public final class AlertEventRepository {
         event.setAckComment((String) row.get("ack_comment"));
         event.setDetailsJson((String) row.get("details_json"));
         event.setSuppressed(toBoolean(row.get("suppressed")));
+        event.setProblemPending(toBoolean(row.get("problem_pending")));
+        event.setResolutionPending(toBoolean(row.get("resolution_pending")));
 
         return event;
     }

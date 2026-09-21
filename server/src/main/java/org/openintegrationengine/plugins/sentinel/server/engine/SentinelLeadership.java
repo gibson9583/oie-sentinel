@@ -6,8 +6,13 @@
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
-import java.util.UUID;
+import java.util.HexFormat;
+import java.util.Set;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -16,8 +21,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.mirth.connect.server.controllers.ConfigurationController;
+import com.mirth.connect.server.controllers.ControllerFactory;
+import com.mirth.connect.server.controllers.EngineController;
+import com.mirth.connect.donkey.server.channel.Channel;
 
 import org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.shared.model.NodeLease;
 
 /**
@@ -46,15 +55,13 @@ import org.openintegrationengine.plugins.sentinel.shared.model.NodeLease;
  * #LEASE_SECONDS} seconds and is renewed every {@value #HEARTBEAT_SECONDS} —
  * one third of it, so leadership survives two consecutive missed heartbeats
  * (a stalled query, a long GC pause, a brief database blip) before it lapses.
- * A lease that long is also comfortably wider than any clock skew a
- * time-synchronised cluster will show, which matters because the expiry
- * comparison uses the application's clock and not the database's — see
- * {@link NodeLeaseRepository#stealExpiredNodeLease}. The cost of the
+ * All expiry values and takeover comparisons use the database clock, so
+ * skew between engine nodes cannot create overlapping claims. The cost of the
  * generosity is failover latency: after an <em>unclean</em> stop a peer takes
  * over between {@value #LEASE_SECONDS}s (expiry) and
  * {@value #LEASE_SECONDS}s + {@value #HEARTBEAT_SECONDS}s (expiry plus its
  * next heartbeat) later. After a clean {@link #stopHeartbeat()} the lease is
- * deleted outright and a peer takes over within one heartbeat instead.</p>
+ * expired and fenced forward, and a peer takes over within one heartbeat.</p>
  *
  * <p>Nothing here is derived from the operator-configurable collector and
  * evaluator intervals, on purpose: failover latency is an availability
@@ -90,6 +97,9 @@ public final class SentinelLeadership {
      */
     private static final String LEASE_NAME = "sentinel-engine";
 
+    /** Namespace for per-node liveness leases consumed by connector-state union evaluation. */
+    private static final String PRESENCE_LEASE_PREFIX = "sentinel-presence-";
+
     /** Lease duration; see class Javadoc for why 90 and not less. */
     private static final int LEASE_SECONDS = 90;
 
@@ -97,11 +107,10 @@ public final class SentinelLeadership {
     private static final int HEARTBEAT_SECONDS = 30;
 
     /**
-     * How long before the written expiry this node stops considering itself
-     * leader. Closes the window in which a slow clock could let this node
-     * still believe it leads while a peer's faster clock already sees the
-     * lease as expired and steals it: this node gives up {@value} seconds
-     * early, so the two beliefs cannot overlap under skew smaller than that.
+     * How long before the written expiry this node stops trusting its cached
+     * claim. Expiry itself is decided solely by the database clock; this
+     * margin covers scheduling and timestamp precision while the monotonic
+     * deadline also charges all time spent reading and writing the claim.
      */
     private static final int LEASE_SAFETY_MARGIN_SECONDS = 5;
 
@@ -117,6 +126,9 @@ public final class SentinelLeadership {
      * for the same node. See {@link #resolveNodeId()}.
      */
     private static final String NODE_ID = resolveNodeId();
+
+    /** Stable bounded lease key for this node's liveness row. */
+    private static final String PRESENCE_LEASE_NAME = presenceLeaseName(NODE_ID);
 
     /**
      * Set by {@link #startHeartbeat()} and never cleared — a one-way latch, not
@@ -139,18 +151,29 @@ public final class SentinelLeadership {
     private static volatile boolean leadershipEngaged;
 
     /**
-     * The instant this node stops trusting its own leadership, or {@code null}
-     * when it holds no claim at all. Set from the expiry written to the row,
-     * less {@link #LEASE_SAFETY_MARGIN_SECONDS}.
+     * Monotonic deadline after which this node stops trusting its own
+     * leadership. Zero means it holds no local claim. Derived from the same
+     * duration the database adds to its own clock, less
+     * {@link #LEASE_SAFETY_MARGIN_SECONDS}.
      *
-     * <p>Storing an instant rather than a boolean is what keeps a cached answer
+     * <p>Storing a monotonic deadline rather than a boolean is what keeps a cached answer
      * honest. {@link NodeLeaseRepository} warns that a node which stalls long
      * enough loses its lease without being told; because leadership here is
      * time-bounded by the very expiry this node last wrote, a heartbeat that
      * stops running expires the local claim on the same schedule a peer becomes
      * able to steal it, with no database round trip on the job path.</p>
      */
-    private static volatile Instant leadershipValidUntil;
+    private static volatile long leadershipValidUntilNanos;
+
+    /** Current fencing epoch, or null while this node holds no managed claim. */
+    private static volatile Long leadershipEpoch;
+
+    /**
+     * Advances on every start and stop. A heartbeat captures its generation,
+     * so a JDBC call that ignores interruption cannot mutate a later
+     * lifecycle's cached claim when it eventually returns.
+     */
+    private static volatile long lifecycleGeneration;
 
     /** The heartbeat thread, or {@code null} whenever the plugin is stopped. */
     private static volatile ScheduledExecutorService heartbeatExecutor;
@@ -162,7 +185,7 @@ public final class SentinelLeadership {
      * <p>The pass that matters is the straggler: one already inside a database
      * call when shutdown began, which outlives the short wait for the heartbeat
      * thread to finish. Without this flag its renewal would find the row
-     * {@link #standDown()} had just deleted, read that as "lost the lease", and
+     * {@link #standDown()} had just expired, read that as "lost the lease", and
      * helpfully insert a fresh one — parking leadership on a node that is
      * shutting down for a full lease duration, which is precisely the outcome
      * releasing the lease exists to avoid.</p>
@@ -189,11 +212,45 @@ public final class SentinelLeadership {
      * @return whether this node should do the work of the tick
      */
     public static boolean isLeader() {
+        return captureFence() != null;
+    }
+
+    /**
+     * Returns this JVM's stable Sentinel node identity. Connector-state rows,
+     * dashboard diagnostics and Prometheus labels all use this exact value so
+     * operators can correlate them with leadership log messages.
+     */
+    public static String nodeId() {
+        return NODE_ID;
+    }
+
+    /** Captures the exact lease epoch a job must carry through its writes. */
+    public static LeaseFence captureFence() {
         if (!leadershipEngaged) {
-            return true;
+            return LeaseFence.unmanaged();
         }
-        Instant validUntil = leadershipValidUntil;
-        return validUntil != null && Instant.now().isBefore(validUntil);
+        Long epoch = leadershipEpoch;
+        return epoch != null && leadershipValidUntilNanos - System.nanoTime() > 0
+                ? new LeaseFence(LEASE_NAME, NODE_ID, epoch)
+                : null;
+    }
+
+    /** Cheap local re-check used between independent work units. */
+    public static boolean holdsFence(LeaseFence fence) {
+        if (fence == null) {
+            return false;
+        }
+        if (!fence.isManaged()) {
+            return !leadershipEngaged;
+        }
+        Long current = leadershipEpoch;
+        return current != null && current.equals(fence.epoch())
+                && leadershipValidUntilNanos - System.nanoTime() > 0;
+    }
+
+    /** Re-checks the captured epoch and expiry against the database clock. */
+    public static boolean recheckFence(LeaseFence fence) {
+        return holdsFence(fence) && NodeLeaseRepository.isFenceCurrent(fence);
     }
 
     /**
@@ -233,6 +290,7 @@ public final class SentinelLeadership {
         // Cleared here rather than at the end of stopHeartbeat, so a straggling
         // pass from the previous run cannot slip through between the two.
         standingDown = false;
+        long generation = ++lifecycleGeneration;
 
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "sentinel-leadership");
@@ -241,9 +299,9 @@ public final class SentinelLeadership {
         });
         heartbeatExecutor = executor;
 
-        heartbeat();
+        heartbeat(generation);
 
-        executor.scheduleAtFixedRate(SentinelLeadership::heartbeat,
+        executor.scheduleAtFixedRate(() -> heartbeat(generation),
                 HEARTBEAT_SECONDS, HEARTBEAT_SECONDS, TimeUnit.SECONDS);
     }
 
@@ -254,7 +312,7 @@ public final class SentinelLeadership {
      *
      * <p>The heartbeat thread is stopped first and the lease released second,
      * so a pass already in flight cannot renew the row a moment after it was
-     * deleted and strand leadership on a node that is shutting down.</p>
+     * released and strand leadership on a node that is shutting down.</p>
      *
      * <p>Never throws: {@code stop()} runs during server shutdown or redeploy,
      * where an exception could disrupt the rest of the extension teardown, and
@@ -262,6 +320,7 @@ public final class SentinelLeadership {
      */
     public static synchronized void stopHeartbeat() {
         standingDown = true;
+        lifecycleGeneration++;
 
         ScheduledExecutorService executor = heartbeatExecutor;
         heartbeatExecutor = null;
@@ -283,6 +342,7 @@ public final class SentinelLeadership {
         }
 
         standDown();
+        releaseNodePresence();
     }
 
     /**
@@ -290,20 +350,21 @@ public final class SentinelLeadership {
      * rather than waiting out the full expiry — the difference between a
      * rolling restart costing seconds of monitoring and costing minutes.
      *
-     * <p>Clears the local claim before the delete, so no straggling caller can
-     * read {@code true} from {@link #isLeader()} between the two. The delete is
-     * conditional on {@code node_id}, so a node that had already lost the lease
-     * cannot take it away from whoever holds it now — that case simply reports
-     * nothing to release.</p>
+     * <p>Clears the local claim before the release, so no straggling caller can
+     * read {@code true} from {@link #isLeader()} between the two. Release
+     * atomically expires the row and increments its epoch; retaining the row
+     * prevents a later insert from reusing epoch one. It is conditional on both
+     * holder and epoch, so a stale node cannot disturb the current claim.</p>
      */
     private static void standDown() {
-        if (leadershipValidUntil == null) {
+        Long epoch = leadershipEpoch;
+        if (epoch == null) {
             return;
         }
-        leadershipValidUntil = null;
+        clearLocalClaim();
 
         try {
-            if (NodeLeaseRepository.deleteNodeLease(LEASE_NAME, NODE_ID)) {
+            if (NodeLeaseRepository.releaseNodeLease(LEASE_NAME, NODE_ID, epoch)) {
                 log.info("Sentinel node {} stood down and released the '{}' leader lease; a peer can take "
                                 + "over within {}s instead of waiting out the {}s expiry",
                         NODE_ID, LEASE_NAME, HEARTBEAT_SECONDS, LEASE_SECONDS);
@@ -317,6 +378,21 @@ public final class SentinelLeadership {
         }
     }
 
+    /** Expires this node's union-membership row on an orderly stop. */
+    private static void releaseNodePresence() {
+        try {
+            NodeLease presence = NodeLeaseRepository.getNodeLease(PRESENCE_LEASE_NAME);
+            if (presence != null && NODE_ID.equals(presence.getNodeId())
+                    && presence.getLeaseEpoch() != null) {
+                NodeLeaseRepository.releaseNodeLease(
+                        PRESENCE_LEASE_NAME, NODE_ID, presence.getLeaseEpoch());
+            }
+        } catch (Throwable t) {
+            log.warn("Sentinel node {} could not release its connector-state presence; it expires within {}s",
+                    NODE_ID, LEASE_SECONDS, t);
+        }
+    }
+
     /**
      * One heartbeat pass: renew the lease if this node holds it, otherwise try
      * to take it.
@@ -324,58 +400,128 @@ public final class SentinelLeadership {
      * <p>A failed renewal is not treated as an error. It means another node
      * holds the lease now — this node stalled past its expiry and was taken
      * over — so it stands down and falls through to the acquisition path in the
-     * same pass. That fall-through also covers the recovery case where the row
-     * was deleted out from under a live leader: the renewal matches nothing and
-     * the insert immediately re-establishes it.</p>
+     * same pass. That fall-through also covers a lease row removed manually:
+     * the renewal matches nothing and the insert immediately re-establishes it.</p>
      *
      * <p>Any failure to reach the database deliberately leaves
-     * {@link #leadershipValidUntil} untouched rather than standing down. A
+     * the cached monotonic deadline untouched rather than standing down. A
      * transient blip must not trigger a failover, and it cannot cause a split
      * either: the claim is already time-bounded, so if the outage outlasts the
      * lease this node stops leading at almost exactly the moment a peer becomes
      * able to take over.</p>
      *
-     * <p>Both {@link #standingDown} checks are deliberate: the first turns a
-     * pass that was already queued when shutdown began into a no-op, the second
-     * stops a pass that was mid-renewal from re-acquiring the lease
-     * {@link #standDown()} has just released.</p>
+     * <p>Generation checks surround every blocking call and are repeated
+     * atomically with each local state mutation. They turn queued passes into
+     * no-ops and prevent a pass from an earlier start/stop lifecycle from
+     * clearing or replacing the restarted heartbeat's claim.</p>
      */
-    private static void heartbeat() {
-        if (standingDown) {
+    static void heartbeat(long generation) {
+        if (!isCurrentGeneration(generation)) {
             return;
         }
 
-        Instant now = Instant.now();
-        Instant expires = now.plusSeconds(LEASE_SECONDS);
-        Instant previousValidUntil = leadershipValidUntil;
+        Long previousEpoch = leadershipEpoch;
 
         try {
-            if (previousValidUntil != null) {
-                if (NodeLeaseRepository.renewNodeLease(LEASE_NAME, NODE_ID, expires)) {
-                    if (previousValidUntil.isBefore(now)) {
+            long databaseClockReadStarted = System.nanoTime();
+            Instant databaseNow = NodeLeaseRepository.getDatabaseTime();
+            if (!isCurrentGeneration(generation)) {
+                return;
+            }
+            heartbeatNodePresence(databaseNow, generation);
+            if (!isCurrentGeneration(generation)) {
+                return;
+            }
+            if (previousEpoch != null) {
+                boolean locallyLapsed = leadershipValidUntilNanos - System.nanoTime() <= 0;
+                boolean renewed = NodeLeaseRepository.renewNodeLease(
+                        LEASE_NAME, NODE_ID, previousEpoch, LEASE_SECONDS);
+                if (!isCurrentGeneration(generation)) {
+                    return;
+                }
+                if (renewed) {
+                    if (locallyLapsed) {
                         log.warn("Sentinel node {} renewed the '{}' leader lease after its local validity had "
-                                        + "already lapsed at {}; the background jobs skipped their ticks in "
+                                        + "already lapsed; the background jobs skipped their ticks in "
                                         + "that gap. A heartbeat that late means a stalled database or a long "
                                         + "GC pause on this node.",
-                                NODE_ID, LEASE_NAME, previousValidUntil);
+                                NODE_ID, LEASE_NAME);
                     }
-                    leadershipValidUntil = expires.minusSeconds(LEASE_SAFETY_MARGIN_SECONDS);
+                    if (!cacheClaimIfCurrent(previousEpoch, databaseClockReadStarted, generation)) {
+                        return;
+                    }
                     return;
                 }
 
-                leadershipValidUntil = null;
+                if (!clearClaimIfCurrent(previousEpoch, generation)) {
+                    return;
+                }
                 log.info("Sentinel node {} lost the '{}' leader lease; its collector, evaluator, rollup and "
                         + "retention prune stand down until it wins the lease back", NODE_ID, LEASE_NAME);
             }
 
-            if (standingDown) {
+            if (!isCurrentGeneration(generation)) {
                 return;
             }
-            acquire(now, expires);
+            acquire(databaseNow, databaseClockReadStarted, generation);
         } catch (Throwable t) {
             log.warn("Sentinel node {} could not reach the '{}' leader lease; retrying in {}s. Leadership is "
                             + "not surrendered here — it simply lapses when the lease this node last wrote "
                             + "expires.", NODE_ID, LEASE_NAME, HEARTBEAT_SECONDS, t);
+        }
+    }
+
+    /**
+     * Maintains a separate database-clock lease for this node's membership in
+     * the connector-state union. Unlike the exclusive leader row, every node
+     * owns one presence row. A clean stop expires it immediately; a crash
+     * removes the node from evaluation when the ordinary lease duration lapses.
+     */
+    private static void heartbeatNodePresence(Instant databaseNow, long generation) {
+        EngineController engine = ControllerFactory.getFactory().createEngineController();
+        Set<String> deployed = engine.getDeployedIds();
+        if (deployed == null) {
+            throw new IllegalStateException("Local deployment inventory is unavailable");
+        }
+        deployed = Set.copyOf(deployed);
+        Map<String, NodeLeaseRepository.ChannelDeployment> inventory = new HashMap<>();
+        for (String channelId : deployed) {
+            Channel channel = engine.getDeployedChannel(channelId);
+            if (channel == null || channel.getMetaDataIds() == null || channel.getDeployDate() == null) {
+                throw new IllegalStateException("Runtime connector inventory is unavailable for " + channelId);
+            }
+            Set<Integer> metadataIds = Set.copyOf(channel.getMetaDataIds());
+            if (metadataIds.isEmpty()) {
+                throw new IllegalStateException("Deployed channel has no runtime connector inventory: " + channelId);
+            }
+            inventory.put(channelId, new NodeLeaseRepository.ChannelDeployment(metadataIds, channel.getDeployDate().toInstant()));
+        }
+        if (!deployed.equals(engine.getDeployedIds())) {
+            throw new IllegalStateException("Deployment inventory changed while reading connector identities");
+        }
+        if (!isCurrentGeneration(generation)) {
+            return;
+        }
+        if (NodeLeaseRepository.refreshNodePresence(PRESENCE_LEASE_NAME, NODE_ID, LEASE_SECONDS,
+                inventory, () -> isCurrentGeneration(generation))) {
+            releasePresenceWrittenByStalePass(generation);
+        }
+    }
+
+    /**
+     * Cleans up a presence write that completed after this lifecycle stopped.
+     * The class monitor serializes the decision with a possible restart: if a
+     * newer lifecycle already began, it deliberately adopts the same stable
+     * presence row; otherwise the stale pass expires it before returning.
+     */
+    private static void releasePresenceWrittenByStalePass(long generation) {
+        if (isCurrentGeneration(generation)) {
+            return;
+        }
+        synchronized (SentinelLeadership.class) {
+            if (!isCurrentGeneration(generation) && standingDown) {
+                releaseNodePresence();
+            }
         }
     }
 
@@ -386,8 +532,8 @@ public final class SentinelLeadership {
      * attempt; it never decides the outcome. {@link NodeLeaseRepository} warns
      * against read-then-act, and rightly so — but every branch below still
      * carries its precondition into the database (a primary key for the insert,
-     * {@code expires_time <} now for the takeover, {@code node_id} for the
-     * renewal), so a read that is already stale by the time it is acted on
+     * database-clock expiry plus the observed epoch for the takeover, and
+     * holder plus epoch for renewal), so a read that is already stale when acted on
      * costs a wasted round trip and nothing more. It is the row count, not the
      * read, that grants leadership.</p>
      *
@@ -396,31 +542,23 @@ public final class SentinelLeadership {
      * provoking a key violation — and a vendor error-log entry — every
      * {@value #HEARTBEAT_SECONDS} seconds for as long as it runs.</p>
      *
-     * @param now     this pass's clock reading, also the takeover's expiry comparison point
-     * @param expires the expiry to write if this node wins
+     * @param now     this pass's database-clock snapshot, used only to avoid
+     *                speculative takeover attempts against a visibly live row
+     * @param generation lifecycle generation this heartbeat belongs to
      */
-    private static void acquire(Instant now, Instant expires) {
+    private static void acquire(Instant now, long databaseClockReadStarted, long generation) {
         NodeLease current = NodeLeaseRepository.getNodeLease(LEASE_NAME);
+        if (!isCurrentGeneration(generation)) {
+            return;
+        }
 
         if (current == null) {
             NodeLease claim = new NodeLease();
             claim.setLeaseName(LEASE_NAME);
             claim.setNodeId(NODE_ID);
-            claim.setAcquiredTime(now);
-            claim.setExpiresTime(expires);
-            if (NodeLeaseRepository.insertNodeLease(claim)) {
-                becomeLeader(expires, null);
-            }
-            return;
-        }
-
-        if (NODE_ID.equals(current.getNodeId())) {
-            // This node's own lease, left behind by an unclean stop — the node
-            // id is stable across restarts, so nobody else can be holding it.
-            // Renewing rather than waiting out the expiry is what makes a
-            // single-node restart resume monitoring immediately.
-            if (NodeLeaseRepository.renewNodeLease(LEASE_NAME, NODE_ID, expires)) {
-                becomeLeader(expires, NODE_ID);
+            claim.setLeaseEpoch(1L);
+            if (NodeLeaseRepository.insertNodeLease(claim, LEASE_SECONDS)) {
+                becomeLeader(claim.getLeaseEpoch(), null, databaseClockReadStarted, generation);
             }
             return;
         }
@@ -432,8 +570,14 @@ public final class SentinelLeadership {
             return;
         }
 
-        if (NodeLeaseRepository.stealExpiredNodeLease(LEASE_NAME, NODE_ID, now, expires, now)) {
-            becomeLeader(expires, current.getNodeId());
+        Long currentEpoch = current.getLeaseEpoch();
+        if (currentEpoch == null) {
+            log.error("Sentinel lease '{}' has no fencing epoch; refusing an unsafe takeover", LEASE_NAME);
+            return;
+        }
+        if (NodeLeaseRepository.stealExpiredNodeLease(
+                LEASE_NAME, NODE_ID, currentEpoch, LEASE_SECONDS)) {
+            becomeLeader(currentEpoch + 1L, current.getNodeId(), databaseClockReadStarted, generation);
         }
     }
 
@@ -443,13 +587,26 @@ public final class SentinelLeadership {
      * it must be answerable from the log of a node that has since been
      * restarted.
      *
-     * @param expires        the expiry just written to the row
+     * @param epoch          the exact epoch just written
      * @param previousHolder the node the lease was taken from, this node's own
      *                       id when reclaiming after a restart, or {@code null}
      *                       when the lease had never been held
      */
-    private static void becomeLeader(Instant expires, String previousHolder) {
-        leadershipValidUntil = expires.minusSeconds(LEASE_SAFETY_MARGIN_SECONDS);
+    private static void becomeLeader(long epoch, String previousHolder,
+            long databaseClockReadStarted, long generation) {
+        boolean releaseInstead;
+        synchronized (SentinelLeadership.class) {
+            releaseInstead = !isCurrentGeneration(generation);
+            if (!releaseInstead) {
+                cacheClaim(epoch, databaseClockReadStarted);
+            }
+        }
+
+        if (releaseInstead) {
+            NodeLeaseRepository.releaseNodeLease(LEASE_NAME, NODE_ID, epoch);
+            log.info("Sentinel node {} released the '{}' leader lease won during shutdown", NODE_ID, LEASE_NAME);
+            return;
+        }
 
         if (previousHolder == null) {
             log.info("Sentinel node {} acquired the previously unheld '{}' leader lease; this node now runs "
@@ -466,6 +623,45 @@ public final class SentinelLeadership {
         }
     }
 
+    private static void cacheClaim(long epoch, long databaseClockReadStarted) {
+        long trustedMillis = TimeUnit.SECONDS.toMillis(
+                LEASE_SECONDS - LEASE_SAFETY_MARGIN_SECONDS);
+        leadershipEpoch = epoch;
+        leadershipValidUntilNanos = databaseClockReadStarted
+                + TimeUnit.MILLISECONDS.toNanos(trustedMillis);
+    }
+
+    private static boolean cacheClaimIfCurrent(long epoch, long databaseClockReadStarted,
+            long generation) {
+        synchronized (SentinelLeadership.class) {
+            if (!isCurrentGeneration(generation)) {
+                return false;
+            }
+            cacheClaim(epoch, databaseClockReadStarted);
+            return true;
+        }
+    }
+
+    private static boolean clearClaimIfCurrent(long expectedEpoch, long generation) {
+        synchronized (SentinelLeadership.class) {
+            if (!isCurrentGeneration(generation)
+                    || leadershipEpoch == null || leadershipEpoch.longValue() != expectedEpoch) {
+                return false;
+            }
+            clearLocalClaim();
+            return true;
+        }
+    }
+
+    private static void clearLocalClaim() {
+        leadershipEpoch = null;
+        leadershipValidUntilNanos = 0L;
+    }
+
+    private static boolean isCurrentGeneration(long generation) {
+        return !standingDown && lifecycleGeneration == generation;
+    }
+
     /**
      * Derives this node's identity, preferring the engine's own server id.
      *
@@ -477,25 +673,38 @@ public final class SentinelLeadership {
      * event name the same node with the same string, which is what makes the
      * two logs correlatable during an incident.</p>
      *
-     * <p>The fallback is hostname plus a random suffix. The suffix is the
-     * load-bearing half: a hostname alone cannot tell two engine JVMs on one
-     * host apart, and two nodes sharing a node id would each happily renew the
-     * other's lease and both collect. Being random it changes on every restart,
-     * which costs only the reclaim path above — the old lease is then waited
-     * out rather than renewed.</p>
+     * <p>The fallback is hostname plus a digest of the engine's application
+     * data directory (or process working directory if even that controller
+     * property is unavailable). It is stable across restarts while still
+     * distinguishing two engine installations on one host. Stability is now
+     * load-bearing because connector-state rows carry this identity.</p>
      *
      * <p>Resolved once into a {@code static final}: it is read on the class's
      * first use, which is the plugin start that runs well after the engine's
      * controllers are up.</p>
      */
     private static String resolveNodeId() {
+        ConfigurationController controller = null;
+        String stableLocation = System.getProperty("user.dir", "unknown-directory");
         try {
-            String serverId = ConfigurationController.getInstance().getServerId();
+            controller = ConfigurationController.getInstance();
+            String serverId = controller.getServerId();
             if (serverId != null && !serverId.isBlank()) {
                 return truncate(serverId.trim());
             }
         } catch (Throwable t) {
             log.debug("Engine server id unavailable; deriving the Sentinel node id from the host instead", t);
+        }
+
+        if (controller != null) {
+            try {
+                String appData = controller.getApplicationDataDir();
+                if (appData != null && !appData.isBlank()) {
+                    stableLocation = appData.trim();
+                }
+            } catch (Throwable t) {
+                log.debug("Engine application-data directory unavailable for Sentinel node identity", t);
+            }
         }
 
         String host;
@@ -504,12 +713,35 @@ public final class SentinelLeadership {
         } catch (Throwable t) {
             host = "unknown-host";
         }
-        String nodeId = truncate(host + "-" + UUID.randomUUID().toString().substring(0, 8));
+        String nodeId = fallbackNodeId(host, stableLocation);
 
-        log.warn("The engine reported no server id, so Sentinel identifies this node as '{}'. The random "
-                + "suffix keeps it distinct from any other engine JVM on this host, but it changes on "
-                + "every restart.", nodeId);
+        log.warn("The engine reported no server id, so Sentinel identifies this node as '{}'. The "
+                + "location digest keeps it stable across restarts and distinct from other engine "
+                + "installations on this host.", nodeId);
         return nodeId;
+    }
+
+    static String fallbackNodeId(String host, String stableLocation) {
+        String safeHost = host == null || host.isBlank() ? "unknown-host" : host.trim();
+        String locationDigest = stableDigest(stableLocation);
+        int hostLimit = NODE_ID_MAX_LENGTH - locationDigest.length() - 1;
+        String boundedHost = safeHost.length() <= hostLimit
+                ? safeHost : safeHost.substring(0, hostLimit);
+        return boundedHost + "-" + locationDigest;
+    }
+
+    private static String presenceLeaseName(String nodeId) {
+        return PRESENCE_LEASE_PREFIX + stableDigest(nodeId);
+    }
+
+    private static String stableDigest(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(String.valueOf(value).getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest, 0, 12);
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     /** Trims a derived id to what {@code sentinel_node_lease.node_id} accepts. */

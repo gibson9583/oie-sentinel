@@ -20,7 +20,7 @@ import java.time.Instant;
  * instead, which keeps the change confined to a lease lookup.</p>
  *
  * <p>The table holds one row per lease name, not one per node — the row's
- * existence with an unexpired {@link #getExpiresTime()} <em>is</em> the
+ * existence with an unexpired {@link #getExpiresTime()} and its fencing epoch <em>is</em> the
  * leadership claim, and the primary key on {@code lease_name} is what makes
  * acquisition atomic: two nodes racing to insert the same lease name means one
  * insert succeeds and the other hits the key violation and stands down. There
@@ -39,6 +39,7 @@ public class NodeLease {
     private String nodeId;
     private Instant acquiredTime;
     private Instant expiresTime;
+    private Long leaseEpoch;
 
     public NodeLease() {
     }
@@ -100,9 +101,9 @@ public class NodeLease {
      *
      * <p>The holder is expected to push this forward well before it arrives; a
      * heartbeat interval comfortably shorter than the lease duration is what
-     * keeps a slow tick from handing leadership away. Time is compared against
-     * values the application supplies, not the database's clock, so nodes must
-     * agree on the time to within much less than the lease duration.</p>
+     * keeps a slow tick from handing leadership away. All expiry comparisons
+     * use the database clock, so engine-node clock skew cannot grant two
+     * simultaneous claims.</p>
      *
      * @return the instant this lease stops being valid
      */
@@ -115,5 +116,18 @@ public class NodeLease {
      */
     public void setExpiresTime(Instant expiresTime) {
         this.expiresTime = expiresTime;
+    }
+
+    /**
+     * @return the monotonically increasing fencing token. Protected writes
+     *         must validate and lock this exact live epoch in their transaction
+     */
+    public Long getLeaseEpoch() {
+        return leaseEpoch;
+    }
+
+    /** @param leaseEpoch token advanced on every takeover or release */
+    public void setLeaseEpoch(Long leaseEpoch) {
+        this.leaseEpoch = leaseEpoch;
     }
 }

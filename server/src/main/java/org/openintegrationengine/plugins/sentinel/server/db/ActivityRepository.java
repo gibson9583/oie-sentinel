@@ -145,6 +145,10 @@ public final class ActivityRepository {
      *                             tick as unwritten
      */
     public static void insertActivitySamples(List<ActivitySample> samples) {
+        insertActivitySamples(samples, LeaseFence.unmanaged());
+    }
+
+    public static void insertActivitySamples(List<ActivitySample> samples, LeaseFence fence) {
         if (samples == null || samples.isEmpty()) {
             return;
         }
@@ -152,6 +156,9 @@ public final class ActivityRepository {
         SqlSession session = null;
         try {
             session = SqlConfig.getInstance().getSqlSessionManager().openSession(ExecutorType.BATCH, false);
+            if (!NodeLeaseRepository.lockFence(session, fence)) {
+                throw new IllegalStateException("Sentinel leadership fence changed before sample batch");
+            }
 
             for (ActivitySample sample : samples) {
                 session.insert(stmt("insertActivitySample"), toSampleColumnMap(sample));
@@ -159,6 +166,7 @@ public final class ActivityRepository {
 
             // Flushes the accumulated batch and commits it; under BATCH
             // nothing has reached the driver before this point.
+            NodeLeaseRepository.requireFence(session, fence);
             session.commit();
         } catch (Exception e) {
             log.error("Failed to insert batch of {} activity samples", samples.size(), e);
@@ -252,6 +260,10 @@ public final class ActivityRepository {
         return ChunkedDelete.run(stmt("deleteActivitySamplesOlderThan"), cutoff, "activity samples");
     }
 
+    public static int deleteActivitySamplesOlderThan(Instant cutoff, LeaseFence fence) {
+        return ChunkedDelete.run(stmt("deleteActivitySamplesOlderThan"), cutoff, "activity samples", fence);
+    }
+
     // ========== Activity Trend ==========
 
     /**
@@ -272,9 +284,16 @@ public final class ActivityRepository {
      *                             leaves the bucket merely deleted
      */
     public static void replaceActivityTrendForHour(ActivityTrend trend) {
+        replaceActivityTrendForHour(trend, LeaseFence.unmanaged());
+    }
+
+    public static void replaceActivityTrendForHour(ActivityTrend trend, LeaseFence fence) {
         SqlSession session = null;
         try {
             session = SqlConfig.getInstance().getSqlSessionManager().openSession(false);
+            if (!NodeLeaseRepository.lockFence(session, fence)) {
+                throw new IllegalStateException("Sentinel leadership fence changed before trend replacement");
+            }
 
             Map<String, Object> deleteParams = new HashMap<>();
             deleteParams.put("channelId", trend.getChannelId());
@@ -284,6 +303,7 @@ public final class ActivityRepository {
             Map<String, Object> insertParams = toTrendColumnMap(trend);
             session.insert(stmt("insertActivityTrend"), insertParams);
 
+            NodeLeaseRepository.requireFence(session, fence);
             session.commit();
         } catch (Exception e) {
             log.error("Failed to replace activity trend for channel {} hour {}",
@@ -365,6 +385,10 @@ public final class ActivityRepository {
      */
     public static int deleteActivityTrendOlderThan(Instant cutoff) {
         return ChunkedDelete.run(stmt("deleteActivityTrendOlderThan"), cutoff, "activity trend buckets");
+    }
+
+    public static int deleteActivityTrendOlderThan(Instant cutoff, LeaseFence fence) {
+        return ChunkedDelete.run(stmt("deleteActivityTrendOlderThan"), cutoff, "activity trend buckets", fence);
     }
 
     // ========== Map <-> DTO Conversion ==========
