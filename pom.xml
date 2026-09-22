@@ -28,7 +28,7 @@
 
         <mc.version>4.6.0</mc.version>
         <javax-servlet.version>4.0.1</javax-servlet.version>
-        <javax-rs-api.version>2.0.1</javax-rs-api.version>
+        <javax-rs-api.version>2.1.1</javax-rs-api.version>
         <log4j.version>2.17.2</log4j.version>
         <slf4j.version>1.7.32</slf4j.version>
         <!-- Pinned to the version the engine actually ships (server-lib/mybatis-3.1.1.jar).
