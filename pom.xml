@@ -36,7 +36,7 @@
              surfacing as NoSuchMethodError in production. -->
         <mybatis.version>3.1.1</mybatis.version>
         <!-- Pinned to the version the engine ships (server-lib/jackson/jackson-databind-2.14.3.jar). -->
-        <jackson.version>2.14.3</jackson.version>
+        <jackson.version>2.22</jackson.version>
         <!-- Quartz is bundled by the engine itself (used by the built-in DataPruner plugin) —
              declared provided here, not shaded into the plugin jar. -->
         <quartz.version>2.3.2</quartz.version>
