@@ -1,0 +1,7 @@
+{
+  "bundle": "package/target/sentinel-*.zip",
+  "jars": [
+    "sentinel/sentinel-server-*.jar",
+    "sentinel/sentinel-shared-*.jar"
+  ]
+}
