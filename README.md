@@ -333,7 +333,7 @@ oie-sentinel/
 See the [1.1.1 release notes](docs/releases/1.1.1.md), including the cluster upgrade instructions.
 
 ```bash
-git tag v1.1.1 && git push origin v1.1.1
+git tag v1.1.2 && git push origin v1.1.2
 ```
 
 The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
