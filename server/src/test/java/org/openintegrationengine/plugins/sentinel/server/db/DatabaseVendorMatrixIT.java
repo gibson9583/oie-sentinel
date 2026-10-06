@@ -51,6 +51,9 @@ class DatabaseVendorMatrixIT {
                             DatabaseMatrixSupport.verifyUpgradeFrom(database, sourceVersion)));
             IntStream.rangeClosed(8, 10).forEach((target) -> scenarios.add(() ->
                     DatabaseMatrixSupport.verifyInterruptedMigration(database, target)));
+            if ("oracle".equals(vendor)) {
+                scenarios.add(() -> OracleInstallationRegressionTest.verifyOracleInstallation(database));
+            }
             scenarios.add(() -> MapperStatementMatrix.verifyAll(database));
             scenarios.add(() -> DatabaseMatrixSupport.verifyUninstallRestartReinstall(database));
             assertAll(vendor + " database compatibility scenarios", scenarios);

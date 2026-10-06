@@ -298,6 +298,9 @@ Without an authorization plugin installed, the engine permits everything.
 
 ## Build
 
+For the Oracle 19c startup error `ORA-00907` in Sentinel 1.1.0, see the
+[Oracle installation recovery guide](docs/oracle-installation.md).
+
 Requires **JDK 21+** (the 4.6.0 engine jars are Java 21 bytecode; the plugin itself targets
 `--release 17`). On a fresh machine or wiped `~/.m2`, first install the 4.6.0 engine jars into the
 local Maven repository (the public repsy mirror does not carry every engine version) — the engine
