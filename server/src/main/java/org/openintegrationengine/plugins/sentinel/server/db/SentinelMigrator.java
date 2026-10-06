@@ -100,6 +100,7 @@ import org.slf4j.LoggerFactory;
  *   <li><b>10</b> — Durable problem dispatch outbox, backfilled for open events.</li>
  *   <li><b>11</b> — Per-node deployed-channel inventory for cluster-wide evaluation.</li>
  *   <li><b>13</b> — Durable channel-maintenance request identities.</li>
+ *   <li><b>14</b> — Nullable delivery context snapshots and paging index.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
  * </ul>
  * <p>Versions 7–12 are this release's sequence after released schema v6.
@@ -120,7 +121,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 13;
+    public static final int LATEST_VERSION = 14;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -201,6 +202,7 @@ public class SentinelMigrator extends Migrator {
             applyV12();
         }
         if (current < 13 && targetVersion >= 13) { applyV13(); }
+        if (current < 14 && targetVersion >= 14) { applyV14(); }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -291,7 +293,7 @@ public class SentinelMigrator extends Migrator {
                                         "problem_pending, status, opened_time")
                                 ? (tableExists("sentinel_channel_presence")
                                         ? (columnExists("sentinel_connector_status_event", "deployment_time")
-                                                ? (tableExists("sentinel_maintenance_request") ? 13 : 12) : 11) : 10) : 9;
+                                                ? (tableExists("sentinel_maintenance_request") ? deliverySnapshotVersion() : 12) : 11) : 10) : 9;
                     }
                     return 8;
                 }
@@ -412,6 +414,24 @@ public class SentinelMigrator extends Migrator {
             }
         } catch (MigrationException e) { throw e; }
         catch (Exception e) { throw new MigrationException("Failed to create maintenance request receipts", e); }
+    }
+
+    private int deliverySnapshotVersion() throws Exception {
+        return columnExists("sentinel_action_dispatch_log", "action_id_at_attempt")
+                && columnExists("sentinel_action_dispatch_log", "action_name_at_attempt")
+                && columnExists("sentinel_action_dispatch_log", "action_type_at_attempt")
+                && columnExists("sentinel_action_dispatch_log", "event_phase_at_attempt")
+                && indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id") ? 14 : 13;
+    }
+
+    private void applyV14() throws MigrationException {
+        String vendor = getDatabaseType();
+        addColumnIfAbsent("sentinel_action_dispatch_log", "action_id_at_attempt", vendor.equals("oracle") ? "NUMBER(10)" : "INTEGER");
+        String varchar = vendor.equals("oracle") ? "VARCHAR2" : "VARCHAR";
+        addColumnIfAbsent("sentinel_action_dispatch_log", "action_name_at_attempt", varchar + "(255)");
+        addColumnIfAbsent("sentinel_action_dispatch_log", "action_type_at_attempt", varchar + "(20)");
+        addColumnIfAbsent("sentinel_action_dispatch_log", "event_phase_at_attempt", varchar + "(20)");
+        createIndexIfAbsent("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id");
     }
 
     private void addColumnIfAbsent(String table, String column, String sqlType) throws MigrationException {
@@ -690,6 +710,7 @@ public class SentinelMigrator extends Migrator {
             object("sentinel_connector_status_event", "idx_sentinel_conn_node_id"),
             object("sentinel_action", "idx_sentinel_action_enabled"),
             object("sentinel_action_dispatch_log", "idx_sentinel_action_dispatch_log_event"),
+            object("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time"),
             object("sentinel_maintenance_window", "idx_sentinel_maintenance_window_scope")};
 
     /** PostgreSQL SERIAL sequences do not follow their table through a rename. */

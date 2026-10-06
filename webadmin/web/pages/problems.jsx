@@ -223,7 +223,13 @@ export function ProblemsPage() {
     const [error, setError] = React.useState(null);     // interactive-load failure
     const [loading, setLoading] = React.useState(true);
     const [selCount, setSelCount] = React.useState(0);
-    const [detailId, setDetailId] = React.useState(null);
+    const [detailId, setDetailId] = React.useState(() => {
+        const intent = readIntent();
+        if (intent && intent.kind === 'problem' && Number.isSafeInteger(intent.problemId) && intent.problemId > 0) {
+            clearIntent(); return intent.problemId;
+        }
+        return null;
+    });
 
     const seqRef = React.useRef(0);
     const stateRef = React.useRef(null);

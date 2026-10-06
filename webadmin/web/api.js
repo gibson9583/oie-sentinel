@@ -278,3 +278,6 @@ export const exportConfiguration = () => apiGet(`${BASE}/export`);
     the response: an entity the server's own validation rejected comes back
     SKIPPED with its reason rather than failing the whole document. */
 export const importConfiguration = (document_) => apiPost(`${BASE}/import`, document_);
+
+export const getDeliveries = params => apiGet(`${BASE}/deliveries`, params);
+export const getPendingDeliveries = params => apiGet(`${BASE}/deliveries/pending`, params);

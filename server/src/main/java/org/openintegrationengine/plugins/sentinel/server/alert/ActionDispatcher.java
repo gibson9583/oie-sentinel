@@ -778,6 +778,11 @@ public final class ActionDispatcher {
      */
     public static ActionTestResult sendTest(Action action) {
         ActionTestResult result = new ActionTestResult();
+        if (action != null) {
+            result.setActionName(action.getName());
+            result.setTransport(action.getActionType() == null ? null : action.getActionType().name());
+            result.setDestination(testDestination(action));
+        }
         try {
             if (action == null) {
                 result.setSuccess(false);
@@ -812,6 +817,25 @@ public final class ActionDispatcher {
             result.setMessage(exceptionMessage(t));
         }
         return result;
+    }
+
+    /** No credentials, webhook path tokens, query parameters or user info in receipts. */
+    static String testDestination(Action action) {
+        try {
+            var config = org.openintegrationengine.plugins.sentinel.server.util.Json.mapper().readTree(action.getConfigJson());
+            if (action.getActionType() == null) return "Destination unavailable";
+            return switch (action.getActionType()) {
+                case EMAIL -> "To: " + config.path("to").asText("not configured") + "; Cc: " + config.path("cc").asText("none");
+                case CHANNEL -> "Channel: " + config.path("channelId").asText("not configured");
+                case SNS -> "Topic: " + config.path("topicArn").asText("not configured");
+                case WEBHOOK -> {
+                    java.net.URI uri = java.net.URI.create(config.path("url").asText());
+                    if (uri.getHost() == null) yield "Webhook origin unavailable";
+                    yield new java.net.URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), null, null, null).toString()
+                            + " (webhook origin; path and credentials omitted)";
+                }
+            };
+        } catch (Exception ignored) { return "Destination unavailable"; }
     }
 
     /**
@@ -1670,6 +1694,10 @@ public final class ActionDispatcher {
             ActionDispatchLog row = new ActionDispatchLog();
             row.setAlertEventId(event.getId());
             row.setActionId(action.getId());
+            row.setActionIdAtAttempt(action.getId());
+            row.setActionNameAtAttempt(action.getName());
+            row.setActionTypeAtAttempt(action.getActionType() == null ? null : action.getActionType().name());
+            row.setEventPhaseAtAttempt(resolvedPhase ? "RESOLVED" : "PROBLEM");
             row.setDispatchTime(Instant.now());
             row.setSuccess(success);
             row.setErrorMessage(truncate(mark(marker, errorMessage)));

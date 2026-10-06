@@ -18,6 +18,8 @@ import org.slf4j.LoggerFactory;
 import com.mirth.connect.server.util.SqlConfig;
 
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
+import org.openintegrationengine.plugins.sentinel.shared.model.DeliveryAttempt;
+import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 
 /**
  * Persistence for {@code sentinel_action_dispatch_log} — the write-once audit
@@ -65,6 +67,10 @@ public final class ActionDispatchLogRepository {
             params.put("dispatch_time", toTimestamp(dispatchLog.getDispatchTime()));
             params.put("success", dispatchLog.isSuccess());
             params.put("error_message", dispatchLog.getErrorMessage());
+            params.put("action_id_at_attempt", dispatchLog.getActionIdAtAttempt());
+            params.put("action_name_at_attempt", dispatchLog.getActionNameAtAttempt());
+            params.put("action_type_at_attempt", dispatchLog.getActionTypeAtAttempt());
+            params.put("event_phase_at_attempt", dispatchLog.getEventPhaseAtAttempt());
 
             SqlConfig.getInstance().getSqlSessionManager().insert(stmt("insertActionDispatchLog"), params);
         } catch (Exception e) {
@@ -100,6 +106,29 @@ public final class ActionDispatchLogRepository {
         }
     }
 
+    /** SQL filters authorization before both count and paging. No unbounded scan in Java. */
+    public static PagedResult<DeliveryAttempt> listDeliveries(Map<String, Object> filter, int page, int pageSize) {
+        try {
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager().selectList(stmt("listDeliveries"), filter);
+            Number total = SqlConfig.getInstance().getSqlSessionManager().selectOne(stmt("countDeliveries"), filter);
+            List<DeliveryAttempt> attempts = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                ActionDispatchLog attempt = toActionDispatchLog(row);
+                String snapshotName = attempt.getActionNameAtAttempt();
+                String currentName = (String) row.get("current_action_name");
+                String source = snapshotName != null ? "CAPTURED" : currentName != null ? "CURRENT_ACTION" : "UNRECORDED";
+                attempts.add(new DeliveryAttempt(attempt, (String) row.get("channel_id"),
+                        ((Number) row.get("monitor_id")).intValue(), (String) row.get("event_status"),
+                        snapshotName != null ? snapshotName : currentName,
+                        source, attempt.getActionIdAtAttempt() != null && row.get("current_action_id") == null));
+            }
+            return new PagedResult<>(attempts, total.longValue(), page, pageSize);
+        } catch (Exception e) {
+            log.error("Failed to list notification deliveries", e);
+            throw new RepositoryException(e);
+        }
+    }
+
     // ========== Map <-> DTO conversion ==========
 
     private static ActionDispatchLog toActionDispatchLog(Map<String, Object> row) {
@@ -116,6 +145,11 @@ public final class ActionDispatchLogRepository {
         dispatchLog.setDispatchTime(toInstant(row.get("dispatch_time")));
         dispatchLog.setSuccess(toBoolean(row.get("success")));
         dispatchLog.setErrorMessage((String) row.get("error_message"));
+        Object originalId = row.get("action_id_at_attempt");
+        dispatchLog.setActionIdAtAttempt(originalId != null ? ((Number) originalId).intValue() : null);
+        dispatchLog.setActionNameAtAttempt((String) row.get("action_name_at_attempt"));
+        dispatchLog.setActionTypeAtAttempt((String) row.get("action_type_at_attempt"));
+        dispatchLog.setEventPhaseAtAttempt((String) row.get("event_phase_at_attempt"));
 
         return dispatchLog;
     }

@@ -159,6 +159,18 @@
         <result property="dispatch_time" column="dispatch_time" />
         <result property="success" column="success" />
         <result property="error_message" column="error_message" />
+        <result property="action_id_at_attempt" column="action_id_at_attempt" />
+        <result property="action_name_at_attempt" column="action_name_at_attempt" />
+        <result property="action_type_at_attempt" column="action_type_at_attempt" />
+        <result property="event_phase_at_attempt" column="event_phase_at_attempt" />
+    </resultMap>
+
+    <resultMap id="deliveryAttemptResult" type="map" extends="actionDispatchLogResult">
+        <result property="channel_id" column="channel_id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="event_status" column="event_status" />
+        <result property="current_action_id" column="current_action_id" />
+        <result property="current_action_name" column="current_action_name" />
     </resultMap>
 
     <resultMap id="maintenanceWindowResult" type="map">
@@ -352,6 +364,7 @@
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         <where>
+            <if test="pendingOnly == true">AND (problem_pending = 1 OR resolution_pending = 1)</if>
             <if test="status != null">AND status = #{status}</if>
             <if test="severityIn != null and !severityIn.isEmpty()">
                 AND severity IN
@@ -403,6 +416,7 @@
         SELECT COUNT(*)
         FROM sentinel_alert_event
         <where>
+            <if test="pendingOnly == true">AND (problem_pending = 1 OR resolution_pending = 1)</if>
             <if test="status != null">AND status = #{status}</if>
             <if test="severityIn != null and !severityIn.isEmpty()">
                 AND severity IN
@@ -739,17 +753,62 @@
 
     <insert id="insertActionDispatchLog" parameterType="map">
         INSERT INTO sentinel_action_dispatch_log (alert_event_id, action_id, dispatch_time,
-            success, error_message)
+            success, error_message, action_id_at_attempt, action_name_at_attempt, action_type_at_attempt, event_phase_at_attempt)
         VALUES (#{alert_event_id}, #{action_id,jdbcType=INTEGER}, #{dispatch_time},
-            #{success}, #{error_message})
+            #{success}, #{error_message}, #{action_id_at_attempt,jdbcType=INTEGER},
+            #{action_name_at_attempt,jdbcType=VARCHAR}, #{action_type_at_attempt,jdbcType=VARCHAR}, #{event_phase_at_attempt,jdbcType=VARCHAR})
     </insert>
 
     <select id="listActionDispatchLogsForEvent" parameterType="map" resultMap="actionDispatchLogResult">
-        SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
+        SELECT id, alert_event_id, action_id, dispatch_time, success, error_message,
+            action_id_at_attempt, action_name_at_attempt, action_type_at_attempt, event_phase_at_attempt
         FROM sentinel_action_dispatch_log
         WHERE alert_event_id = #{alertEventId}
-        ORDER BY dispatch_time
+        ORDER BY dispatch_time, id
     </select>
+
+    <sql id="deliveryFilters">
+        <where>
+            <if test="channelIdIn != null">
+                <choose>
+                    <when test="!channelIdIn.isEmpty()">AND e.channel_id IN
+                        <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+                    </when>
+                    <otherwise>AND 1 = 0</otherwise>
+                </choose>
+            </if>
+            <if test="actionId != null">AND COALESCE(d.action_id_at_attempt, d.action_id) = #{actionId}</if>
+            <if test="transport != null and transport != 'UNKNOWN'">AND d.action_type_at_attempt = #{transport}</if>
+            <if test="transport == 'UNKNOWN'">AND d.action_type_at_attempt IS NULL</if>
+            <if test="phase != null and phase != 'UNKNOWN'">AND d.event_phase_at_attempt = #{phase}</if>
+            <if test="phase == 'UNKNOWN'">AND d.event_phase_at_attempt IS NULL</if>
+            <if test="eventId != null">AND d.alert_event_id = #{eventId}</if>
+            <if test="success != null">AND d.success = #{success}</if>
+            <if test="from != null">AND d.dispatch_time &gt;= #{from}</if>
+            <if test="to != null">AND d.dispatch_time &lt;= #{to}</if>
+        </where>
+    </sql>
+
+    <select id="listDeliveries" parameterType="map" resultMap="deliveryAttemptResult">
+        SELECT d.id, d.alert_event_id, d.action_id, d.dispatch_time, d.success, d.error_message,
+            d.action_id_at_attempt, d.action_name_at_attempt, d.action_type_at_attempt, d.event_phase_at_attempt,
+            e.channel_id, e.monitor_id, e.status AS event_status,
+            a.id AS current_action_id, a.name AS current_action_name
+        FROM sentinel_action_dispatch_log d
+        JOIN sentinel_alert_event e ON e.id = d.alert_event_id
+        LEFT JOIN sentinel_action a ON a.id = d.action_id
+        <include refid="deliveryFilters" />
+        ORDER BY d.dispatch_time DESC, d.id DESC
+        OFFSET #{offset} ROWS FETCH NEXT #{limit} ROWS ONLY
+    </select>
+
+    <select id="countDeliveries" parameterType="map" resultType="Long">
+        SELECT COUNT(*) FROM sentinel_action_dispatch_log d
+        JOIN sentinel_alert_event e ON e.id = d.alert_event_id
+        <include refid="deliveryFilters" />
+    </select>
+
+
 
     <!-- ========== MAINTENANCE_WINDOW (sentinel_maintenance_window) ========== -->
 

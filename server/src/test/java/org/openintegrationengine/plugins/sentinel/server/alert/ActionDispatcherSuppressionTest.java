@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 
@@ -312,6 +313,9 @@ class ActionDispatcherSuppressionTest {
                 Mockito.times(3));
         assertEquals(List.of(9, 10, 10), captor.getAllValues().stream()
                 .map(ActionDispatchLog::getActionId).toList());
+        assertTrue(captor.getAllValues().stream().allMatch(row -> "RESOLVED".equals(row.getEventPhaseAtAttempt())));
+        assertEquals(List.of(9,10,10),captor.getAllValues().stream().map(ActionDispatchLog::getActionIdAtAttempt).toList());
+        assertEquals("secondary",captor.getAllValues().get(1).getActionNameAtAttempt());
         alerts.verify(() -> AlertEventRepository.setResolutionPending(EVENT_ID, false));
     }
 

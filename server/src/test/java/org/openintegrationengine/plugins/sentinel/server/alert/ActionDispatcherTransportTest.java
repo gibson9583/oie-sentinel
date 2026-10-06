@@ -37,6 +37,18 @@ class ActionDispatcherTransportTest {
     }
 
     @Test
+    void receiptDestinationOmitsWebhookCredentialsAndHandlesEveryType() {
+        Action webhook = action(ActionType.WEBHOOK);
+        webhook.setConfigJson("{\"url\":\"https://user:password@example.org:8443/token/secret?key=secret#fragment\",\"headers\":{\"Authorization\":\"secret\"}}");
+        assertEquals("https://example.org:8443 (webhook origin; path and credentials omitted)",ActionDispatcher.testDestination(webhook));
+        webhook.setConfigJson("not json");assertEquals("Destination unavailable",ActionDispatcher.testDestination(webhook));
+        Action email=action(ActionType.EMAIL);email.setConfigJson("{\"to\":\"ops@example.org\",\"cc\":\"oncall@example.org\"}");
+        assertEquals("To: ops@example.org; Cc: oncall@example.org",ActionDispatcher.testDestination(email));
+        Action channel=action(ActionType.CHANNEL);channel.setConfigJson("{\"channelId\":\"channel-a\"}");assertEquals("Channel: channel-a",ActionDispatcher.testDestination(channel));
+        Action sns=action(ActionType.SNS);sns.setConfigJson("{\"topicArn\":\"topic-a\",\"secretAccessKey\":\"secret\"}");assertEquals("Topic: topic-a",ActionDispatcher.testDestination(sns));
+    }
+
+    @Test
     @DisplayName("the wall clock cancels an in-flight synchronous transport and releases its caller")
     void timeoutCancelsSynchronousTransport() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
