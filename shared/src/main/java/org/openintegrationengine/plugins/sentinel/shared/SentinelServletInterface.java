@@ -284,6 +284,14 @@ public interface SentinelServletInterface extends BaseServletInterface {
             @Param("from") @QueryParam("from") Long from,
             @Param("to") @QueryParam("to") Long to) throws ClientException;
 
+    /** Latest observed opening/recovery progress; channel restricted, read-only,
+     * at most 1000 visible trigger rows (truncated is explicit). */
+    @GET
+    @Path("/monitors/{id}/recovery")
+    @Operation(summary = "Returns latest visible trigger recovery progress")
+    @MirthOperation(name = "sentinelGetRecoveryProgress", display = "View Sentinel recovery progress", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getRecoveryProgress(@Param("id") @PathParam("id") int id) throws ClientException;
+
     // ========== Actions ==========
 
     /**

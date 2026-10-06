@@ -122,6 +122,129 @@ class AlertLifecyclePersistenceTest {
         return event;
     }
 
+    private void recoveryTick(EvaluationOutcome outcome, int seconds) {
+        TriggerEvaluatorJob.applyOutcome(monitor, channel, null, outcome, now.plusSeconds(seconds));
+    }
+    private int healthyProgress() throws Exception {
+        return new com.fasterxml.jackson.databind.ObjectMapper().readTree(state().getLastValueJson())
+                .path("sentinelRecovery").path("healthyCount").asInt();
+    }
+
+    @Test
+    void recoveryProgressSurvivesRepositoryReloadAndKeepsRepeatsActiveUntilConfirmed() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":3}");
+        MonitorRepository.updateMonitor(monitor);
+        AlertEvent event = open();
+        recoveryTick(EvaluationOutcome.ok("{\"observed\":4}"), 1);
+        assertEquals(1, healthyProgress());
+        assertEquals(TriggerStatus.PROBLEM, state().getState());
+        assertEquals(event.getId(), state().getOpenAlertEventId());
+        dispatch.verify(() -> ActionDispatcher.onRepeatCheck(any(), any()));
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), never());
+        // A fresh monitor and trigger are rehydrated from the database each tick.
+        monitor = MonitorRepository.getMonitor(monitor.getId());
+        recoveryTick(EvaluationOutcome.ok("{\"observed\":3}"), 2);
+        assertEquals(2, healthyProgress());
+        recoveryTick(EvaluationOutcome.ok("{\"observed\":2}"), 3);
+        assertEquals(TriggerStatus.OK, state().getState());
+        assertNull(state().getOpenAlertEventId());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertTrue(AlertEventRepository.getAlertEvent(event.getId()).isResolutionPending());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        recoveryTick(EvaluationOutcome.ok("{}"), 4);
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+    }
+
+    @Test
+    void breachAndUnknownBreakRecoverySequenceWithoutClosingOrDuplicatingIncident() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":2}");
+        AlertEvent event = open();
+        recoveryTick(EvaluationOutcome.ok("{}"), 1); assertEquals(1, healthyProgress());
+        recoveryTick(EvaluationOutcome.breach("{}", "again"), 2); assertEquals(0, healthyProgress());
+        recoveryTick(EvaluationOutcome.ok("{}"), 3); assertEquals(1, healthyProgress());
+        recoveryTick(EvaluationOutcome.insufficientData("{}"), 4); assertEquals(0, healthyProgress());
+        assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
+        assertEquals(event.getId(), state().getOpenAlertEventId());
+        recoveryTick(EvaluationOutcome.ok("{}"), 5); assertEquals(1, healthyProgress());
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        recoveryTick(EvaluationOutcome.ok("{}"), 6);
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(1, count("sentinel_alert_event"));
+    }
+
+    @Test
+    void recoveryTransactionFailureRollsBackProgressResolutionAndNotificationThenRetrySucceeds() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":2}");
+        AlertEvent event = open();
+        recoveryTick(EvaluationOutcome.ok("{}"), 1);
+        sql("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT reject_recovery CHECK (state <> 'OK')");
+        assertThrows(RuntimeException.class, () -> recoveryTick(EvaluationOutcome.ok("{}"), 2));
+        assertEquals(1, healthyProgress());
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), never());
+        sql("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT reject_recovery");
+        recoveryTick(EvaluationOutcome.ok("{}"), 2);
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+    }
+
+    @Test
+    void manualResolveStartsNewIncidentWithZeroRecoveryProgress() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":3}");
+        AlertEvent old = open();
+        recoveryTick(EvaluationOutcome.ok("{}"), 1); recoveryTick(EvaluationOutcome.ok("{}"), 2);
+        ProblemService.resolve(old.getId(), "manual", 7);
+        assertNull(state().getOpenAlertEventId());
+        recoveryTick(EvaluationOutcome.breach("{}", "new incident"), 3);
+        assertNotEquals(old.getId(), state().getOpenAlertEventId());
+        assertEquals(0, healthyProgress());
+        recoveryTick(EvaluationOutcome.ok("{}"), 4);
+        assertEquals(1, healthyProgress());
+        assertEquals(TriggerStatus.PROBLEM, state().getState());
+    }
+
+    @Test
+    void editedRecoveryRequirementStartsFreshSequence() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":3}"); open();
+        recoveryTick(EvaluationOutcome.ok("{}"), 1); recoveryTick(EvaluationOutcome.ok("{}"), 2);
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":2}");
+        recoveryTick(EvaluationOutcome.ok("{}"), 3);
+        assertEquals(1, healthyProgress()); assertEquals(TriggerStatus.PROBLEM, state().getState());
+        recoveryTick(EvaluationOutcome.ok("{}"), 4); assertEquals(TriggerStatus.OK, state().getState());
+    }
+
+    @Test
+    void operationalDepartureBypassesMetricRecoveryDelayAndLeavesStateUnknown() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":100}");
+        AlertEvent event = open(); recoveryTick(EvaluationOutcome.ok("{}"), 1);
+        assertEquals(1, healthyProgress());
+        sweep(Set.of(), Map.of());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+        assertEquals(TriggerStatus.INSUFFICIENT_DATA, state().getState());
+        assertNull(state().getOpenAlertEventId());
+        assertEquals(0, org.openintegrationengine.plugins.sentinel.server.evaluate.RecoveryHysteresis.currentCount(monitor, state()));
+    }
+
+    @Test
+    void staleManuallyClosedIncidentIsNotDelayedByRecoveryRequirement() throws Exception {
+        monitor.setConfigJson("{\"minConsecutiveRecoveries\":100}");
+        AlertEvent event = open(); recoveryTick(EvaluationOutcome.ok("{}"), 1);
+        event.setStatus(AlertStatus.RESOLVED); event.setResolvedTime(now);
+        assertTrue(AlertEventRepository.resolveAlertEventManually(event));
+        recoveryTick(EvaluationOutcome.ok("{}"), 2);
+        assertEquals(TriggerStatus.OK, state().getState());
+        assertNull(state().getOpenAlertEventId());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), never());
+    }
+
+    @Test
+    void oldConfigurationRetainsImmediateRecoveryAndUnchangedEvidence() {
+        AlertEvent event = open(); recoveryTick(EvaluationOutcome.ok("{\"observed\":1}"), 1);
+        assertEquals(TriggerStatus.OK, state().getState());
+        assertEquals("{\"observed\":1}", state().getLastValueJson());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
+    }
+
     @Test
     void failedTriggerInsertRollsBackAlertAndRetryDeliversOnlyCommittedIncident() throws Exception {
         sql("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT reject_problem CHECK (state <> 'PROBLEM')");

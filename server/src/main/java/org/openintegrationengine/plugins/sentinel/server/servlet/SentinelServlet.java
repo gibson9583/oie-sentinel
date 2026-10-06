@@ -256,6 +256,16 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    @Override
+    public String getRecoveryProgress(int id) {
+        try {
+            return Json.write(org.openintegrationengine.plugins.sentinel.server.service.RecoveryProgressService
+                    .build(id, authorizedChannelIds(null)));
+        } catch (Exception e) {
+            throw translate("getRecoveryProgress", e);
+        }
+    }
+
     // ========== Actions ==========
 
     /**

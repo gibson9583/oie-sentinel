@@ -84,6 +84,9 @@ export const setMonitorEnabled = (id, enabled) =>
     { ok, message, outcomes: [{ channelId, channelName, status, valueSummary }] } */
 export const testMonitor = (monitor) => apiPost(`${BASE}/monitors/_test`, monitor);
 
+/** GET /monitors/{id}/recovery -> latest visible trigger progress (max 1000). */
+export const getRecoveryProgress = (id) => apiGet(`${BASE}/monitors/${enc(id)}/recovery`);
+
 /** GET /monitors/{id}/history -> daily alerting history
     { monitorId, from, to, bucket: 'DAY', truncated,
       points: [{ bucket, alertCount, avgResolveSeconds }] }.
