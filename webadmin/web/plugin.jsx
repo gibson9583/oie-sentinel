@@ -11,6 +11,7 @@ import { platform } from '@oie/web-shell';
 import { canManage, canManageSettings } from './ui.jsx';
 import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
+import { CoveragePage } from './pages/coverage.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
 import { ActionsPage } from './pages/actions.jsx';
@@ -60,6 +61,23 @@ const SENTINEL_CSS = `
 /* DataTable host (useDataTable mounts DataTable.el inside). */
 .sn-view .sn-dt-host { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
+/* Coverage uses host table/panel styling with a local overflow boundary. */
+.sn-view .sn-coverage { min-width: 0; }
+.sn-view .sn-coverage-scroll { overflow-x: auto; }
+.sn-view .sn-coverage table { width: 100%; min-width: 580px; }
+.sn-view .sn-coverage td { vertical-align: top; overflow-wrap: anywhere; }
+.sn-view .sn-coverage ul { padding-left: 18px; }
+.sn-view .sn-coverage li { margin-bottom: 10px; }
+@media (max-width: 640px) {
+    .sn-view .sn-coverage table { min-width: 0; }
+    .sn-view .sn-coverage thead { display: none; }
+    .sn-view .sn-coverage tbody, .sn-view .sn-coverage tr, .sn-view .sn-coverage td { display: block; }
+    .sn-view .sn-coverage tr { border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+    .sn-view .sn-coverage td { border: 0; }
+    .sn-view .sn-coverage ul { margin-top: 8px; }
+}
+.sn-view .sn-coverage-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+
 /* Charts and sparklines. */
 .sn-view .sn-spark { display: inline-block; vertical-align: middle; line-height: 0; }
 .sn-view .sn-chart { min-width: 0; }
@@ -78,6 +96,7 @@ const SENTINEL_CSS = `
 const TABS = [
     { key: 'dashboard', label: 'Dashboard', component: DashboardPage },
     { key: 'problems', label: 'Problems', component: ProblemsPage },
+    { key: 'coverage', label: 'Coverage', component: CoveragePage },
     { key: 'monitors', label: 'Monitors', component: MonitorsPage },
     { key: 'actions', label: 'Actions', component: ActionsPage },
     { key: 'schedules', label: 'Schedules', component: MaintenancePage },

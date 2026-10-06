@@ -555,6 +555,14 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    @Override
+    public String getCoverage() {
+        try {
+            return Json.write(org.openintegrationengine.plugins.sentinel.server.service.CoverageService.build(
+                    channelId -> !isChannelRedacted(channelId), !doesUserHaveChannelRestrictions()));
+        } catch (Exception e) { throw translate("getCoverage", e); }
+    }
+
     // ========== Dashboard & activity ==========
 
     /**

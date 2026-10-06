@@ -587,6 +587,13 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @MirthOperation(name = "sentinelBulkResolveProblems", display = "Bulk resolve Sentinel problems", permission = PERMISSION_ACKNOWLEDGE, type = ExecuteType.ASYNC)
     String bulkResolveProblems(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
 
+    /** Read-only coverage for visible channels using type-specific evaluator scope rules. */
+    @GET
+    @Path("/coverage")
+    @Operation(summary = "Returns configured coverage and persisted evaluation health")
+    @MirthOperation(name = "sentinelGetCoverage", display = "Get Sentinel coverage", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getCoverage() throws ClientException;
+
     // ========== Dashboard & activity ==========
 
     /**

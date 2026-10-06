@@ -274,3 +274,6 @@ export const exportConfiguration = () => apiGet(`${BASE}/export`);
     the response: an entity the server's own validation rejected comes back
     SKIPPED with its reason rather than failing the whole document. */
 export const importConfiguration = (document_) => apiPost(`${BASE}/import`, document_);
+
+/** Read-only visible-channel coverage and persisted evaluation evidence. */
+export const getCoverage = () => apiGet(`${BASE}/coverage`);

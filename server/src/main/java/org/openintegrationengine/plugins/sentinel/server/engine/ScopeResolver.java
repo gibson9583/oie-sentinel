@@ -324,6 +324,24 @@ public final class ScopeResolver {
         return channel.getName();
     }
 
+    /** Distinguishes an existing empty scope from a deleted/unknown scope for diagnostics. */
+    public static boolean scopeExists(Monitor monitor) {
+        if (monitor == null || monitor.getScopeType() == null) return false;
+        switch (monitor.getScopeType()) {
+            case ALL: return true;
+            case CHANNEL: return ChannelController.getInstance().getChannelById(monitor.getScopeId()) != null;
+            case GROUP:
+                List<ChannelGroup> groups = ChannelController.getInstance().getChannelGroups(null);
+                if (groups == null) throw new IllegalStateException("Channel-group inventory is unavailable");
+                return groups.stream().anyMatch(g -> monitor.getScopeId().equals(g.getId()));
+            case TAG:
+                Set<ChannelTag> tags = ControllerFactory.getFactory().createConfigurationController().getChannelTags();
+                if (tags == null) throw new IllegalStateException("Channel-tag inventory is unavailable");
+                return tags.stream().anyMatch(t -> monitor.getScopeId().equals(t.getId()));
+            default: return false;
+        }
+    }
+
     /**
      * Returns the member channel ids of a channel group, or an empty set if
      * the group id is unknown. Group members from
