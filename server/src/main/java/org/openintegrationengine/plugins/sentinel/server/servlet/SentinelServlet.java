@@ -35,6 +35,7 @@ import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
 import org.openintegrationengine.plugins.sentinel.server.service.DashboardService;
+import org.openintegrationengine.plugins.sentinel.server.service.DecisionInspectorService;
 import org.openintegrationengine.plugins.sentinel.server.service.ExportImportService;
 import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWindowService;
 import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
@@ -476,6 +477,16 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             return Json.write(ProblemService.getDetail(id));
         } catch (Exception e) {
             throw translate("getProblem", e);
+        }
+    }
+
+    @Override
+    public String inspectDecision(long id) {
+        try {
+            assertProblemVisible(id);
+            return Json.write(DecisionInspectorService.inspect(id));
+        } catch (Exception e) {
+            throw translate("inspectDecision", e);
         }
     }
 

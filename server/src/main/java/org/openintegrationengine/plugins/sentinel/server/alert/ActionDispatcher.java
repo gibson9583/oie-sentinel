@@ -1797,10 +1797,7 @@ public final class ActionDispatcher {
      * on neither.
      */
     private static boolean firesOnPhase(OperationMode mode, boolean resolvedPhase) {
-        if (mode == OperationMode.BOTH) {
-            return true;
-        }
-        return resolvedPhase ? mode == OperationMode.ON_RESOLVE : mode == OperationMode.ON_PROBLEM;
+        return ActionConditionMatcher.firesOnPhase(mode, resolvedPhase);
     }
 
     /**

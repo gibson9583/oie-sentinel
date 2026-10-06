@@ -20,6 +20,7 @@ import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
+import org.openintegrationengine.plugins.sentinel.shared.model.OperationMode;
 
 /**
  * Decides whether an action's stored condition filter matches a given alert
@@ -71,6 +72,12 @@ public final class ActionConditionMatcher {
     private static final Logger log = LoggerFactory.getLogger(ActionConditionMatcher.class);
 
     private ActionConditionMatcher() {
+    }
+
+    /** Shared lifecycle gate; malformed/null mode fires on neither phase. */
+    public static boolean firesOnPhase(OperationMode mode, boolean resolvedPhase) {
+        if (mode == OperationMode.BOTH) return true;
+        return resolvedPhase ? mode == OperationMode.ON_RESOLVE : mode == OperationMode.ON_PROBLEM;
     }
 
     /**
