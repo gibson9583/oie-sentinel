@@ -682,6 +682,12 @@ public interface SentinelServletInterface extends BaseServletInterface {
             @Param("page") @QueryParam("page") @DefaultValue("0") int page,
             @Param("pageSize") @QueryParam("pageSize") @DefaultValue("25") int pageSize) throws ClientException;
 
+    @GET
+    @Path("/health")
+    @Operation(summary = "Reads shared leadership/job evidence and channel-authorized retention diagnostics")
+    @MirthOperation(name = "sentinelGetClusterHealth", display = "Get Sentinel cluster health", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getClusterHealth() throws ClientException;
+
     // ========== Metrics ==========
 
     /**

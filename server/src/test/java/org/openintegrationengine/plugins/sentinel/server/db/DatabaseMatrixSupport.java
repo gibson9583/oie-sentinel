@@ -70,6 +70,7 @@ final class DatabaseMatrixSupport {
 
     private static final String[] LIVE_TABLES = {
             "sentinel_maintenance_request",
+            "sentinel_job_observation",
             "sentinel_action_dispatch_log",
             "sentinel_trigger_state",
             "sentinel_alert_event",

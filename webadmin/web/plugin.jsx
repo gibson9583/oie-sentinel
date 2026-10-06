@@ -12,6 +12,7 @@ import { canManage, canManageSettings } from './ui.jsx';
 import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
+import { ClusterHealth } from './pages/health.jsx';
 import { DeliveryInbox } from './pages/delivery.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
 import { ActionsPage } from './pages/actions.jsx';
@@ -81,6 +82,7 @@ const TABS = [
     { key: 'problems', label: 'Problems', component: ProblemsPage },
     { key: 'monitors', label: 'Monitors', component: MonitorsPage },
     { key: 'actions', label: 'Actions', component: ActionsPage },
+    { key: 'health', label: 'Sentinel health', component: ClusterHealth },
     { key: 'delivery', label: 'Delivery', component: DeliveryInbox },
     { key: 'schedules', label: 'Schedules', component: MaintenancePage },
     { key: 'settings', label: 'Settings', component: SettingsPage, manageOnly: true },

@@ -281,3 +281,5 @@ export const importConfiguration = (document_) => apiPost(`${BASE}/import`, docu
 
 export const getDeliveries = params => apiGet(`${BASE}/deliveries`, params);
 export const getPendingDeliveries = params => apiGet(`${BASE}/deliveries/pending`, params);
+
+export const getClusterHealth = () => apiGet(`${BASE}/health`);

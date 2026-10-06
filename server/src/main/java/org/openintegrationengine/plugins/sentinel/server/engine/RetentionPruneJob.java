@@ -81,45 +81,51 @@ public class RetentionPruneJob implements Job {
         if (fence == null) {
             return;
         }
-        try {
-            SentinelSettings settings = SettingsService.get();
-            Instant now = Instant.now();
+        try (JobObservation observation = JobObservation.begin("prune", fence)) {
+            try {
+                SentinelSettings settings = SettingsService.get();
+                Instant now = Instant.now();
 
-            Instant sampleCutoff = now.minus(Duration.ofDays(settings.getSampleRetentionDays()));
-            int samplesDeleted = ActivityRepository.deleteActivitySamplesOlderThan(sampleCutoff, fence);
+                Instant sampleCutoff = now.minus(Duration.ofDays(settings.getSampleRetentionDays()));
+                int samplesDeleted = ActivityRepository.deleteActivitySamplesOlderThan(sampleCutoff, fence);
 
-            if (!SentinelLeadership.recheckFence(fence)) {
-                return;
+                if (!SentinelLeadership.recheckFence(fence)) {
+                    JobObservation.failedUnit();
+                    return;
+                }
+
+                Instant trendCutoff = now.minus(Duration.ofDays(settings.getTrendRetentionDays()));
+                int trendsDeleted = ActivityRepository.deleteActivityTrendOlderThan(trendCutoff, fence);
+
+                if (!SentinelLeadership.recheckFence(fence)) {
+                    JobObservation.failedUnit();
+                    return;
+                }
+
+                Instant alertCutoff = now.minus(Duration.ofDays(settings.getResolvedAlertRetentionDays()));
+                int alertsDeleted = AlertEventRepository.deleteResolvedAlertEventsOlderThan(alertCutoff, fence);
+
+                if (!SentinelLeadership.recheckFence(fence)) {
+                    JobObservation.failedUnit();
+                    return;
+                }
+
+                int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff, fence);
+
+                // Counts at info: pruning is destructive, so the log should
+                // always answer "what did last night's run delete" without the
+                // operator having to enable debug logging first.
+                log.info("Retention prune complete: {} activity sample(s) older than {}d, "
+                                + "{} trend bucket(s) older than {}d, {} resolved alert(s) older than {}d, "
+                                + "{} connector status event(s) older than {}d",
+                        samplesDeleted, settings.getSampleRetentionDays(),
+                        trendsDeleted, settings.getTrendRetentionDays(),
+                        alertsDeleted, settings.getResolvedAlertRetentionDays(),
+                        statusDeleted, settings.getSampleRetentionDays());
+            } catch (Throwable t) {
+                JobObservation.failedUnit();
+                log.error("Retention prune run failed", t);
             }
-
-            Instant trendCutoff = now.minus(Duration.ofDays(settings.getTrendRetentionDays()));
-            int trendsDeleted = ActivityRepository.deleteActivityTrendOlderThan(trendCutoff, fence);
-
-            if (!SentinelLeadership.recheckFence(fence)) {
-                return;
-            }
-
-            Instant alertCutoff = now.minus(Duration.ofDays(settings.getResolvedAlertRetentionDays()));
-            int alertsDeleted = AlertEventRepository.deleteResolvedAlertEventsOlderThan(alertCutoff, fence);
-
-            if (!SentinelLeadership.recheckFence(fence)) {
-                return;
-            }
-
-            int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff, fence);
-
-            // Counts at info: pruning is destructive, so the log should
-            // always answer "what did last night's run delete" without the
-            // operator having to enable debug logging first.
-            log.info("Retention prune complete: {} activity sample(s) older than {}d, "
-                            + "{} trend bucket(s) older than {}d, {} resolved alert(s) older than {}d, "
-                            + "{} connector status event(s) older than {}d",
-                    samplesDeleted, settings.getSampleRetentionDays(),
-                    trendsDeleted, settings.getTrendRetentionDays(),
-                    alertsDeleted, settings.getResolvedAlertRetentionDays(),
-                    statusDeleted, settings.getSampleRetentionDays());
-        } catch (Throwable t) {
-            log.error("Retention prune run failed", t);
         }
     }
 }

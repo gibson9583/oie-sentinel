@@ -81,9 +81,9 @@ function HealthItem({ label, time, staleSeconds }) {
     const stale = isNaN(t) || (Date.now() - t) > staleSeconds * 1000;
     return (
         <span className="status-cell" title={time ? fmtTime(time) : 'No run recorded yet'}>
-            <span className={`pip ${stale ? 'warn' : 'ok'}`} />
-            <span style={stale ? { color: 'var(--warn)' } : undefined}>
-                {label} {time ? `ran ${fmtAgo(time)}` : 'has not run yet'}
+            <span className={`pip ${!time ? '' : stale ? 'warn' : 'ok'}`} />
+            <span style={time && stale ? { color: 'var(--warn)' } : undefined}>
+                {label} {time ? `ran ${fmtAgo(time)}` : 'no local run observed (may be standby)'}
             </span>
         </span>
     );
@@ -93,9 +93,9 @@ function HealthFootnote({ summary }) {
     return (
         <div className="sn-hint"
             style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'center', marginTop: 12 }}>
-            <HealthItem label="Collector" time={summary.lastCollectorRun}
+            <HealthItem label="This node collector" time={summary.lastCollectorRun}
                 staleSeconds={COLLECTOR_STALE_SECONDS} />
-            <HealthItem label="Evaluator" time={summary.lastEvaluatorRun}
+            <HealthItem label="This node evaluator" time={summary.lastEvaluatorRun}
                 staleSeconds={EVALUATOR_STALE_SECONDS} />
             {/* Connector events are push-driven — silence is normal, so no pip. */}
             <span title={summary.lastConnectorEvent ? fmtTime(summary.lastConnectorEvent) : undefined}>

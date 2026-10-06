@@ -36,6 +36,7 @@ import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
 import org.openintegrationengine.plugins.sentinel.server.service.DashboardService;
 import org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService;
+import org.openintegrationengine.plugins.sentinel.server.service.ClusterHealthService;
 import org.openintegrationengine.plugins.sentinel.server.service.ExportImportService;
 import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWindowService;
 import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
@@ -662,6 +663,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         try {
             return Json.write(DeliveryInboxService.pending(authorizedChannelIds(channelId), channelId, from, to, page, pageSize));
         } catch (Exception e) { throw translate("getPendingDeliveries", e); }
+    }
+
+    @Override
+    public String getClusterHealth() {
+        try { return Json.write(ClusterHealthService.build(authorizedChannelIds(null))); }
+        catch(Exception e) { throw translate("getClusterHealth",e); }
     }
 
     // ========== Metrics ==========

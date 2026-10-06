@@ -147,10 +147,13 @@ public class TriggerEvaluatorJob implements Job {
         if (fence == null) {
             return;
         }
-        try {
-            runTick(Instant.now(), fence);
-        } catch (Throwable t) {
-            log.error("Sentinel trigger evaluator tick failed", t);
+        try (JobObservation observation = JobObservation.begin("evaluator", fence)) {
+            try {
+                runTick(Instant.now(), fence);
+            } catch (Throwable t) {
+                JobObservation.failedUnit();
+                log.error("Sentinel trigger evaluator tick failed", t);
+            }
         }
     }
 
@@ -163,10 +166,11 @@ public class TriggerEvaluatorJob implements Job {
         List<Monitor> monitors = MonitorRepository.listMonitors(null, null, Boolean.TRUE, null);
 
         for (Monitor monitor : orderByDependency(monitors)) {
-            if (!SentinelLeadership.recheckFence(fence)) return;
+            if (!SentinelLeadership.recheckFence(fence)) { JobObservation.failedUnit(); return; }
             try {
                 evaluateMonitor(monitor, now, fence);
             } catch (Exception e) {
+                JobObservation.failedUnit();
                 log.error("Evaluation failed for monitor {} ({})", monitor.getId(), monitor.getName(), e);
             }
         }
@@ -185,6 +189,7 @@ public class TriggerEvaluatorJob implements Job {
     private static void retryPendingProblems(LeaseFence fence) {
         for (AlertEvent event : AlertEventRepository.listPendingProblemAlertEvents()) {
             if (!SentinelLeadership.recheckFence(fence)) {
+                JobObservation.failedUnit();
                 return;
             }
             try {
@@ -196,6 +201,7 @@ public class TriggerEvaluatorJob implements Job {
                 // A resolved event is ordered by retryPendingResolutions:
                 // its worker replays the pending problem edge first.
             } catch (Throwable t) {
+                JobObservation.failedUnit();
                 log.error("Failed to enqueue pending problem for alert event {}",
                         event.getId(), t);
             }
@@ -211,6 +217,7 @@ public class TriggerEvaluatorJob implements Job {
     private static void retryPendingResolutions(LeaseFence fence) {
         for (AlertEvent event : AlertEventRepository.listPendingResolvedAlertEvents()) {
             if (!SentinelLeadership.recheckFence(fence)) {
+                JobObservation.failedUnit();
                 return;
             }
             try {
@@ -218,6 +225,7 @@ public class TriggerEvaluatorJob implements Job {
                 ActionDispatcher.onAlertResolved(
                         event, AlertPayload.of(event, monitor, "RESOLVED"));
             } catch (Throwable t) {
+                JobObservation.failedUnit();
                 log.error("Failed to enqueue pending resolution for alert event {}",
                         event.getId(), t);
             }
@@ -328,6 +336,7 @@ public class TriggerEvaluatorJob implements Job {
                             targets.add(target);
                         }
                     } catch (Exception e) {
+                        JobObservation.failedUnit();
                         // Target discovery is part of evaluating this channel.
                         // Retain it in scopedChannelIds so the later departure
                         // sweep has no authority over its alerts, but do not
@@ -385,6 +394,7 @@ public class TriggerEvaluatorJob implements Job {
                     // departed and their old alerts may be closed.
                     evaluatedTriggers.put(target.channelId, currentIdentities);
                 } catch (Exception e) {
+                    JobObservation.failedUnit();
                     // A database/config/runtime failure for one channel must
                     // neither starve later channels nor authorize the
                     // departure sweep to prune the failed channel's rows.
@@ -432,6 +442,7 @@ public class TriggerEvaluatorJob implements Job {
                     applyOutcome(monitor, target.channelId, null, outcome, now, fence);
                     recordEvaluated(evaluatedTriggers, target.channelId, null, outcome);
                 } catch (Exception e) {
+                    JobObservation.failedUnit();
                     evaluatedTriggers.remove(target.channelId);
                     log.error("Evaluation failed for monitor {} channel {}",
                             monitor.getId(), target.channelId, e);
@@ -794,6 +805,7 @@ public class TriggerEvaluatorJob implements Job {
                             continue;
                         }
                     } catch (Exception e) {
+                        JobObservation.failedUnit();
                         log.warn("Cannot verify connector departure for channel {}; retaining alert {}",
                                 state.getChannelId(), state.getOpenAlertEventId(), e);
                         continue;
