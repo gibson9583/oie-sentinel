@@ -283,3 +283,6 @@ export const getDeliveries = params => apiGet(`${BASE}/deliveries`, params);
 export const getPendingDeliveries = params => apiGet(`${BASE}/deliveries/pending`, params);
 
 export const getClusterHealth = () => apiGet(`${BASE}/health`);
+
+export const getIncidentTimeline = (id,cursor) => apiGet(`${BASE}/problems/${enc(id)}/timeline`,{cursor});
+export const appendIncidentNote = (id,request) => apiPost(`${BASE}/problems/${enc(id)}/notes`,request);

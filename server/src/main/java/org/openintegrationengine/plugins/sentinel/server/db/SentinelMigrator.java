@@ -103,6 +103,7 @@ import org.slf4j.LoggerFactory;
  *   <li><b>14</b> — Nullable delivery context snapshots and paging index.</li>
  *   <li><b>15</b> — Shared fenced job observations.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
+ *   <li><b>16</b> — Append-only incident notes and durable request identities.</li>
  * </ul>
  * <p>Versions 7–12 are this release's sequence after released schema v6.
  * Unpublished hardening-branch versions are intentionally not the release
@@ -122,7 +123,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 15;
+    public static final int LATEST_VERSION = 16;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -205,6 +206,7 @@ public class SentinelMigrator extends Migrator {
         if (current < 13 && targetVersion >= 13) { applyV13(); }
         if (current < 14 && targetVersion >= 14) { applyV14(); }
         if (current < 15 && targetVersion >= 15) { applyV15(); }
+        if (current < 16 && targetVersion >= 16) { applyV16(); }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -423,7 +425,21 @@ public class SentinelMigrator extends Migrator {
                 && columnExists("sentinel_action_dispatch_log", "action_name_at_attempt")
                 && columnExists("sentinel_action_dispatch_log", "action_type_at_attempt")
                 && columnExists("sentinel_action_dispatch_log", "event_phase_at_attempt")
-                && indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id") ? (tableExists("sentinel_job_observation") ? 15 : 14) : 13;
+                && indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id") ? (tableExists("sentinel_job_observation") ? notesSchemaVersion() : 14) : 13;
+    }
+
+    private int notesSchemaVersion() throws Exception {
+        return tableExists("sentinel_incident_note")
+                && indexExists("sentinel_incident_note", "idx_sentinel_note_event", "alert_event_id, created_time, note_id") ? 16 : 15;
+    }
+
+    /** Preserve append-only notes and request identities independently of incident pruning. */
+    private void applyV16() throws MigrationException {
+        try {
+            if (!tableExists("sentinel_incident_note")) executeScript("/" + getDatabaseType() + "-sentinel-v16.sql");
+            createIndexIfAbsent("sentinel_incident_note", "idx_sentinel_note_event", "alert_event_id, created_time, note_id");
+        } catch(MigrationException e) { throw e; }
+        catch(Exception e) { throw new MigrationException("Failed to add Sentinel incident notes",e); }
     }
 
     private void applyV15() throws MigrationException {
@@ -693,7 +709,8 @@ public class SentinelMigrator extends Migrator {
             "sentinel_monitor",
             "sentinel_node_lease",
             "sentinel_maintenance_request",
-            "sentinel_job_observation"};
+            "sentinel_job_observation",
+            "sentinel_incident_note"};
 
     /**
      * Explicit secondary indexes created by Sentinel. The naming convention is
@@ -704,6 +721,7 @@ public class SentinelMigrator extends Migrator {
     private static final NamedObject[] UNINSTALL_INDEXES = {
             object("sentinel_monitor", "idx_sentinel_monitor_scope"),
             object("sentinel_monitor", "idx_sentinel_monitor_enabled"),
+            object("sentinel_incident_note", "idx_sentinel_note_event"),
             object("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel"),
             object("sentinel_alert_event", "idx_sentinel_alert_event_status"),
             object("sentinel_alert_event", "idx_sentinel_alert_event_opened"),
@@ -747,6 +765,7 @@ public class SentinelMigrator extends Migrator {
             object("sentinel_monitor", "sentinel_monitor_pkey"),
             object("sentinel_monitor", "sentinel_monitor_name_key"),
             object("sentinel_monitor", "sentinel_monitor_suppressed_by_monitor_id_fkey"),
+            object("sentinel_incident_note", "sentinel_incident_note_pkey"),
             object("sentinel_alert_event", "sentinel_alert_event_pkey"),
             object("sentinel_alert_event", "sentinel_alert_event_monitor_id_fkey"),
             object("sentinel_trigger_state", "sentinel_trigger_state_pkey"),

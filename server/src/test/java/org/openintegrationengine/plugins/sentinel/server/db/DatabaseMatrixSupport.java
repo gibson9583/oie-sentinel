@@ -81,7 +81,8 @@ final class DatabaseMatrixSupport {
             "sentinel_maintenance_window",
             "sentinel_action",
             "sentinel_monitor",
-            "sentinel_node_lease"};
+            "sentinel_node_lease",
+            "sentinel_incident_note"};
 
     private DatabaseMatrixSupport() {
     }

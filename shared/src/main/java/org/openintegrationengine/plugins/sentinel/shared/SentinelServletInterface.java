@@ -474,6 +474,18 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @MirthOperation(name = "sentinelCancelChannelMaintenance", display = "Cancel channel maintenance", permission = PERMISSION_MAINTENANCE, type = ExecuteType.ASYNC)
     String cancelChannelMaintenance(@Param("requestId") @PathParam("requestId") String requestId) throws ClientException;
 
+    @GET
+    @Path("/problems/{id}/timeline")
+    @Operation(summary = "Reads recorded incident facts and append-only notes")
+    @MirthOperation(name = "sentinelGetIncidentTimeline", display = "Read incident timeline", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getIncidentTimeline(@Param("id") @PathParam("id") long id, @Param("cursor") @QueryParam("cursor") String cursor) throws ClientException;
+
+    @POST
+    @Path("/problems/{id}/notes")
+    @Operation(summary = "Appends an incident note with a durable request identity")
+    @MirthOperation(name = "sentinelAppendIncidentNote", display = "Append incident note", permission = PERMISSION_ACKNOWLEDGE, type = ExecuteType.ASYNC, auditable = false)
+    String appendIncidentNote(@Param("id") @PathParam("id") long id, @Param("body") String bodyJson) throws ClientException;
+
     // ========== Problems ==========
 
     /**

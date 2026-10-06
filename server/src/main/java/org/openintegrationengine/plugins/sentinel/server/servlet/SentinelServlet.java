@@ -43,6 +43,7 @@ import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorHistoryService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorService;
 import org.openintegrationengine.plugins.sentinel.server.service.ProblemService;
+import org.openintegrationengine.plugins.sentinel.server.service.IncidentTimelineService;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
@@ -459,6 +460,18 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             }
             return Json.write(MaintenanceWindowService.cancelChannelMaintenance(requestId, getCurrentUserId()));
         } catch (Exception e) { throw translate("cancelChannelMaintenance", e); }
+    }
+
+    @Override public String getIncidentTimeline(long id, String cursor) {
+        try { assertProblemVisible(id); return Json.write(IncidentTimelineService.timeline(id,cursor)); }
+        catch(Exception e) { throw translate("getIncidentTimeline",e); }
+    }
+    @Override public String appendIncidentNote(long id, String bodyJson) {
+        try {
+            assertProblemVisible(id);JsonNode root=readBodyTree(bodyJson);
+            if(!root.path("requestId").isTextual() || !root.path("text").isTextual())throw new IllegalArgumentException("Request ID and note text must be strings");
+            return Json.write(IncidentTimelineService.append(id,textOrNull(root,"requestId"),textOrNull(root,"text"),getCurrentUserId()));
+        } catch(Exception e) { throw translate("appendIncidentNote",e); }
     }
 
     // ========== Problems ==========

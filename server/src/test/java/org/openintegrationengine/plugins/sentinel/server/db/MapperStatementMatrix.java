@@ -273,6 +273,10 @@ final class MapperStatementMatrix {
         values.put("severityIn", new ArrayList<>(List.of("HIGH")));
         values.put("config_json", "{}");
         values.put("condition_json", "{}");
+        values.put("note_id", "00000000-0000-0000-0000-000000000099");
+        values.put("noteId", "00000000-0000-0000-0000-000000000099");
+        values.put("actor_id", 1); values.put("note_text", "Matrix note");
+        values.put("beforeTime", null); values.put("beforeId", null);
         values.put("details_json", "{}");
         values.put("min_consecutive_breaches", 1);
         values.put("suppressed_by_monitor_id", monitorId);

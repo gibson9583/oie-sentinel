@@ -28,6 +28,11 @@ const React = platform.React;
    utilities are unsafe here unless a host file already emits them — anything
    custom belongs below. */
 const SENTINEL_CSS = `
+.sn-timeline-list { padding-left: 1.5em; }
+.sn-timeline-list li { margin-block: 1em; overflow-wrap: anywhere; }
+.sn-note-text { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 75ch; }
+.sn-note-editor { display: block; width: 100%; max-width: 75ch; box-sizing: border-box; min-height: 6em; }
+
 /* Pills never wrap their text into tall ovals. */
 .sn-view .tag { white-space: nowrap; }
 

@@ -292,6 +292,16 @@ public final class SentinelAuditLog {
         }
     }
 
+    /** Avoid copying note content into a second audit store; identity, actor and size suffice. */
+    public static void problemNoteAdded(int userId, AlertEvent event, String noteId, int bytes) {
+        try {
+            Map<String,String> attributes=new LinkedHashMap<>();
+            attributes.put("Action", "Added Sentinel incident note");
+            attributes.put("Problem ID", String.valueOf(event.getId())); attributes.put("Note ID",noteId);
+            attributes.put("Note UTF-8 bytes",String.valueOf(bytes));addChannelAttributes(attributes,event.getChannelId());dispatch(userId,attributes);
+        } catch(Exception e) { log.warn("Failed to audit incident note {}",noteId,e); }
+    }
+
     // ========== Settings ==========
 
     /**
