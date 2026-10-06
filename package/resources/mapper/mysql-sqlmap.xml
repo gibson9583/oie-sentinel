@@ -885,4 +885,27 @@
         FROM sentinel_alert_event WHERE (problem_pending=TRUE OR resolution_pending=TRUE) <include refid="healthChannelFilter" />
     </select>
 
+
+    <resultMap id="incidentNoteResult" type="map">
+        <result property="note_id" column="note_id" />
+        <result property="alert_event_id" column="alert_event_id" />
+        <result property="actor_id" column="actor_id" />
+        <result property="created_time" column="created_time" />
+        <result property="note_text" column="note_text" />
+    </resultMap>
+    <insert id="insertIncidentNote" parameterType="map">
+        INSERT INTO sentinel_incident_note (note_id, alert_event_id, actor_id, created_time, note_text)
+        VALUES (#{note_id}, #{alert_event_id}, #{actor_id}, #{created_time}, #{note_text})
+    </insert>
+    <select id="getIncidentNote" parameterType="map" resultMap="incidentNoteResult">
+        SELECT note_id, alert_event_id, actor_id, created_time, note_text FROM sentinel_incident_note WHERE note_id = #{noteId}
+    </select>
+    <select id="listIncidentNotes" parameterType="map" resultMap="incidentNoteResult">
+        SELECT note_id, alert_event_id, actor_id, created_time, note_text FROM sentinel_incident_note
+        WHERE alert_event_id = #{alertEventId}
+        <if test="beforeTime != null">
+            AND (created_time &lt; #{beforeTime} OR (created_time = #{beforeTime} AND note_id &lt; #{beforeId}))
+        </if>
+        ORDER BY created_time DESC, note_id DESC LIMIT 51
+    </select>
 </mapper>

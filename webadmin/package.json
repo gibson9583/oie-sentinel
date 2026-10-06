@@ -5,7 +5,8 @@
     "type": "module",
     "scripts": {
         "build": "node build.mjs",
-        "test:maintenance": "node verify/maintenance.browser.mjs"
+        "test:maintenance": "node verify/maintenance.browser.mjs",
+        "test:incident-notes": "node --test verify/incident-notes.test.mjs && node verify/incident-notes.browser.mjs"
     },
     "devDependencies": {
         "@playwright/test": "^1.56.1",

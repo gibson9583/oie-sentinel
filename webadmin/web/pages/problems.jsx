@@ -23,6 +23,7 @@ import {
 } from '../ui.jsx';
 import { ChannelMaintenanceShortcut } from '../channel-maintenance.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
+import { IncidentTimeline } from '../incident-timeline.jsx';
 
 const React = platform.React;
 const { h, modal } = platform.ui;
@@ -804,6 +805,7 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
                         </div>
                     </div>
 
+                    <IncidentTimeline key={id} id={id} />
                     <div className="panel">
                         <div className="panel-header">Action Dispatches</div>
                         <div className="panel-body">
