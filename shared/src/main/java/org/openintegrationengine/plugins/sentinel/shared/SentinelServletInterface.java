@@ -461,6 +461,19 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String activateMaintenanceWindowNow(@Param("id") @PathParam("id") int id,
             @Param("durationMinutes") @QueryParam("durationMinutes") @DefaultValue("60") int durationMinutes) throws ClientException;
 
+    /** One-time channel suppression with required reason and durable request identity. */
+    @POST
+    @Path("/maintenanceWindows/_channel")
+    @Operation(summary = "Creates an expiring channel maintenance window idempotently")
+    @MirthOperation(name = "sentinelCreateChannelMaintenance", display = "Mute channel notifications temporarily", permission = PERMISSION_MAINTENANCE, type = ExecuteType.ASYNC)
+    String createChannelMaintenance(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
+
+    @POST
+    @Path("/maintenanceWindows/_channel/{requestId}/_cancel")
+    @Operation(summary = "Cancels a channel maintenance window without re-creating it on replay")
+    @MirthOperation(name = "sentinelCancelChannelMaintenance", display = "Cancel channel maintenance", permission = PERMISSION_MAINTENANCE, type = ExecuteType.ASYNC)
+    String cancelChannelMaintenance(@Param("requestId") @PathParam("requestId") String requestId) throws ClientException;
+
     // ========== Problems ==========
 
     /**

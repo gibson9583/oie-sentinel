@@ -10,6 +10,13 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.UUID;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import org.openintegrationengine.plugins.sentinel.server.db.MaintenanceRequestRepository;
 import java.util.NoSuchElementException;
 
 import org.openintegrationengine.plugins.sentinel.server.db.MaintenanceWindowRepository;
@@ -159,6 +166,65 @@ public final class MaintenanceWindowService {
         MaintenanceWindowRepository.updateMaintenanceWindow(window);
         SentinelAuditLog.windowActivated(userId, window);
         return window;
+    }
+
+    /** Creates a persisted, one-time CHANNEL window without re-timing a replay. */
+    public static Map<String,Object> channelMaintenance(String requestId, String channelId,
+            long untilMillis, String reason, int userId) {
+        if (requestId == null || !UUID.fromString(requestId).toString().equals(requestId)) {
+            throw new IllegalArgumentException("A canonical UUID requestId is required");
+        }
+        if (channelId == null || channelId.isBlank() || channelId.length() > 36) {
+            throw new IllegalArgumentException("A channelId is required");
+        }
+        if (reason == null || reason.isBlank() || reason.trim().length() > 200) {
+            throw new IllegalArgumentException("A reason between 1 and 200 characters is required");
+        }
+        String name = "Channel maintenance: " + reason.trim();
+        String fingerprint;
+        try {
+            fingerprint = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(
+                    (channelId + "\n" + untilMillis + "\n" + name).getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+        Instant now = Instant.now(), until = Instant.ofEpochMilli(untilMillis);
+        // An already-completed replay is valid even after expiry/cancellation.
+        Map<String,Object> existing = MaintenanceRequestRepository.get(requestId);
+        if (existing == null && (!until.isAfter(now) || until.isAfter(now.plus(30, ChronoUnit.DAYS)))) {
+            throw new IllegalArgumentException("Expiry must be in the future and within 30 days");
+        }
+        MaintenanceWindow window = new MaintenanceWindow();
+        window.setName(name); window.setScopeType(ScopeType.CHANNEL); window.setScopeId(channelId);
+        window.setMode(WindowMode.SUPPRESS); window.setRepeatType(WindowRepeat.NONE);
+        window.setActiveFrom(now); window.setActiveUntil(until); window.setEnabled(true);
+        window.setCreatedBy(userId); window.setCreatedTime(now);
+        if (existing == null) validate(window);
+        MaintenanceRequestRepository.Result result = MaintenanceRequestRepository.createOnce(requestId, fingerprint, window);
+        if (result.created()) SentinelAuditLog.windowCreated(userId, window);
+        Number id = (Number) result.request().get("window_id");
+        MaintenanceWindow stored = id == null ? null : MaintenanceWindowRepository.getMaintenanceWindow(id.intValue());
+        if (stored != null) stored.setActiveNow(Boolean.TRUE.equals(WindowSchedule.isActiveNow(stored, Instant.now())));
+        Map<String,Object> response = new HashMap<>();
+        response.put("requestId", requestId); response.put("replayed", !result.created());
+        response.put("window", stored); response.put("removed", stored == null);
+        return response;
+    }
+
+    /** Conditional cancellation cannot disable a schedule moved to another scope. */
+    public static Map<String,Object> cancelChannelMaintenance(String requestId, int userId) {
+        Map<String,Object> request = MaintenanceRequestRepository.get(requestId);
+        if (request == null) throw new NoSuchElementException("No channel maintenance request");
+        Number id = (Number) request.get("window_id");
+        MaintenanceWindow stored = id == null ? null : MaintenanceWindowRepository.getMaintenanceWindow(id.intValue());
+        if (stored != null) {
+            if (MaintenanceRequestRepository.disable(request) == 0) {
+                throw new IllegalArgumentException("Schedule scope or policy changed; review it in Schedules");
+            }
+            stored.setEnabled(false); stored.setActiveNow(false);
+            SentinelAuditLog.windowUpdated(userId, stored);
+        }
+        Map<String,Object> response = new HashMap<>();
+        response.put("requestId", requestId); response.put("window", stored); response.put("removed", stored == null);
+        return response;
     }
 
     /**
