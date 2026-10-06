@@ -556,10 +556,10 @@ public interface SentinelServletInterface extends BaseServletInterface {
 
     /**
      * Acknowledges a batch of problems in one call — the Problems grid's
-     * multi-select action. Already-acknowledged ids are skipped silently.
+     * multi-select action. Already-acknowledged IDs return a receipt without a mutation.
      *
      * @param bodyJson JSON {@code {"ids": [1, 2, ...], "comment": "..."}}
-     * @return JSON {@code {"acknowledged": n}} — how many were newly acknowledged
+     * @return JSON count plus one {@code {id, status}} receipt per distinct requested ID
      * @throws ClientException on malformed body or persistence failure
      */
     @POST
@@ -578,7 +578,7 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * clean.
      *
      * @param bodyJson JSON {@code {"ids": [1, 2, ...], "comment": "..."}}
-     * @return JSON {@code {"resolved": n}} — how many were newly resolved
+     * @return JSON count plus one {@code {id, status}} receipt per distinct requested ID
      * @throws ClientException on malformed body or persistence failure
      */
     @POST

@@ -60,6 +60,30 @@ const SENTINEL_CSS = `
 /* DataTable host (useDataTable mounts DataTable.el inside). */
 .sn-view .sn-dt-host { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
+/* Problems owns its responsive queue/detail layout; host table code is untouched. */
+.sn-view .sn-problems { min-width: 0; }
+.sn-view .sn-problems.sn-has-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.sn-view .sn-problem-queue, .sn-view .sn-problem-detail { min-width: 0; }
+.sn-view .sn-freshness, .sn-view .sn-triage-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.sn-view .sn-freshness { color: var(--text-dim); }
+.sn-view .sn-table-scroll { overflow-x: auto; }
+.sn-view .sn-problem-queue .sn-table-scroll table { min-width: 780px; }
+.sn-view .sn-problem-queue td:nth-child(3) { white-space: nowrap; }
+.sn-view .sn-problem-detail .sn-table-scroll table { table-layout: auto; min-width: 560px; }
+.sn-view .sn-problem-open { display: block; text-align: start; color: var(--accent); background: none; border: 0; padding: 6px 0; font: inherit; cursor: pointer; overflow-wrap: anywhere; max-width: 65ch; }
+.sn-view .sn-problem-open:hover { text-decoration: underline; }
+.sn-view .sn-problems :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sn-view .sn-problems td, .sn-view .sn-problems p, .sn-view .sn-problems li { overflow-wrap: anywhere; }
+.sn-view .sn-problem-detail table { width: 100%; table-layout: fixed; }
+.sn-view .sn-problem-detail .flex { flex-wrap: wrap; }
+.sn-view .sn-problem-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.sn-view .sn-problem-detail summary { cursor: pointer; }
+@media (max-width: 1000px) {
+    .sn-view .sn-problems.sn-has-detail { display: block; }
+    .sn-view .sn-has-detail .sn-problem-queue { display: none; }
+    .sn-view .sn-problem-detail td:first-child { width: 110px !important; white-space: normal !important; }
+}
+
 /* Charts and sparklines. */
 .sn-view .sn-spark { display: inline-block; vertical-align: middle; line-height: 0; }
 .sn-view .sn-chart { min-width: 0; }

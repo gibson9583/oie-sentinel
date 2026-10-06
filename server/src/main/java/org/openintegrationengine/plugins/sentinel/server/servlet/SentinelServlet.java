@@ -525,9 +525,11 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     public String bulkAcknowledgeProblems(String bodyJson) {
         try {
             JsonNode root = readBodyTree(bodyJson);
-            List<Long> ids = dropRedactedProblemIds(parseProblemIds(root));
-            int acknowledged = ProblemService.bulkAcknowledge(ids, textOrNull(root, "comment"), getCurrentUserId());
-            return Json.write(Map.of("acknowledged", acknowledged));
+            List<Long> ids = parseProblemIds(root);
+            List<Map<String, Object>> receipts = ProblemService.bulkReceipts(ids,
+                    textOrNull(root, "comment"), getCurrentUserId(), false,
+                    event -> !isChannelRedacted(event.getChannelId()));
+            return Json.write(Map.of("acknowledged", ProblemService.appliedCount(receipts), "receipts", receipts));
         } catch (Exception e) {
             throw translate("bulkAcknowledgeProblems", e);
         }
@@ -537,7 +539,7 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * {@inheritDoc}
      * <p>The exact shape of {@link #bulkAcknowledgeProblems(String)}, sharing
      * both its body parsing and — critically — its
-     * {@link #dropRedactedProblemIds} pass. Redaction matters more here, not
+     * visibility check before each mutation. Redaction matters more here, not
      * less: a bulk resolve closes problems <i>and</i> resets their trigger
      * states, so an unfiltered batch would let a channel-restricted caller
      * silence monitoring on channels they are not entrusted with, and would
@@ -547,9 +549,11 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     public String bulkResolveProblems(String bodyJson) {
         try {
             JsonNode root = readBodyTree(bodyJson);
-            List<Long> ids = dropRedactedProblemIds(parseProblemIds(root));
-            int resolved = ProblemService.bulkResolve(ids, textOrNull(root, "comment"), getCurrentUserId());
-            return Json.write(Map.of("resolved", resolved));
+            List<Long> ids = parseProblemIds(root);
+            List<Map<String, Object>> receipts = ProblemService.bulkReceipts(ids,
+                    textOrNull(root, "comment"), getCurrentUserId(), true,
+                    event -> !isChannelRedacted(event.getChannelId()));
+            return Json.write(Map.of("resolved", ProblemService.appliedCount(receipts), "receipts", receipts));
         } catch (Exception e) {
             throw translate("bulkResolveProblems", e);
         }
@@ -973,35 +977,6 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         if (isChannelRedacted(event.getChannelId())) {
             throw new MirthApiException(Status.NOT_FOUND);
         }
-    }
-
-    /**
-     * Bulk-acknowledge companion to {@link #assertProblemVisible}: silently
-     * drops ids whose problem is on a redacted channel (mirroring the
-     * service's skip-don't-fail semantics for the batch), along with ids
-     * that don't resolve at all — the service would skip those anyway. The
-     * returned count then honestly reports how many the caller was actually
-     * allowed to acknowledge.
-     */
-    private List<Long> dropRedactedProblemIds(List<Long> ids) {
-        if (!doesUserHaveChannelRestrictions()) {
-            return ids;
-        }
-        List<Long> visible = new ArrayList<>();
-        for (Long id : ids) {
-            if (id == null) {
-                continue;
-            }
-            try {
-                if (!isChannelRedacted(ProblemService.get(id).getChannelId())) {
-                    visible.add(id);
-                }
-            } catch (NoSuchElementException e) {
-                // Missing id: the service's bulk loop skips these silently;
-                // dropping here preserves identical behavior.
-            }
-        }
-        return visible;
     }
 
     /**
