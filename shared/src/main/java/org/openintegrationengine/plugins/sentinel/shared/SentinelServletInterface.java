@@ -284,6 +284,14 @@ public interface SentinelServletInterface extends BaseServletInterface {
             @Param("from") @QueryParam("from") Long from,
             @Param("to") @QueryParam("to") Long to) throws ClientException;
 
+    /** Read-only bounded raw activity threshold replay for one explicit channel.
+     * Historical runtime/schedule/lifecycle context is not reconstructed. */
+    @POST
+    @Path("/monitors/_replay")
+    @Operation(summary = "Compares a draft activity rule against retained raw samples")
+    @MirthOperation(name = "sentinelReplayActivity", display = "Replay Sentinel activity thresholds", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC, auditable = false)
+    String replayActivity(@Param(value = "body", excludeFromAudit = true) String requestJson) throws ClientException;
+
     // ========== Actions ==========
 
     /**

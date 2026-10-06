@@ -24,6 +24,7 @@ import {
     ChannelGroupPicker, TagPicker, fmtNum, fmtTime, fmtAgo,
 } from '../ui.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
+import { ActivityReplayPanel } from '../activity-replay.jsx';
 
 const React = platform.React;
 const { h } = platform.ui;
@@ -815,7 +816,7 @@ function MonitorHistoryPanel({ monitorId }) {
 
 /* ---- editor sub-view ----------------------------------------------------- */
 
-function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
+export function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
     const isNew = !monitor;
     const [name, setName] = React.useState((monitor && monitor.name) || '');
     const [description, setDescription] = React.useState((monitor && monitor.description) || '');
@@ -1077,6 +1078,10 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                 ) : null}
             </div>
         </div>
+        <ActivityReplayPanel buildDraft={buildPayload} type={monitorType}
+            compareTo={cfg.compareTo} channelId={scopeType === 'CHANNEL' ? scopeId : ''}
+            channels={channels} manage={manage}
+            draftFingerprint={JSON.stringify({monitorType,configs,scopeType,scopeId,name,minBreaches,enabled,suppressedBy})} />
         {/* Only for a saved monitor: an unsaved draft has no id to query, and
             no history to have. */}
         {!isNew ? <MonitorHistoryPanel monitorId={monitor.id} /> : null}

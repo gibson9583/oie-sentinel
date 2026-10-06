@@ -118,15 +118,20 @@ public final class ErrorRateEvaluator {
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         int windowSeconds = Math.max(1, config.path("windowSeconds").asInt(DEFAULT_WINDOW_SECONDS));
-        double thresholdPercent = config.path("thresholdPercent").asDouble(DEFAULT_THRESHOLD_PERCENT);
-        long minMessages = Math.max(0L, config.path("minMessages").asLong(DEFAULT_MIN_MESSAGES));
-
         ActivityAggregate aggregate = ActivityRepository.sumActivitySamplesForRange(
                 channelId, now.minusSeconds(windowSeconds), now);
         // Verified never null (the query COALESCEs every aggregate); guard anyway.
         long received = aggregate != null ? aggregate.getReceivedSum() : 0L;
         long errors = aggregate != null ? aggregate.getErrorSum() : 0L;
 
+        return evaluateCounts(config, windowSeconds, received, errors);
+    }
+
+    /** Shared metric-only comparison for live evaluation and bounded replay.
+     * Caller supplies sample coverage/runtime context separately. */
+    public static EvaluationOutcome evaluateCounts(JsonNode config, int windowSeconds, long received, long errors) {
+        double thresholdPercent = config.path("thresholdPercent").asDouble(DEFAULT_THRESHOLD_PERCENT);
+        long minMessages = Math.max(0L, config.path("minMessages").asLong(DEFAULT_MIN_MESSAGES));
         // Checked before minMessages so a "no floor" config (minMessages = 0)
         // still cannot divide by zero. Nothing received means the rate is
         // undefined, not 0% — see the class Javadoc.

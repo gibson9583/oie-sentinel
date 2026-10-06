@@ -1,0 +1,21 @@
+import {createRequire} from 'node:module';import {mkdir,writeFile} from 'node:fs/promises';import path from 'node:path';import {fileURLToPath} from 'node:url';
+const {chromium,expect}=createRequire(process.env.SENTINEL_PLAYWRIGHT_PACKAGE||import.meta.url)('@playwright/test');const out=path.join(path.dirname(fileURLToPath(import.meta.url)),'evidence');await mkdir(out,{recursive:true});const browser=await chromium.launch(),results=[];
+try{for(const width of [1440,390]){
+ const page=await browser.newPage({viewport:{width,height:1000}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.goto('http://127.0.0.1:8772');
+ const replay=page.getByRole('button',{name:'Replay candidate',exact:true});await expect(replay).toBeEnabled();
+ await page.locator('#sn-replay-step').fill('1');await replay.click();await expect(page.getByRole('alert')).toContainText('Step must be');
+ await page.locator('#sn-replay-step').fill('300');await replay.evaluate(b=>{b.click();b.click();});
+ expect(await page.evaluate(()=>control.calls.length)).toBe(1);expect(await page.evaluate(()=>control.calls[0].path)).toContain('/_replay');
+ expect(await page.evaluate(()=>control.calls[0].payload.channelId)).toBe('c');await expect(page.locator('#sn-replay-step')).toBeDisabled();
+ await page.evaluate(()=>control.pending.shift().reject(new Error('offline')));await expect(page.getByRole('alert')).toContainText('draft is preserved');
+ await replay.click();await page.locator('.field').filter({has:page.locator('label',{hasText:'Error rate threshold (%)'})}).locator('input').fill('6');
+ await page.evaluate(()=>control.pending.shift().resolve(replayResponse()));await expect(page.getByRole('alert')).toContainText('Draft changed');await expect(page.getByText('threshold breaches across',{exact:false})).toHaveCount(0);
+ await page.evaluate(()=>{control.permission=false;});const before=await page.evaluate(()=>control.calls.length);await replay.click();expect(await page.evaluate(()=>control.calls.length)).toBe(before);await page.evaluate(()=>{control.permission=true;});
+ await replay.click();await page.evaluate(()=>control.pending.shift().resolve({runs:[],points:[],evaluationCount:0,comparisonOnly:true}));await expect(page.getByRole('alert')).toContainText('Unexpected replay response');
+ await replay.click();await page.evaluate(()=>control.pending.shift().resolve(replayResponse()));await expect(page.getByText('1 threshold breaches across 2',{exact:false})).toBeVisible();await expect(page.getByText('These are not historical incidents',{exact:false})).toBeVisible();
+ await expect(page.getByText('INSUFFICIENT_DATA ·',{exact:false}).first()).toBeVisible();await page.getByText('Captured comparisons (2)',{exact:true}).click();await expect(page.getByText('Missing raw coverage',{exact:false})).toBeVisible();
+ await page.screenshot({path:path.join(out,`replay-${width}.png`),fullPage:true});
+ await page.locator('#sn-replay-gap').fill('121');await expect(page.getByText('threshold breaches across',{exact:false})).toHaveCount(0);
+ const type=page.locator('.field').filter({has:page.locator('label',{hasText:'Type',exact:true})}).locator('select');await type.selectOption('ANOMALY');await expect(replay).toBeDisabled();
+ expect(errors).toEqual([]);expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);results.push({width,checks:12,errors,overflow:false});await page.close();
+}}finally{await browser.close();await writeFile(path.join(out,'results.json'),JSON.stringify(results,null,2)+'\n');}console.log(JSON.stringify(results));

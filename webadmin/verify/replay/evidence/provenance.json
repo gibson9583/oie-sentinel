@@ -1,0 +1,11 @@
+{
+  "base": "24de1c2",
+  "validation": "controlled React/Chromium fixtures; isolated Derby test databases, no engine installation",
+  "sha256": {
+    "webadmin/verify/replay/evidence/results.json": "581f5a0c9969db5efc1422c9c296ee8473574d4277695296cf5405c31c6db0c2",
+    "webadmin/verify/replay/evidence/replay-390.png": "a46a5e3a7a022131bc6587ee1991d9b14d6d286c2d445c8cd8aef4993ea38952",
+    "webadmin/verify/replay/evidence/replay-1440.png": "97ee07c484ca6e878a59cf3f5e599b9d88d4fafb49f16850121b24fcb1943894",
+    "server/src/main/java/org/openintegrationengine/plugins/sentinel/server/service/ActivityReplayService.java": "a7cf91079306386547a98999741945d0f0870181b9a6831bfc8977dd35590b37",
+    "webadmin/web/activity-replay.jsx": "9d04a22675d7cd0cefd1b51c537709f92075a76b2e8143eaaf65304846a124bd"
+  }
+}

@@ -84,6 +84,9 @@ export const setMonitorEnabled = (id, enabled) =>
     { ok, message, outcomes: [{ channelId, channelName, status, valueSummary }] } */
 export const testMonitor = (monitor) => apiPost(`${BASE}/monitors/_test`, monitor);
 
+/** POST /monitors/_replay: bounded, read-only metric threshold replay. */
+export const replayActivity = (request) => apiPost(`${BASE}/monitors/_replay`, request);
+
 /** GET /monitors/{id}/history -> daily alerting history
     { monitorId, from, to, bucket: 'DAY', truncated,
       points: [{ bucket, alertCount, avgResolveSeconds }] }.

@@ -209,6 +209,22 @@ public final class ActivityRepository {
         }
     }
 
+    /** Bounded raw-only replay read using existing five-vendor mapped query.
+     * RowBounds limits materialized results; caller asks limit+1 to reject
+     * incomplete input rather than silently replaying a truncated series. */
+    public static List<ActivitySample> listActivitySamplesBounded(String channelId, Instant from, Instant to, int limit) {
+        if (limit < 1 || limit > 10001) throw new IllegalArgumentException("Raw sample limit must be 1..10001");
+        try {
+            Map<String, Object> params = new HashMap<>(); params.put("channelId", channelId);
+            params.put("from", toTimestamp(from)); params.put("to", toTimestamp(to));
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listActivitySamples"), params, new org.apache.ibatis.session.RowBounds(0, limit));
+            List<ActivitySample> samples = new ArrayList<>();
+            for (Map<String, Object> row : rows) samples.add(buildActivitySample(row));
+            return samples;
+        } catch (Exception e) { throw new RepositoryException(e); }
+    }
+
     /**
      * Aggregates activity samples for a channel within a time range: sums of
      * received/sent/error deltas plus average/min/max queued-message
