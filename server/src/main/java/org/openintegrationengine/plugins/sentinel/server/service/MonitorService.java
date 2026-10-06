@@ -474,12 +474,30 @@ public final class MonitorService {
                 // reading of it. Negative is the incoherent case.
                 requireNonNegativeIfPresent(config, "threshold");
                 requireNonNegativeIfPresent(config, "minDurationSeconds");
+                requireOneOfIfPresent(config, "mode", "DEPTH", "GROWTH", "STALL");
+                requireBoundedWholeIfPresent(config, "windowSeconds", 1, 86400);
+                requireBoundedWholeIfPresent(config, "maxSampleGapSeconds", 1, 1200);
+                requireFiniteQueueRate(config, "growthPerMinute", true);
+                requireFiniteQueueRate(config, "maxNetDecreasePerMinute", false);
                 break;
             case CHANNEL_STATE:
                 requireNonNegativeIfPresent(config, "minDurationSeconds");
                 validateDeployedStates(config);
                 break;
         }
+    }
+
+    private static void requireFiniteQueueRate(JsonNode config, String field, boolean positive) {
+        Double value = numericValue(config, field);
+        if (value != null && (!Double.isFinite(value) || (positive ? value <= 0 : value < 0)))
+            throw new IllegalArgumentException(field + " must be a finite " + (positive ? "positive" : "non-negative") + " number");
+    }
+
+    private static void requireBoundedWholeIfPresent(JsonNode config, String field, int min, int max) {
+        JsonNode value = config.get(field);
+        if (value == null || value.isNull()) return;
+        if (!value.isIntegralNumber() || !value.canConvertToInt() || value.intValue() < min || value.intValue() > max)
+            throw new IllegalArgumentException(field + " must be a whole number between " + min + " and " + max);
     }
 
     /**

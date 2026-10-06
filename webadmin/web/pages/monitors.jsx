@@ -285,8 +285,16 @@ function buildConfig(type, cfg) {
             num('minMessages', 'Minimum messages', { min: 0, integer: true });
             break;
         case 'QUEUE_DEPTH':
+            out.mode = String(cfg.mode || 'DEPTH').toUpperCase();
+            if (!['DEPTH', 'GROWTH', 'STALL'].includes(out.mode)) throw new Error('Select a valid queue detection mode.');
             num('threshold', 'Queue depth threshold', { min: 0, integer: true });
-            num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
+            if (out.mode === 'DEPTH') num('minDurationSeconds', 'Minimum duration (seconds)', { min: 0, integer: true });
+            else {
+                num('windowSeconds', 'Queue trend window', { min: 1, max: 86400, integer: true });
+                num('maxSampleGapSeconds', 'Maximum sample gap', { min: 1, max: 1200, integer: true });
+                if (out.mode === 'GROWTH') num('growthPerMinute', 'Growth per minute', { min: 0.001 });
+                else num('maxNetDecreasePerMinute', 'Maximum net decrease per minute', { min: 0 });
+            }
             break;
         case 'CHANNEL_STATE': {
             const states = Array.from(new Set(
@@ -469,23 +477,28 @@ function ConfigFields({ type, cfg, setCfg }) {
                         hint="Windows with fewer received messages than this report insufficient data, never OK." />
                 </div>
             );
-        case 'QUEUE_DEPTH':
-            return (
-                <div className="form-grid">
-                    <NumField label="Queue depth threshold" value={cfg.threshold} min={0}
-                        onChange={(v) => setCfg({ threshold: v })}
-                        hint="Breach when the channel's queued-message count is at or above this." />
-                    <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
-                        onChange={(v) => setCfg({ minDurationSeconds: v })}
-                        hint="The depth must hold at least this long before it counts as a breach." />
-                    <div className="field span-2">
-                        <div className="hint">
-                            Depth is read from the latest sample; with no recent sample the monitor
-                            reports insufficient data.
-                        </div>
-                    </div>
-                </div>
-            );
+        case 'QUEUE_DEPTH': {
+            const mode = String(cfg.mode || 'DEPTH').toUpperCase();
+            return <div className="form-grid">
+                <SelectField label="Queue detection" value={mode} options={[
+                    {value:'DEPTH',label:'Sustained depth'}, {value:'GROWTH',label:'Queue growth'}, {value:'STALL',label:'Queue not shrinking'}]}
+                    onChange={(v) => setCfg({ mode:v })} hint="Trend modes require raw samples covering the full recent window. All modes evaluate started channels." />
+                <NumField label={mode === 'DEPTH' ? 'Queue depth threshold' : 'Minimum queue depth'} value={cfg.threshold} min={0}
+                    onChange={(v) => setCfg({ threshold:v })} hint={mode === 'STALL' ? 'Every sampled depth must be at least this high.' : 'Latest depth must be at least this high.'} />
+                {mode === 'DEPTH' ? <NumField label="Minimum duration (seconds)" value={cfg.minDurationSeconds} min={0}
+                    onChange={(v) => setCfg({minDurationSeconds:v})} hint="Queue stays at or above the threshold for this long." /> : <>
+                    <NumField label="Trend window (seconds)" value={cfg.windowSeconds ?? '300'} min={1} max={86400}
+                        onChange={(v) => setCfg({windowSeconds:v})} hint="Up to 24 hours. No hourly rollups; missing coverage means insufficient data." />
+                    <NumField label="Maximum sample gap (seconds)" value={cfg.maxSampleGapSeconds ?? '120'} min={1} max={1200}
+                        onChange={(v) => setCfg({maxSampleGapSeconds:v})} hint="Tolerance at boundaries and between samples. Set above your collector interval; a gap above this remains unknown." />
+                    {mode === 'GROWTH' ? <NumField label="Growth threshold (messages/min)" value={cfg.growthPerMinute ?? '100'} min={0.001} step={0.1}
+                        onChange={(v) => setCfg({growthPerMinute:v})} hint="Breaches at or above this estimated net growth rate." />
+                        : <NumField label="Maximum net decrease (messages/min)" value={cfg.maxNetDecreasePerMinute ?? '0'} min={0} step={0.1}
+                            onChange={(v) => setCfg({maxNetDecreasePerMinute:v})} hint="Breaches if net decrease is at or below this rate, including growth. Zero detects a flat or growing queue." />}
+                    <p className="field span-2 hint">Aggregate queue snapshots estimate net change. A queue can stay flat while messages arrive and depart; this does not measure true drain throughput, destination message age or exact latency.</p>
+                </>}
+            </div>;
+        }
         case 'CHANNEL_STATE': {
             const selected = Array.isArray(cfg.alertOnStates) ? cfg.alertOnStates : [];
             const extras = selected.filter((s) => !CHANNEL_STATES.includes(s));
@@ -815,7 +828,7 @@ function MonitorHistoryPanel({ monitorId }) {
 
 /* ---- editor sub-view ----------------------------------------------------- */
 
-function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
+export function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
     const isNew = !monitor;
     const [name, setName] = React.useState((monitor && monitor.name) || '');
     const [description, setDescription] = React.useState((monitor && monitor.description) || '');

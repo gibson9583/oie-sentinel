@@ -1,0 +1,23 @@
+import {createRequire} from 'node:module';
+import {mkdir,writeFile} from 'node:fs/promises';
+import path from 'node:path';import {fileURLToPath} from 'node:url';
+const {chromium,expect}=createRequire(process.env.SENTINEL_PLAYWRIGHT_PACKAGE||import.meta.url)('@playwright/test');
+const out=path.join(path.dirname(fileURLToPath(import.meta.url)),'evidence');await mkdir(out,{recursive:true});
+const browser=await chromium.launch(),results=[];
+try{for(const width of [1440,390]){
+ const page=await browser.newPage({viewport:{width,height:1000}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.goto('http://127.0.0.1:8771');
+ const field=label=>page.locator('.field').filter({has:page.locator('label',{hasText:label})}).locator('input');
+ const mode=page.locator('.field').filter({has:page.locator('label',{hasText:'Queue detection'})}).locator('select');
+ await expect(mode).toHaveValue('DEPTH');await mode.selectOption('GROWTH');await expect(field('Trend window')).toHaveValue('300');
+ await field('Trend window').fill('86401');await page.getByRole('button',{name:'Test',exact:true}).click();expect(await page.evaluate(()=>control.modal[1])).toContain('at most 86400');
+ await field('Trend window').fill('300');await field('Growth threshold').fill('125');await page.getByRole('button',{name:'Test',exact:true}).click();
+ let cfg=await page.evaluate(()=>JSON.parse(control.calls.at(-1).payload.configJson));expect(cfg.mode).toBe('GROWTH');expect(cfg.growthPerMinute).toBe(125);expect(cfg.minDurationSeconds).toBeUndefined();
+ await page.evaluate(()=>control.pending.shift().reject(new Error('offline')));await expect(field('Growth threshold')).toHaveValue('125');
+ await mode.selectOption('STALL');await expect(field('Maximum net decrease')).toHaveValue('0');await field('Maximum net decrease').fill('1');await page.getByRole('button',{name:'Test',exact:true}).click();
+ cfg=await page.evaluate(()=>JSON.parse(control.calls.at(-1).payload.configJson));expect(cfg.mode).toBe('STALL');expect(cfg.maxNetDecreasePerMinute).toBe(1);expect(cfg.growthPerMinute).toBeUndefined();
+ await page.evaluate(()=>control.pending.shift().resolve({ok:true,outcomes:[{status:'INSUFFICIENT_DATA',valueSummary:'Raw history does not cover window'}]}));
+ expect(await page.evaluate(()=>control.modal.sections[0].text)).toContain('INSUFFICIENT_DATA');
+ await mode.selectOption('DEPTH');await expect(field('Minimum duration')).toHaveValue('300');await mode.selectOption('GROWTH');await expect(field('Growth threshold')).toHaveValue('125');
+ await expect(page.getByText('Aggregate queue snapshots estimate net change.',{exact:false})).toBeVisible();expect(errors).toEqual([]);expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);
+ await page.screenshot({path:path.join(out,`queue-${width}.png`),fullPage:true});results.push({width,checks:10,errors,overflow:false});await page.close();
+}}finally{await browser.close();await writeFile(path.join(out,'results.json'),JSON.stringify(results,null,2)+'\n');}console.log(JSON.stringify(results));

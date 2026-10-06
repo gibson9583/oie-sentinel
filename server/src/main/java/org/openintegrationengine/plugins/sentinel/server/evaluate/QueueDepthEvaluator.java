@@ -137,6 +137,8 @@ public final class QueueDepthEvaluator {
      */
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
+        String mode = config.path("mode").asText("DEPTH").trim().toUpperCase(java.util.Locale.ROOT);
+        if (!"DEPTH".equals(mode)) return QueueTrendEvaluator.evaluate(monitor, channelId, now, config);
         long threshold = Math.max(0L, config.path("threshold").asLong(DEFAULT_THRESHOLD));
         long minDurationSeconds = Math.max(0L,
                 config.path("minDurationSeconds").asLong(DEFAULT_MIN_DURATION_SECONDS));

@@ -196,7 +196,7 @@ export const MONITOR_TYPE_META = {
     },
     QUEUE_DEPTH: {
         label: 'Queue depth',
-        description: 'Alerts when queued messages stay at or above a depth for a period.',
+        description: 'Alerts on sustained queue depth, estimated growth, or a queue that is not shrinking.',
         // Queue depth is an instantaneous gauge, so the evaluator reads the
         // latest sample; minDurationSeconds separates a real backlog from the
         // burst a destination clears on its next reconnect.
