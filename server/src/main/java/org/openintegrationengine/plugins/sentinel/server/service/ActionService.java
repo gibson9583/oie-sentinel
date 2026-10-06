@@ -432,6 +432,11 @@ public final class ActionService {
      * stored.
      */
     private static void validate(Action action, Integer selfId) {
+        validateDefinition(action);
+        requireUniqueName(action.getName(), selfId);
+    }
+
+    static void validateDefinition(Action action) {
         if (action == null) {
             throw new IllegalArgumentException("Action body is required");
         }
@@ -452,7 +457,6 @@ public final class ActionService {
         }
         validateCondition(action);
         validateConfig(action);
-        requireUniqueName(action.getName(), selfId);
     }
 
     /**

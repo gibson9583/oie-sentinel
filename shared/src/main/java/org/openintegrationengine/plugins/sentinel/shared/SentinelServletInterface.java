@@ -855,4 +855,16 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @Operation(summary = "Applies an export document to this server, matching entities by name")
     @MirthOperation(name = "sentinelImportConfiguration", display = "Import Sentinel configuration", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC)
     String importConfiguration(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
+    @POST
+    @Path("/import/preview")
+    @Operation(summary = "Previews import changes and explicit environment reference mappings without writes")
+    @MirthOperation(name = "sentinelPreviewImport", display = "Preview Sentinel import", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC, auditable = false)
+    String previewImport(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
+
+    @POST
+    @Path("/import/apply")
+    @Operation(summary = "Revalidates and applies a reviewed additive import with per-entity receipts")
+    @MirthOperation(name = "sentinelApplyReviewedImport", display = "Apply reviewed Sentinel import", permission = PERMISSION_MANAGE, type = ExecuteType.ASYNC)
+    String applyReviewedImport(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
+
 }

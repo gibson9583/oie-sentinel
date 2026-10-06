@@ -36,6 +36,7 @@ import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
 import org.openintegrationengine.plugins.sentinel.server.service.DashboardService;
 import org.openintegrationengine.plugins.sentinel.server.service.ExportImportService;
+import org.openintegrationengine.plugins.sentinel.server.service.ImportReviewService;
 import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWindowService;
 import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorHistoryService;
@@ -794,6 +795,20 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         } catch (Exception e) {
             throw translate("importConfiguration", e);
         }
+    }
+
+    @Override
+    public String previewImport(String bodyJson) {
+        try {
+            return Json.write(ImportReviewService.preview(readBodyTree(bodyJson)));
+        } catch (Exception e) { throw translate("previewImport", e); }
+    }
+
+    @Override
+    public String applyReviewedImport(String bodyJson) {
+        try {
+            return Json.write(ImportReviewService.apply(readBodyTree(bodyJson), getCurrentUserId()));
+        } catch (Exception e) { throw translate("applyReviewedImport", e); }
     }
 
     // ========== Boundary helpers ==========

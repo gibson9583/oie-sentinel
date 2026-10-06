@@ -311,6 +311,12 @@ public final class MonitorService {
      *                checks)
      */
     private static void validate(Monitor monitor, Integer selfId) {
+        validateDefinition(monitor);
+        requireValidSuppression(monitor.getSuppressedByMonitorId(), selfId);
+        requireUniqueName(monitor.getName(), selfId);
+    }
+
+    static void validateDefinition(Monitor monitor) {
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
         }
@@ -338,8 +344,6 @@ public final class MonitorService {
         }
         monitor.setRunbookUrl(validateRunbookUrl(monitor.getRunbookUrl()));
         validateConfig(monitor);
-        requireValidSuppression(monitor.getSuppressedByMonitorId(), selfId);
-        requireUniqueName(monitor.getName(), selfId);
     }
 
     /**
