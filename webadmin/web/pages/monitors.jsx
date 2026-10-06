@@ -15,7 +15,7 @@ import {
 } from 'recharts';
 import {
     listMonitors, createMonitor, updateMonitor, deleteMonitor,
-    setMonitorEnabled, testMonitor, getMonitorHistory, getCoreChannels,
+    setMonitorEnabled, testMonitor, getMonitorHistory, getRecoveryProgress, getCoreChannels,
     getCoreChannelGroups, getCoreTags, errText,
 } from '../api.js';
 import {
@@ -305,6 +305,7 @@ function buildConfig(type, cfg) {
         default:
             break;
     }
+    num('minConsecutiveRecoveries', 'Minimum consecutive healthy evaluations', { min: 1, max: 10000, integer: true });
     return out;
 }
 
@@ -813,9 +814,35 @@ function MonitorHistoryPanel({ monitorId }) {
     );
 }
 
+function RecoveryProgressPanel({ monitorId }) {
+    const api = useApi(() => getRecoveryProgress(monitorId), [monitorId]);
+    const [fetchedAt, setFetchedAt] = React.useState(null);
+    React.useEffect(() => { if (api.data) setFetchedAt(new Date()); }, [api.data]);
+    const valid = api.data && Array.isArray(api.data.rows) && Number.isInteger(api.data.required);
+    const rows = valid ? api.data.rows : [];
+    return <div className="panel mb-3">
+        <div className="panel-header">Latest saved trigger progress
+            <button className="btn btn-sm" onClick={api.reload} disabled={api.loading}>Refresh progress</button>
+        </div>
+        <div className="panel-body">
+            {api.error ? <p className="text-err" role="alert">Progress refresh failed: {api.error}. Retained observations may be stale.</p> : null}
+            <p className="sn-hint">{fetchedAt ? `Fetched ${fmtTime(fetchedAt)}. ` : 'Loading progress. '}
+                Saved configuration only; unsaved edits and draft tests do not advance these counters. Eligibility closure is separate from recovery.</p>
+            {api.data && !valid ? <p className="text-err" role="alert">Unexpected progress response. Refresh to retry; no health conclusion is available.</p> : null}
+            {valid && !rows.length ? <p>No visible trigger observations. This does not establish health.</p> : null}
+            {rows.map((r) => <p key={`${r.channelId}-${r.metadataId}`} style={{ overflowWrap: 'anywhere' }}>
+                {r.channelId}{r.metadataId == null ? '' : ` / connector ${r.metadataId}`} · {r.state} ·
+                {' '}opening breaches {r.consecutiveBreachCount} · recovery healthy {r.healthyCount}/{r.required}
+                {' '}· evaluated {fmtTime(r.lastEvaluatedTime) || 'unknown'}{r.openAlertEventId == null ? ' · no open problem' : ` · problem ${r.openAlertEventId} (${r.problemStatus || 'missing'})`}
+            </p>)}
+            {valid && api.data.truncated ? <p className="text-err">Partial: first 1,000 visible triggers. Refreshing does not expand this limit.</p> : null}
+        </div>
+    </div>;
+}
+
 /* ---- editor sub-view ----------------------------------------------------- */
 
-function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
+export function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
     const isNew = !monitor;
     const [name, setName] = React.useState((monitor && monitor.name) || '');
     const [description, setDescription] = React.useState((monitor && monitor.description) || '');
@@ -1050,6 +1077,11 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                         {(MONITOR_TYPE_META[monitorType] || { label: monitorType }).label} settings
                     </div>
                     <ConfigFields type={monitorType} cfg={cfg} setCfg={setCfg} />
+                    <div className="form-grid" style={{ marginTop: 16 }}>
+                        <NumField label="Minimum consecutive healthy evaluations" value={cfg.minConsecutiveRecoveries} min={1} max={10000}
+                            onChange={(v) => setCfg({ minConsecutiveRecoveries: v })}
+                            hint="Default 1 preserves immediate recovery. An open problem stays open until this many consecutive healthy evaluations; breach or insufficient data resets recovery progress. Progress survives restart/failover. Scope departure and manual resolve retain their existing behavior." />
+                    </div>
                 </fieldset>
             </div>
             <div className="panel-body"
@@ -1079,7 +1111,7 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
         </div>
         {/* Only for a saved monitor: an unsaved draft has no id to query, and
             no history to have. */}
-        {!isNew ? <MonitorHistoryPanel monitorId={monitor.id} /> : null}
+        {!isNew ? <><RecoveryProgressPanel monitorId={monitor.id} /><MonitorHistoryPanel monitorId={monitor.id} /></> : null}
         </>
     );
 }

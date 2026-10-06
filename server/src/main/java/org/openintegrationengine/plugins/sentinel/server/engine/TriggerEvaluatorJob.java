@@ -37,6 +37,7 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutc
 import org.openintegrationengine.plugins.sentinel.server.evaluate.InactivityEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.RecoveryHysteresis;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -474,13 +475,13 @@ public class TriggerEvaluatorJob implements Job {
      *   <li><b>OK</b> — resolves any open alert (also covering the
      *       PROBLEM → INSUFFICIENT_DATA → OK path, where the state is no
      *       longer PROBLEM but an alert is still open) and settles the state
-     *       to OK.</li>
+     *       to OK once optional consecutive recovery hysteresis is satisfied.</li>
      *   <li><b>INSUFFICIENT_DATA</b> — parks the state, resetting the breach
      *       counter, but deliberately leaves any open alert untouched: a
      *       transient data gap (collector restart, baseline aging out) is
      *       not evidence the underlying problem recovered, and
      *       resolve-then-reopen flapping would double-notify. The alert
-     *       resolves on the next confirmed OK, and until then it still gets
+     *       resolves after the configured consecutive confirmed OK evaluations, and until then it still gets
      *       the still-open pass — see {@link #onInsufficientData}.</li>
      * </ul>
      */
@@ -509,12 +510,13 @@ public class TriggerEvaluatorJob implements Job {
             state.setLastChangeTime(now);
         }
 
+        RecoveryHysteresis.Progress recovery = RecoveryHysteresis.advance(monitor, state, outcome);
         switch (outcome.getResult()) {
             case BREACH:
                 onBreach(monitor, state, channelId, metadataId, outcome, now, afterCommit);
                 break;
             case OK:
-                onOk(monitor, state, now, afterCommit);
+                onOk(monitor, state, recovery, now, afterCommit);
                 break;
             case INSUFFICIENT_DATA:
                 onInsufficientData(monitor, state, now, afterCommit);
@@ -522,7 +524,7 @@ public class TriggerEvaluatorJob implements Job {
         }
 
         state.setLastEvaluatedTime(now);
-        state.setLastValueJson(outcome.getValueJson());
+        state.setLastValueJson(RecoveryHysteresis.evidence(outcome.getValueJson(), recovery));
         if (isNew) {
             TriggerStateRepository.insertTriggerState(state);
         } else {
@@ -597,7 +599,18 @@ public class TriggerEvaluatorJob implements Job {
     }
 
     /** OK branch of {@link #applyOutcome} — see its Javadoc. */
-    private static void onOk(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
+    private static void onOk(Monitor monitor, TriggerState state, RecoveryHysteresis.Progress recovery,
+            Instant now, List<Runnable> afterCommit) {
+        if (state.getOpenAlertEventId() != null && recovery.required() > 1) {
+            AlertEvent open = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
+            if (open != null && open.getStatus() == AlertStatus.PROBLEM && recovery.healthyCount() < recovery.required()) {
+                if (state.getState() != TriggerStatus.PROBLEM) state.setLastChangeTime(now);
+                state.setState(TriggerStatus.PROBLEM);
+                state.setConsecutiveBreachCount(0);
+                stillOpenPass(monitor, state, afterCommit);
+                return;
+            }
+        }
         if (state.getOpenAlertEventId() != null) {
             resolveOpenAlert(monitor, state, null, now, afterCommit);
         }

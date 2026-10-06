@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sentinel recovery interaction fixture</title>
+<style>
+:root { --accent:#2868c8; --text:#182333; --text-dim:#46566d; --line:#cbd3df; --line-strong:#9cabbf; }
+body { color:var(--text); background:#f6f8fb; font:14px system-ui; margin:16px; }
+.panel { border:1px solid var(--line); background:white; } .panel-header,.panel-body { padding:16px; }
+.panel-header,.panel-tools { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
+.form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; } .span-2 { grid-column:span 2; }
+.field label { display:block; margin-bottom:6px; } input,select { max-width:100%; box-sizing:border-box; padding:8px; }
+.field input:not([type=checkbox]),.field select { width:100%; } .hint,.sn-hint { color:var(--text-dim); margin-top:6px; }
+.btn,.segpill button { padding:10px 14px; color:var(--text); border:1px solid var(--line-strong); background:white; cursor:pointer; }
+.btn-primary,.segpill .on { color:white; background:var(--accent); } button:disabled { opacity:.55; cursor:default; } .text-err { color:#a51c24; }
+fieldset { min-width:0; } p,pre { overflow-wrap:anywhere; } @media(max-width:600px) { .form-grid { grid-template-columns:1fr; } .span-2 { grid-column:span 1; } }
+</style></head><body><div id="app"></div><script src="bundle.js"></script></body></html>

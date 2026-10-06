@@ -5,6 +5,7 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.service;
 
+import org.openintegrationengine.plugins.sentinel.server.evaluate.RecoveryHysteresis;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
@@ -438,6 +439,7 @@ public final class MonitorService {
         if (!config.isObject()) {
             throw new IllegalArgumentException("Monitor config must be a JSON object");
         }
+        RecoveryHysteresis.validate(config);
 
         switch (monitor.getMonitorType()) {
             case INACTIVITY:
