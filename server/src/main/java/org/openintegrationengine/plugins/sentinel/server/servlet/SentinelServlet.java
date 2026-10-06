@@ -430,6 +430,15 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    @Override
+    public String getTriageViewContext() {
+        try {
+            String serverId = com.mirth.connect.server.controllers.ConfigurationController.getInstance().getServerId();
+            if (serverId == null || serverId.isBlank()) throw new IllegalStateException("Engine identity unavailable");
+            return Json.write(Map.of("serverId", serverId, "userId", getCurrentUserId()));
+        } catch (Exception e) { throw translate("getTriageViewContext", e); }
+    }
+
     // ========== Problems ==========
 
     /**

@@ -4,10 +4,14 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "build": "node build.mjs"
+        "build": "node build.mjs",
+        "test:saved-views": "node --test verify/triage-views.test.mjs && node verify/saved-views.browser.mjs"
     },
     "devDependencies": {
-        "esbuild": "^0.21.0"
+        "@playwright/test": "^1.56.1",
+        "esbuild": "^0.21.0",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1"
     },
     "dependencies": {
         "recharts": "^2.12.0"

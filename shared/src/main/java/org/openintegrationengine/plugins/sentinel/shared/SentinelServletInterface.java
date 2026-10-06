@@ -461,6 +461,13 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String activateMaintenanceWindowNow(@Param("id") @PathParam("id") int id,
             @Param("durationMinutes") @QueryParam("durationMinutes") @DefaultValue("60") int durationMinutes) throws ClientException;
 
+    /** Stable signed-in engine/user namespace for browser-only triage preferences. */
+    @GET
+    @Path("/triageViews/context")
+    @Operation(summary = "Returns the signed-in triage preference namespace")
+    @MirthOperation(name = "sentinelGetTriageViewContext", display = "Get triage preference context", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getTriageViewContext() throws ClientException;
+
     // ========== Problems ==========
 
     /**

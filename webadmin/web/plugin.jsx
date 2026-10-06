@@ -60,6 +60,10 @@ const SENTINEL_CSS = `
 /* DataTable host (useDataTable mounts DataTable.el inside). */
 .sn-view .sn-dt-host { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
+.sn-view .sn-saved-views { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.sn-view .sn-saved-views label { display: flex; flex-direction: column; gap: 4px; }
+.sn-view .sn-saved-views input, .sn-view .sn-saved-views select { max-width: 220px; }
+
 /* Charts and sparklines. */
 .sn-view .sn-spark { display: inline-block; vertical-align: middle; line-height: 0; }
 .sn-view .sn-chart { min-width: 0; }
