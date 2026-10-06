@@ -21,6 +21,7 @@ import {
     ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, severityChipNode,
     MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
+import { ChannelMaintenanceShortcut } from '../channel-maintenance.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
 
 const React = platform.React;
@@ -692,6 +693,7 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
 
             {detail ? (
                 <>
+                    <ChannelMaintenanceShortcut key={ev.channelId} channelId={ev.channelId} channelName={detail.channelName} />
                     {ev.suppressed ? (
                         <div className="panel mb-3"><div className="panel-body">
                             <span className="tag amber">Suppressed</span>{' '}

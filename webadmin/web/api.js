@@ -153,6 +153,10 @@ export const activateMaintenanceWindowNow = (id, durationMinutes) =>
     apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_activateNow`, null,
         { durationMinutes: durationMinutes == null ? 60 : durationMinutes });
 
+/** Idempotent one-time CHANNEL suppression; retries must preserve the payload/requestId. */
+export const createChannelMaintenance = payload => apiPost(`${BASE}/maintenanceWindows/_channel`, payload);
+export const cancelChannelMaintenance = requestId => apiPost(`${BASE}/maintenanceWindows/_channel/${enc(requestId)}/_cancel`, null);
+
 /* ---- Problems ----------------------------------------------------------- */
 
 /** GET /problems -> PagedResult<AlertEvent> { items, total, page, pageSize }.

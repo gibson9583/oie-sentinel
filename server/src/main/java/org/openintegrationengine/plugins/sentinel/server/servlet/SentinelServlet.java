@@ -430,6 +430,35 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    @Override
+    public String createChannelMaintenance(String bodyJson) {
+        try {
+            JsonNode root = readBodyTree(bodyJson);
+            String channelId = textOrNull(root, "channelId");
+            if (channelId == null || isChannelRedacted(channelId)) throw new MirthApiException(Status.NOT_FOUND);
+            if (ScopeResolver.listChannels().stream().noneMatch(c -> channelId.equals(c.getChannelId()))) {
+                throw new MirthApiException(Status.NOT_FOUND);
+            }
+            JsonNode until = root.path("untilMillis");
+            if (!until.isIntegralNumber() || !until.canConvertToLong()) {
+                throw new IllegalArgumentException("untilMillis must be an integer epoch timestamp");
+            }
+            return Json.write(MaintenanceWindowService.channelMaintenance(textOrNull(root, "requestId"),
+                    channelId, until.asLong(), textOrNull(root, "reason"), getCurrentUserId()));
+        } catch (Exception e) { throw translate("createChannelMaintenance", e); }
+    }
+
+    @Override
+    public String cancelChannelMaintenance(String requestId) {
+        try {
+            Map<String,Object> request = org.openintegrationengine.plugins.sentinel.server.db.MaintenanceRequestRepository.get(requestId);
+            if (request == null || isChannelRedacted((String) request.get("channel_id"))) {
+                throw new MirthApiException(Status.NOT_FOUND);
+            }
+            return Json.write(MaintenanceWindowService.cancelChannelMaintenance(requestId, getCurrentUserId()));
+        } catch (Exception e) { throw translate("cancelChannelMaintenance", e); }
+    }
+
     // ========== Problems ==========
 
     /**

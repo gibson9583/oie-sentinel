@@ -364,6 +364,9 @@ final class MapperStatementMatrix {
         values.put("success", Boolean.TRUE);
         values.put("error_message", "");
 
+        values.put("request_id", "00000000-0000-0000-0000-000000000001");
+        values.put("fingerprint", "0".repeat(64));
+        values.put("window_id", null);
         values.put("window_mode", "RECURRING");
         values.put("repeat_type", "DAILY");
         values.put("days_of_week", "1");

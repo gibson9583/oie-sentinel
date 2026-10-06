@@ -577,6 +577,31 @@
 
     <!-- ========== MAINTENANCE_WINDOW (table sentinel_maintenance_window) ========== -->
 
+    <resultMap id="maintenanceRequestResult" type="map">
+        <result property="request_id" column="request_id" />
+        <result property="fingerprint" column="fingerprint" />
+        <result property="channel_id" column="channel_id" />
+        <result property="window_id" column="window_id" />
+    </resultMap>
+    <select id="getMaintenanceRequest" parameterType="map" resultMap="maintenanceRequestResult">
+        SELECT request_id, fingerprint, channel_id, window_id FROM sentinel_maintenance_request
+        WHERE request_id = #{request_id}
+    </select>
+    <insert id="insertMaintenanceRequest" parameterType="map">
+        INSERT INTO sentinel_maintenance_request (request_id, fingerprint, channel_id)
+        VALUES (#{request_id}, #{fingerprint}, #{channel_id})
+    </insert>
+    <update id="completeMaintenanceRequest" parameterType="map">
+        UPDATE sentinel_maintenance_request SET window_id = #{window_id,jdbcType=INTEGER}
+        WHERE request_id = #{request_id}
+    </update>
+
+    <update id="disableChannelMaintenanceWindow" parameterType="map">
+        UPDATE sentinel_maintenance_window SET enabled = FALSE
+        WHERE id = #{window_id} AND scope_type = 'CHANNEL' AND scope_id = #{channel_id}
+          AND window_mode = 'SUPPRESS' AND repeat_type = 'NONE'
+    </update>
+
     <select id="getMaintenanceWindow" parameterType="map" resultType="map">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
             start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time

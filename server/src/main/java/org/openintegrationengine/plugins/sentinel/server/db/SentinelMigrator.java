@@ -99,6 +99,7 @@ import org.slf4j.LoggerFactory;
  *   <li><b>9</b> — Durable resolution dispatch outbox.</li>
  *   <li><b>10</b> — Durable problem dispatch outbox, backfilled for open events.</li>
  *   <li><b>11</b> — Per-node deployed-channel inventory for cluster-wide evaluation.</li>
+ *   <li><b>13</b> — Durable channel-maintenance request identities.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
  * </ul>
  * <p>Versions 7–12 are this release's sequence after released schema v6.
@@ -119,7 +120,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 12;
+    public static final int LATEST_VERSION = 13;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -199,6 +200,7 @@ public class SentinelMigrator extends Migrator {
         if (current < 12 && targetVersion >= 12) {
             applyV12();
         }
+        if (current < 13 && targetVersion >= 13) { applyV13(); }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -288,7 +290,8 @@ public class SentinelMigrator extends Migrator {
                                 && indexExists("sentinel_alert_event", "idx_sentinel_alert_problem",
                                         "problem_pending, status, opened_time")
                                 ? (tableExists("sentinel_channel_presence")
-                                        ? (columnExists("sentinel_connector_status_event", "deployment_time") ? 12 : 11) : 10) : 9;
+                                        ? (columnExists("sentinel_connector_status_event", "deployment_time")
+                                                ? (tableExists("sentinel_maintenance_request") ? 13 : 12) : 11) : 10) : 9;
                     }
                     return 8;
                 }
@@ -399,6 +402,16 @@ public class SentinelMigrator extends Migrator {
         } catch (Exception e) {
             throw new MigrationException("Failed to add Sentinel observation deployment identity", e);
         }
+    }
+
+    /** Single-table durable request receipts survive schedule deletion and restart. */
+    private void applyV13() throws MigrationException {
+        try {
+            if (!tableExists("sentinel_maintenance_request")) {
+                executeScript("/" + getDatabaseType() + "-sentinel-v13.sql");
+            }
+        } catch (MigrationException e) { throw e; }
+        catch (Exception e) { throw new MigrationException("Failed to create maintenance request receipts", e); }
     }
 
     private void addColumnIfAbsent(String table, String column, String sqlType) throws MigrationException {
@@ -649,7 +662,8 @@ public class SentinelMigrator extends Migrator {
             "sentinel_action",
             "sentinel_maintenance_window",
             "sentinel_monitor",
-            "sentinel_node_lease"};
+            "sentinel_node_lease",
+            "sentinel_maintenance_request"};
 
     /**
      * Explicit secondary indexes created by Sentinel. The naming convention is
@@ -696,6 +710,8 @@ public class SentinelMigrator extends Migrator {
      * one explicitly named FK, so a fresh v1 script cannot collide.
      */
     private static final NamedObject[] POSTGRES_CONSTRAINTS = {
+            object("sentinel_maintenance_request", "sentinel_maintenance_request_pkey"),
+
             object("sentinel_monitor", "sentinel_monitor_pkey"),
             object("sentinel_monitor", "sentinel_monitor_name_key"),
             object("sentinel_monitor", "sentinel_monitor_suppressed_by_monitor_id_fkey"),
@@ -720,12 +736,14 @@ public class SentinelMigrator extends Migrator {
 
     /** Oracle constraints that were explicitly named by shipped scripts. */
     private static final NamedObject[] ORACLE_CONSTRAINTS = {
+
             object("sentinel_trigger_state", "uq_sentinel_trigger_state"),
             object("sentinel_trigger_state", "fk_sentinel_trigger_state_alert_event"),
             object("sentinel_channel_activity_trend", "uq_sentinel_activity_trend")};
 
     /** SQL Server schema-global constraint names introduced by v7/v8. */
     private static final NamedObject[] SQLSERVER_CONSTRAINTS = {
+
             object("sentinel_node_lease", "df_sentinel_node_lease_epoch"),
             object("sentinel_connector_status_event", "df_sentinel_connector_node_id")};
 

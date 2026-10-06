@@ -18,7 +18,7 @@ class SentinelMigratorTest {
 
     @Test
     void latestSchemaIncludesBothLifecycleOutboxes() {
-        assertEquals(12, SentinelMigrator.LATEST_VERSION);
+        assertEquals(13, SentinelMigrator.LATEST_VERSION);
     }
 
     @Test
