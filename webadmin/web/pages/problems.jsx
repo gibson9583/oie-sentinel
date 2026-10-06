@@ -13,7 +13,7 @@
 import { platform } from '@oie/web-shell';
 import { errorModal } from '@oie/web-ui';
 import {
-    getProblems, getProblem, acknowledgeProblem, resolveProblem,
+    getTriageViewContext, getProblems, getProblem, acknowledgeProblem, resolveProblem,
     bulkAcknowledgeProblems, bulkResolveProblems, listMonitors, getCoreChannels, errText,
 } from '../api.js';
 import {
@@ -21,6 +21,8 @@ import {
     ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, severityChipNode,
     MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
+import { SavedTriageViews } from '../saved-triage-views.jsx';
+import { readViews, viewStorageKey, VIEW_DEFAULTS } from '../triage-views.js';
 import { readIntent, clearIntent } from '../host.jsx';
 
 const React = platform.React;
@@ -52,7 +54,6 @@ function confirmWithComment({ title, message, okLabel, danger = false }) {
     });
 }
 
-const PAGE_SIZE = 25;
 const POLL_MS = 30000;
 
 /* Activity window on the detail pane: this much either side of the open, so
@@ -80,7 +81,7 @@ function pollGate() {
     }
 }
 
-function problemParams(filters, page, sort) {
+function problemParams(filters, page, sort, pageSize) {
     return {
         status: filters.status || undefined,
         severity: filters.severity && filters.severity.length ? filters.severity.join(',') : undefined,
@@ -91,7 +92,7 @@ function problemParams(filters, page, sort) {
         sort: sort.column,
         sortDir: sort.dir,
         page,
-        pageSize: PAGE_SIZE,
+        pageSize,
     };
 }
 
@@ -197,10 +198,10 @@ function buildColumns(namesRef) {
  * it before the first render means the very first request is already the right
  * one.</p>
  */
-function initialFilters() {
+function initialFilters(fallback = DEFAULT_PROBLEM_FILTERS) {
     const intent = readIntent();
     if (!intent) {
-        return DEFAULT_PROBLEM_FILTERS;
+        return fallback;
     }
     if (intent.kind === 'problems') {
         clearIntent();
@@ -215,9 +216,30 @@ function initialFilters() {
 }
 
 export function ProblemsPage() {
-    const [filters, setFilters] = React.useState(initialFilters);
+    const context = useApi(getTriageViewContext, []);
+    const [withoutPreferences, setWithoutPreferences] = React.useState(false);
+    React.useEffect(() => platform.store.subscribe('user', () => { setWithoutPreferences(false); context.reload(); }), [context.reload]);
+    if (context.loading && !withoutPreferences) return <div className="sn-empty">Loading triage preferences…</div>;
+    const user = platform.store.getState('user');
+    const matchesAccount = context.data && String(context.data.userId) === String(user?.id);
+    const key = matchesAccount ? viewStorageKey(context.data) : null;
+    if ((!key || context.error) && !withoutPreferences) return <div className="panel"><div className="panel-body" role="status">
+        <p>Saved-view account context unavailable. {context.error}</p>
+        <button className="btn btn-sm" onClick={context.reload}>Retry context</button>
+        <button className="btn btn-sm" onClick={() => setWithoutPreferences(true)}>Use Problems without saved views</button>
+    </div></div>;
+    return <ProblemsWorkspace key={withoutPreferences ? `without-preferences:${user?.id}` : key} storageKey={withoutPreferences ? null : key} />;
+}
+
+function ProblemsWorkspace({ storageKey }) {
+    const [initialView] = React.useState(() => {
+        try { return readViews(localStorage, storageKey).last || VIEW_DEFAULTS; }
+        catch (e) { return VIEW_DEFAULTS; }
+    });
+    const [filters, setFilters] = React.useState(() => initialFilters(initialView.filters));
     const [page, setPage] = React.useState(0);
-    const [sort, setSort] = React.useState(DEFAULT_SORT);
+    const [pageSize, setPageSize] = React.useState(initialView.pageSize);
+    const [sort, setSort] = React.useState(initialView.sort);
     const [data, setData] = React.useState(null);       // { items, total }
     const [error, setError] = React.useState(null);     // interactive-load failure
     const [loading, setLoading] = React.useState(true);
@@ -226,7 +248,7 @@ export function ProblemsPage() {
 
     const seqRef = React.useRef(0);
     const stateRef = React.useRef(null);
-    stateRef.current = { filters, page, sort };
+    stateRef.current = React.useMemo(() => ({ filters, page, sort, pageSize }), [filters, page, sort, pageSize]);
     const namesRef = React.useRef({ channels: {}, monitors: {} });
     const modRef = React.useRef(false);                 // last click had ctrl/cmd/shift
     const handlersRef = React.useRef({ onSelect: () => {} });
@@ -241,13 +263,13 @@ export function ProblemsPage() {
         const s = stateRef.current;
         if (!background) setLoading(true);
         try {
-            const res = await getProblems(problemParams(s.filters, s.page, s.sort));
-            if (seq !== seqRef.current) return;
+            const res = await getProblems(problemParams(s.filters, s.page, s.sort, s.pageSize));
+            if (seq !== seqRef.current || s !== stateRef.current) return;
             setData(normalizePaged(res));
             setError(null);
             failStreakRef.current = false;
         } catch (e) {
-            if (seq !== seqRef.current) return;
+            if (seq !== seqRef.current || s !== stateRef.current) return;
             if (background) {
                 if (!failStreakRef.current) toast(`Problems refresh failed: ${errText(e)}`, 'info');
                 failStreakRef.current = true;
@@ -265,8 +287,8 @@ export function ProblemsPage() {
         const delay = filters.q !== prevQRef.current ? 300 : 0;
         prevQRef.current = filters.q;
         const t = setTimeout(() => load(false), delay);
-        return () => clearTimeout(t);
-    }, [filters, page, sort, load]);
+        return () => { clearTimeout(t); ++seqRef.current; };
+    }, [filters, page, sort, pageSize, load]);
 
     React.useEffect(() => {
         const t = setInterval(() => { if (pollGate()) load(true); }, POLL_MS);
@@ -419,9 +441,20 @@ export function ProblemsPage() {
         }
     };
 
+    const viewValue = React.useMemo(() => ({ filters, sort, pageSize }), [filters, sort, pageSize]);
+    const loadView = value => {
+        ++seqRef.current; setFilters(value.filters); setSort(value.sort); setPageSize(value.pageSize); setPage(0); setData(null);
+        const t = table(); if (t) t.clearSelection(); setSelCount(0);
+    };
+    React.useEffect(() => {
+        const t = table(); if (!t) return;
+        t.sortKey = { severity: 'severity', channel_id: 'channel', opened_time: 'opened' }[sort.column];
+        t.sortDir = sort.dir === 'ASC' ? 1 : -1; t.render();
+    }, [sort, table]);
+
     const rangeText = !data ? '' : (data.total === 0
         ? '0 of 0'
-        : `${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + data.items.length} of ${data.total}`);
+        : `${page * pageSize + 1}–${page * pageSize + data.items.length} of ${data.total}`);
 
     return (
         <div className="sn-problems">
@@ -432,6 +465,8 @@ export function ProblemsPage() {
                     onChanged={() => load(true)} />
             ) : null}
             <div style={{ display: detailId != null ? 'none' : undefined }}>
+                <SavedTriageViews storageKey={storageKey} value={viewValue} onLoad={loadView}
+                    onPageSizeChange={size => { setPageSize(size); setPage(0); setData(null); }} />
                 <FilterBar value={filters} onChange={changeFilters}
                     monitors={monitorsApi.data} channels={channelsApi.data || NO_CHANNELS} />
                 <div className="flex items-center gap-2" style={{ marginBottom: 8 }}>
@@ -475,7 +510,7 @@ export function ProblemsPage() {
                             onClick={() => setPage(page - 1)}>‹ Prev</button>
                         <span className="sn-hint">{rangeText}</span>
                         <button className="btn btn-sm"
-                            disabled={loading || (page + 1) * PAGE_SIZE >= data.total}
+                            disabled={loading || (page + 1) * pageSize >= data.total}
                             onClick={() => setPage(page + 1)}>Next ›</button>
                     </div>
                 ) : null}
