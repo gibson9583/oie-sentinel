@@ -104,6 +104,28 @@ class LeaseFencePersistenceTest {
     }
 
     @Test
+    void importLeaseLocksDoNotEncloseOrRollbackIndependentEntityWrites() throws Exception {
+        LeaseFence fence = acquire("sentinel-config-import", "import-a", 90);
+        SqlSession importLock = sessions.openSession(false);
+        try {
+            NodeLeaseRepository.requireFence(importLock, fence);
+            // The dedicated lock session is not the service write connection.
+            // A callback may commit an entity even if its later entries fail.
+            try (Connection independent = DriverManager.getConnection(url); Statement write = independent.createStatement()) {
+                write.execute("CREATE TABLE import_receipt_probe (id INTEGER)");
+                write.executeUpdate("INSERT INTO import_receipt_probe VALUES (1)");
+            }
+            importLock.rollback();
+            try (Connection independent = DriverManager.getConnection(url); Statement read = independent.createStatement(); ResultSet rows = read.executeQuery("SELECT COUNT(*) FROM import_receipt_probe")) {
+                assertTrue(rows.next()); assertEquals(1, rows.getInt(1));
+            }
+        } finally {
+            importLock.close();
+            NodeLeaseRepository.releaseNodeLease(fence.leaseName(), fence.nodeId(), fence.epoch());
+        }
+    }
+
+    @Test
     void releasedEpochCannotRenewReclaimOrAuthorizeEvenWhenTheSameNodeReacquires() {
         LeaseFence first = acquire("sentinel-engine", "node-a", 90);
         assertTrue(NodeLeaseRepository.releaseNodeLease(first.leaseName(), first.nodeId(), first.epoch()));

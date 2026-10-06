@@ -173,7 +173,7 @@ public final class MaintenanceWindowService {
      * validated by {@link #normalizeTimezone}, and null keeps meaning "the
      * server's zone" so pre-v3 clients do too.
      */
-    private static void validate(MaintenanceWindow window) {
+    static void validate(MaintenanceWindow window) {
         if (window == null) {
             throw new IllegalArgumentException("Maintenance window body is required");
         }

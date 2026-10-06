@@ -7,17 +7,18 @@
 // enforcement. Save success -> toast; validation failures (client pre-check or
 // server 400) -> errorModal.
 //
-// Also hosts the Export / Import panel over GET /export and POST /import. Those
+// Also hosts export and the reviewed import preview/apply flow. Those
 // two endpoints are MANAGE-gated rather than SETTINGS-gated (the export carries
 // the full action config surface), so their controls use canManage() while the
 // settings form above keeps canManageSettings().
 
 import { platform } from '@oie/web-shell';
-import { errorModal, confirmDialog, saveFile, pickFile } from '@oie/web-ui';
+import { errorModal, saveFile, pickFile } from '@oie/web-ui';
 import {
-    getSettings, updateSettings, exportConfiguration, importConfiguration, errText,
+    getSettings, updateSettings, exportConfiguration, errText,
 } from '../api.js';
 import { useApi, canManage, canManageSettings, toast, fmtTime } from '../ui.jsx';
+import { ImportReview } from '../import-review.jsx';
 
 const React = platform.React;
 
@@ -79,6 +80,7 @@ const ENTITY_LABELS = {
 const OUTCOME_META = {
     CREATED: { label: 'Created', cls: 'tag accent' },
     UPDATED: { label: 'Updated', cls: 'tag' },
+    UNCERTAIN: { label: 'Uncertain', cls: 'tag amber' },
     SKIPPED: { label: 'Skipped', cls: 'tag' },
 };
 
@@ -103,14 +105,15 @@ function ImportResult({ result }) {
     return (
         <div style={{ marginTop: 12 }}>
             <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
-                <span className="tag accent">Applied</span>
+                <span className="tag">Run receipt</span>
                 <span className="sn-hint">
-                    Created {result.created}, updated {result.updated}, skipped {result.skipped}
+                    Created {result.created}, updated {result.updated}, skipped {result.skipped}, uncertain {result.uncertain || 0}
                 </span>
                 {result.exportedAt
                     ? <span className="sn-hint">Document exported {fmtTime(result.exportedAt)}</span>
                     : null}
             </div>
+            {result.incomplete ? <p className="text-err">Run interrupted. Unprocessed entries have no receipt; preview again to reconcile.</p> : null}
             {result.secretsNotice
                 ? <div className="sn-hint" style={{ marginTop: 6 }}>{result.secretsNotice}</div>
                 : null}
@@ -145,7 +148,6 @@ function ExportImportPanel() {
     const manage = canManage();
     const [busy, setBusy] = React.useState(null);   // null | 'export' | 'import'
     const [doc, setDoc] = React.useState(null);     // { name, parsed }
-    const [result, setResult] = React.useState(null);
 
     // saveFile gives a native Save As dialog where the browser supports the
     // File System Access API and falls back to a plain download elsewhere. It
@@ -174,37 +176,11 @@ function ExportImportPanel() {
     const pick = async () => {
         const file = await pickFile('application/json,.json');
         if (!file) return;   // dialog dismissed
-        setResult(null);
         try {
             setDoc({ name: file.name, parsed: JSON.parse(file.content) });
         } catch (err) {
             setDoc(null);
             errorModal('Invalid File', `${file.name} is not valid JSON.`);
-        }
-    };
-
-    // The import writes as soon as it is called, so the confirm is the only
-    // step between the click and the change — it has to name the file and say
-    // plainly what is about to be touched.
-    const run = async () => {
-        if (!doc) return;
-        const ok = await confirmDialog('Import Configuration',
-            `Import ${doc.name} into this server? Monitors, actions and maintenance windows are `
-            + 'created and updated here immediately — entities are matched by name, so a name '
-            + 'already on this server is overwritten. Nothing is deleted.',
-            { danger: true, okLabel: 'Import' });
-        if (!ok) return;
-        setBusy('import');
-        try {
-            const applied = await importConfiguration(doc.parsed);
-            setResult(applied);
-            toast(`Import applied: ${applied.created} created, ${applied.updated} updated, `
-                + `${applied.skipped} skipped.`, 'success');
-        } catch (e) {
-            setResult(null);
-            errorModal('Import Failed', errText(e));
-        } finally {
-            setBusy(null);
         }
     };
 
@@ -242,17 +218,8 @@ function ExportImportPanel() {
                     {doc ? <span className="sn-hint">{doc.name}</span> : null}
                 </div>
 
-                <div className="flex items-center gap-2 mt-3">
-                    <button type="button" className="btn btn-primary"
-                        disabled={!manage || !doc || !!busy}
-                        title={manageTitle}
-                        onClick={run}>
-                        {busy === 'import' ? 'Importing…' : 'Import'}
-                    </button>
-                    {!doc ? <span className="sn-hint">Choose an export document to import.</span> : null}
-                </div>
-
-                {result ? <ImportResult result={result} /> : null}
+                <ImportReview document={doc && doc.parsed} name={doc && doc.name}
+                    renderReceipt={result => <ImportResult result={result} />} />
             </div>
         </div>
     );

@@ -17,6 +17,8 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.function.UnaryOperator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -156,6 +158,7 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * schema version — fails the request; everything else is reported per entry.</p>
  */
 public final class ExportImportService {
+    private static final Logger log = LoggerFactory.getLogger(ExportImportService.class);
 
     /**
      * Format version of the export document, stamped on export and required
@@ -230,6 +233,13 @@ public final class ExportImportService {
      * fill the diff with phantom updates.
      */
     private static final List<String> EMBEDDED_JSON_FIELDS = List.of("configJson", "conditionJson");
+
+    private static final class Run {
+        final boolean preview;
+        final boolean reviewed;
+        int nextId = -1;
+        Run(boolean preview, boolean reviewed) { this.preview = preview; this.reviewed = reviewed; }
+    }
 
     private ExportImportService() {
     }
@@ -359,17 +369,45 @@ public final class ExportImportService {
      *                                  non-array where an entity list belongs
      */
     public static ImportResult importDocument(JsonNode document, int userId) {
+        validateDocumentShape(document);
+        return ConfigurationImportLock.withLock(() -> runDocument(document, userId, new Run(false, false)));
+    }
+
+    static void validateDocumentShape(JsonNode document) {
+        if (document == null || !document.isObject()) throw new IllegalArgumentException("The import body must be an export document (a JSON object)");
+        requireSchemaVersion(document);
+        entityArray(document, KEY_MONITORS); entityArray(document, KEY_ACTIONS); entityArray(document, KEY_WINDOWS);
+    }
+
+    static ImportResult runReviewed(JsonNode document, int userId, boolean preview) {
+        return runDocument(document, userId, new Run(preview, true));
+    }
+
+    private static ImportResult runDocument(JsonNode document, int userId, Run run) {
         if (document == null || !document.isObject()) {
             throw new IllegalArgumentException("The import body must be an export document (a JSON object)");
         }
         int schemaVersion = requireSchemaVersion(document);
 
         List<ImportEntry> entries = new ArrayList<>();
-        MonitorIndex monitors = importMonitors(entityArray(document, KEY_MONITORS), userId, entries);
-        importActions(entityArray(document, KEY_ACTIONS), monitors, userId, entries);
-        importWindows(entityArray(document, KEY_WINDOWS), userId, entries);
+        // Validate every array before the first mutation, including legacy apply.
+        ArrayNode monitorNodes = entityArray(document, KEY_MONITORS);
+        ArrayNode actionNodes = entityArray(document, KEY_ACTIONS);
+        ArrayNode windowNodes = entityArray(document, KEY_WINDOWS);
+        boolean incomplete = false;
+        try {
+            MonitorIndex monitors = importMonitors(monitorNodes, userId, entries, run);
+            importActions(actionNodes, monitors, userId, entries, run);
+            importWindows(windowNodes, userId, entries, run);
+        } catch (Exception e) {
+            if (!run.reviewed || run.preview) throw e;
+            log.error("Reviewed import interrupted after {} receipts", entries.size(), e);
+            incomplete = true;
+        }
 
         ImportResult result = new ImportResult();
+        result.incomplete = incomplete;
+        result.uncertain = countOf(entries, "UNCERTAIN");
         result.setSchemaVersion(schemaVersion);
         result.setExportedAt(textOrNull(document, "exportedAt"));
         result.setEntries(entries);
@@ -436,7 +474,7 @@ public final class ExportImportService {
      * {@code MonitorService} rejects cycles on save — terminate as a reported
      * skip instead of spinning.</p>
      */
-    private static MonitorIndex importMonitors(ArrayNode nodes, int userId, List<ImportEntry> entries) {
+    private static MonitorIndex importMonitors(ArrayNode nodes, int userId, List<ImportEntry> entries, Run run) {
         MonitorIndex index = MonitorIndex.of(MonitorService.list());
         if (nodes == null) {
             return index;
@@ -461,7 +499,7 @@ public final class ExportImportService {
                     deferred.add(node);
                     continue;
                 }
-                entries.add(applyMonitor(node, index, userId));
+                entries.add(applyMonitor(node, index, userId, run));
                 progressed = true;
             }
             if (!progressed) {
@@ -500,9 +538,12 @@ public final class ExportImportService {
      * {@link #monitorNode} — so a monitor whose only difference is its
      * environment's serial ids never reads as changed.
      */
-    private static ImportEntry applyMonitor(JsonNode node, MonitorIndex index, int userId) {
+    private static ImportEntry applyMonitor(JsonNode node, MonitorIndex index, int userId, Run run) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_MONITOR, name);
+        if (run.reviewed && node.isObject() && node.has("_importError")) {
+            return entry.skipped(node.get("_importError").asText());
+        }
         if (isBlank(name)) {
             return entry.skipped("Entry has no name; monitors are matched by name");
         }
@@ -511,9 +552,13 @@ public final class ExportImportService {
         try {
             incoming = Json.mapper().treeToValue(node, Monitor.class);
         } catch (Exception e) {
-            return entry.skipped("Not a valid monitor definition: " + rootMessage(e));
+            return entry.skipped("Not a valid monitor definition: " + (run.reviewed ? "Check field types" : rootMessage(e)));
         }
         incoming.setId(null);
+        if (run.reviewed) {
+            try { MonitorService.validateDefinition(incoming); }
+            catch (IllegalArgumentException e) { return entry.skipped(rootMessage(e)); }
+        }
 
         String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
         Monitor existing = index.byName(name);
@@ -531,6 +576,13 @@ public final class ExportImportService {
         incoming.setSuppressedByMonitorId(parent == null ? null : parent.getId());
 
         try {
+            if (run.preview) {
+                MonitorService.validateDefinition(incoming);
+                entry.plan(existing == null ? null : monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())), monitorNode(incoming, parentName));
+                incoming.setId(existing == null ? run.nextId-- : existing.getId());
+                index.put(incoming);
+                return existing == null ? entry.created() : entry.updated();
+            }
             if (existing == null) {
                 index.put(MonitorService.create(incoming, userId));
                 return entry.created();
@@ -539,6 +591,10 @@ public final class ExportImportService {
             return entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        } catch (Exception e) {
+            if (!run.reviewed || run.preview) throw e;
+            log.error("Reviewed import entry {} failed with uncertain completion", name, e);
+            return entry.uncertain();
         }
     }
 
@@ -551,7 +607,7 @@ public final class ExportImportService {
      * previous pass returned.
      */
     private static void importActions(ArrayNode nodes, MonitorIndex monitors, int userId,
-            List<ImportEntry> entries) {
+            List<ImportEntry> entries, Run run) {
         if (nodes == null) {
             return;
         }
@@ -560,7 +616,7 @@ public final class ExportImportService {
             byName.put(nameKey(action.getName()), action);
         }
         for (JsonNode node : nodes) {
-            entries.add(applyAction(node, byName, monitors, userId));
+            entries.add(applyAction(node, byName, monitors, userId, run));
         }
     }
 
@@ -577,9 +633,12 @@ public final class ExportImportService {
      * file.</p>
      */
     private static ImportEntry applyAction(JsonNode node, Map<String, Action> byName, MonitorIndex monitors,
-            int userId) {
+            int userId, Run run) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_ACTION, name);
+        if (run.reviewed && node.isObject() && node.has("_importError")) {
+            return entry.skipped(node.get("_importError").asText());
+        }
         if (isBlank(name)) {
             return entry.skipped("Entry has no name; actions are matched by name");
         }
@@ -588,9 +647,13 @@ public final class ExportImportService {
         try {
             incoming = Json.mapper().treeToValue(node, Action.class);
         } catch (Exception e) {
-            return entry.skipped("Not a valid action definition: " + rootMessage(e));
+            return entry.skipped("Not a valid action definition: " + (run.reviewed ? "Check field types" : rootMessage(e)));
         }
         incoming.setId(null);
+        if (run.reviewed) {
+            try { ActionService.validateDefinition(incoming); }
+            catch (IllegalArgumentException e) { return entry.skipped(rootMessage(e)); }
+        }
 
         Action existing = byName.get(nameKey(name));
         // Computed against the UNTOUCHED incoming config, so both sides are
@@ -607,6 +670,9 @@ public final class ExportImportService {
         entry.setSecretsRequired(secrets.required);
         entry.setSecretsNote(secretsNote(secrets.kept, secrets.required));
 
+        if (run.reviewed && !secrets.required.isEmpty()) {
+            return entry.skipped("Missing target secrets; enter credentials on this server before importing this action");
+        }
         if (unchanged) {
             return entry.skipped("Already matches this server");
         }
@@ -630,6 +696,13 @@ public final class ExportImportService {
         incoming.setConfigJson(secrets.configJson);
 
         try {
+            if (run.preview) {
+                ActionService.validateDefinition(incoming);
+                entry.plan(existing == null ? null : actionNode(existing, monitors), actionNode(ActionService.redact(incoming), monitors));
+                incoming.setId(existing == null ? run.nextId-- : existing.getId());
+                byName.put(nameKey(name), ActionService.redact(incoming));
+                return existing == null ? entry.created() : entry.updated();
+            }
             if (existing == null) {
                 byName.put(nameKey(name), ActionService.create(incoming, userId));
                 return entry.created();
@@ -638,6 +711,10 @@ public final class ExportImportService {
             return entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        } catch (Exception e) {
+            if (!run.reviewed || run.preview) throw e;
+            log.error("Reviewed import entry {} failed with uncertain completion", name, e);
+            return entry.uncertain();
         }
     }
 
@@ -653,7 +730,7 @@ public final class ExportImportService {
      * which of two identically named windows the operator meant could silence
      * the wrong channels.</p>
      */
-    private static void importWindows(ArrayNode nodes, int userId, List<ImportEntry> entries) {
+    private static void importWindows(ArrayNode nodes, int userId, List<ImportEntry> entries, Run run) {
         if (nodes == null) {
             return;
         }
@@ -662,15 +739,18 @@ public final class ExportImportService {
             byName.computeIfAbsent(nameKey(window.getName()), k -> new ArrayList<>()).add(window);
         }
         for (JsonNode node : nodes) {
-            entries.add(applyWindow(node, byName, userId));
+            entries.add(applyWindow(node, byName, userId, run));
         }
     }
 
     /** Creates, updates, or skips one maintenance window. */
     private static ImportEntry applyWindow(JsonNode node, Map<String, List<MaintenanceWindow>> byName,
-            int userId) {
+            int userId, Run run) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_MAINTENANCE_WINDOW, name);
+        if (run.reviewed && node.isObject() && node.has("_importError")) {
+            return entry.skipped(node.get("_importError").asText());
+        }
         if (isBlank(name)) {
             return entry.skipped("Entry has no name; maintenance windows are matched by name");
         }
@@ -679,10 +759,14 @@ public final class ExportImportService {
         try {
             incoming = Json.mapper().treeToValue(node, MaintenanceWindow.class);
         } catch (Exception e) {
-            return entry.skipped("Not a valid maintenance window definition: " + rootMessage(e));
+            return entry.skipped("Not a valid maintenance window definition: " + (run.reviewed ? "Check field types" : rootMessage(e)));
         }
         incoming.setId(null);
         incoming.setActiveNow(null);
+        if (run.reviewed) {
+            try { MaintenanceWindowService.validate(incoming); }
+            catch (IllegalArgumentException e) { return entry.skipped(rootMessage(e)); }
+        }
 
         List<MaintenanceWindow> matches = byName.getOrDefault(nameKey(name), List.of());
         if (matches.size() > 1) {
@@ -695,6 +779,13 @@ public final class ExportImportService {
         }
 
         try {
+            if (run.preview) {
+                MaintenanceWindowService.validate(incoming);
+                entry.plan(existing == null ? null : portable(existing), portable(incoming));
+                incoming.setId(existing == null ? run.nextId-- : existing.getId());
+                byName.put(nameKey(name), List.of(incoming));
+                return existing == null ? entry.created() : entry.updated();
+            }
             if (existing == null) {
                 byName.put(nameKey(name), List.of(MaintenanceWindowService.create(incoming, userId)));
                 return entry.created();
@@ -704,6 +795,10 @@ public final class ExportImportService {
             return entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        } catch (Exception e) {
+            if (!run.reviewed || run.preview) throw e;
+            log.error("Reviewed import entry {} failed with uncertain completion", name, e);
+            return entry.uncertain();
         }
     }
 
@@ -1074,6 +1169,12 @@ public final class ExportImportService {
      */
     public static final class ImportResult {
 
+        private int uncertain;
+        public int getUncertain() { return uncertain; }
+
+        private boolean incomplete;
+        public boolean isIncomplete() { return incomplete; }
+
         private int schemaVersion;
         private String exportedAt;
         private int created;
@@ -1175,6 +1276,42 @@ public final class ExportImportService {
         private List<String> secretsKept = new ArrayList<>();
         private List<String> secretsRequired = new ArrayList<>();
         private String secretsNote;
+        private Map<String, Object> fieldDiffs = new LinkedHashMap<>();
+
+        public Map<String, Object> getFieldDiffs() { return fieldDiffs; }
+
+        void plan(ObjectNode existing, ObjectNode incoming) {
+            JsonNode before = existing == null ? Json.mapper().createObjectNode() : comparable(existing);
+            JsonNode after = comparable(incoming);
+            Set<String> fields = new LinkedHashSet<>();
+            before.fieldNames().forEachRemaining(fields::add); after.fieldNames().forEachRemaining(fields::add);
+            for (String field : fields) {
+                JsonNode oldValue = before.path(field), newValue = after.path(field);
+                if (!oldValue.equals(newValue)) {
+                    // Entire config remains opaque: arbitrary header/url/body fields
+                    // can contain credentials beyond the known transport secret slots.
+                    if (field.equals("configJson")) {
+                        fieldDiffs.put(field, Map.of("before", "[configuration omitted]", "after", "[configuration changed; values omitted]"));
+                        for (String configField : List.of("threshold", "thresholdPercent", "noDataForSeconds",
+                                "minMessages", "windowSeconds", "windowMinutes", "baselineDays", "timeoutSeconds")) {
+                            JsonNode oldNumber = oldValue.path(configField), newNumber = newValue.path(configField);
+                            if ((oldNumber.isMissingNode() || oldNumber.isNumber())
+                                    && (newNumber.isMissingNode() || newNumber.isNumber())
+                                    && !oldNumber.equals(newNumber)) {
+                                Map<String, Object> numericDiff = new LinkedHashMap<>();
+                                numericDiff.put("before", oldNumber); numericDiff.put("after", newNumber);
+                                fieldDiffs.put(field + "." + configField, numericDiff);
+                            }
+                        }
+                    } else {
+                        Map<String, Object> diff = new LinkedHashMap<>();
+                        diff.put("before", oldValue); diff.put("after", newValue);
+                        fieldDiffs.put(field, diff);
+                    }
+                }
+            }
+        }
+
 
         /**
          * @param entityType one of {@link ExportImportService#TYPE_MONITOR},
@@ -1198,6 +1335,12 @@ public final class ExportImportService {
         /** Marks this entry updated and returns itself. */
         ImportEntry updated() {
             this.outcome = OUTCOME_UPDATED;
+            return this;
+        }
+
+        ImportEntry uncertain() {
+            this.outcome = "UNCERTAIN";
+            this.reason = "Apply failed; completion may be uncertain. Reconcile with a new preview before rerunning";
             return this;
         }
 
