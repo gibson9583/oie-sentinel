@@ -23,6 +23,8 @@ import {
     TagPicker, fmtTime,
 } from '../ui.jsx';
 
+import { duplicateSchedule, registerAuthoringGuard } from '../authoring.js';
+
 const React = platform.React;
 const { h } = platform.ui;
 
@@ -289,32 +291,61 @@ function buildOptions(handlersRef) {
 
 /* ---- editor sub-view ----------------------------------------------------- */
 
-function WindowEditor({ window: win, channels, groups, tags, manage, onClose, onChanged }) {
-    const isNew = !win;
-    const [name, setName] = React.useState(win ? win.name : '');
-    const [mode, setMode] = React.useState((win && win.mode) || 'SUPPRESS');
-    const [scopeType, setScopeType] = React.useState((win && win.scopeType) || 'ALL');
-    const [scopeId, setScopeId] = React.useState((win && win.scopeId) || '');
-    const [repeatType, setRepeatType] = React.useState((win && win.repeatType) || 'NONE');
-    const [daysOfWeek, setDaysOfWeek] = React.useState(() => (win && win.daysOfWeek
+export function WindowEditor({ window: win, channels, groups, tags, manage, onClose, onChanged, onDuplicate, initialDraft = null, onDraftChange = () => {}, onDraftDiscard = () => {} }) {
+    const isNew = !win || win.id == null;
+    const [name, setName] = React.useState(initialDraft?.name ?? (win ? win.name : ''));
+    const [mode, setMode] = React.useState(initialDraft?.mode ?? ((win && win.mode) || 'SUPPRESS'));
+    const [scopeType, setScopeType] = React.useState(initialDraft?.scopeType ?? ((win && win.scopeType) || 'ALL'));
+    const [scopeId, setScopeId] = React.useState(initialDraft?.scopeId ?? ((win && win.scopeId) || ''));
+    const [repeatType, setRepeatType] = React.useState(initialDraft?.repeatType ?? ((win && win.repeatType) || 'NONE'));
+    const [daysOfWeek, setDaysOfWeek] = React.useState(() => initialDraft?.daysOfWeek || (win && win.daysOfWeek
         ? String(win.daysOfWeek).split(',').map((s) => s.trim()).filter(Boolean)
         : []));
-    const [daysOfMonth, setDaysOfMonth] = React.useState((win && win.daysOfMonth) || '');
-    const [startTime, setStartTime] = React.useState((win && win.startTime) || '');
-    const [endTime, setEndTime] = React.useState((win && win.endTime) || '');
+    const [daysOfMonth, setDaysOfMonth] = React.useState(initialDraft?.daysOfMonth ?? ((win && win.daysOfMonth) || ''));
+    const [startTime, setStartTime] = React.useState(initialDraft?.startTime ?? ((win && win.startTime) || ''));
+    const [endTime, setEndTime] = React.useState(initialDraft?.endTime ?? ((win && win.endTime) || ''));
     // New windows default to the browser's zone — an operator building a
     // schedule almost always means their own clock, and the DST-correctness
     // this exists for only happens if a zone is actually set. Existing windows
     // keep exactly what is stored, blank included: silently promoting a stored
     // null (= server zone) to the zone of whoever happened to open the editor
     // would move a live schedule on save.
-    const [timezone, setTimezone] = React.useState(() => (win ? (win.timezone || '') : browserTimezone()));
+    const [timezone, setTimezone] = React.useState(() => initialDraft?.timezone ?? (win ? (win.timezone || '') : browserTimezone()));
     const zoneChoices = React.useMemo(() => timezoneOptions(win && win.timezone), [win]);
-    const [from, setFrom] = React.useState(win ? isoToLocalInput(win.activeFrom) : '');
-    const [until, setUntil] = React.useState(win ? isoToLocalInput(win.activeUntil) : '');
-    const [enabled, setEnabled] = React.useState(win ? !!win.enabled : true);
+    const [from, setFrom] = React.useState(initialDraft?.from ?? (win ? isoToLocalInput(win.activeFrom) : ''));
+    const [until, setUntil] = React.useState(initialDraft?.until ?? (win ? isoToLocalInput(win.activeUntil) : ''));
+    const [enabled, setEnabled] = React.useState(initialDraft?.enabled ?? (win ? !!win.enabled : true));
     const [busy, setBusy] = React.useState(null);
 
+    const operation = React.useRef(null);
+    const [inlineError, setInlineError] = React.useState('');
+    const draft = JSON.stringify({ name, mode, scopeType, scopeId, repeatType, daysOfWeek,
+        daysOfMonth, startTime, endTime, timezone, from, until, enabled });
+    const initial = React.useRef(draft);
+    const dirty = draft !== initial.current || !!initialDraft || (isNew && !!win);
+    React.useEffect(() => {
+        onDraftChange(dirty ? JSON.parse(draft) : null);
+    }, [draft, dirty]);
+    const live = React.useRef({}); live.current = { dirty, busy };
+    const leave = async () => {
+        if (operation.current || live.current.busy) return false;
+        if (!live.current.dirty) return true;
+        operation.current = 'leave'; setBusy('leave');
+        try {
+            const ok = await confirmDialog('Discard schedule draft?',
+                'Your unsaved schedule changes will be discarded.', { danger: true, okLabel: 'Discard' });
+            if (ok) onDraftDiscard();
+            return ok;
+        }
+        finally { operation.current = null; setBusy(null); }
+    };
+    const close = async () => { if (await leave()) onClose(); };
+    React.useEffect(() => registerAuthoringGuard(leave), []);
+    React.useEffect(() => {
+        const unload = (e) => { if (live.current.dirty || operation.current) { e.preventDefault(); e.returnValue = ''; } };
+        window.addEventListener('beforeunload', unload);
+        return () => window.removeEventListener('beforeunload', unload);
+    }, []);
     const recurring = repeatType !== 'NONE';
     const toggleDay = (d, on) => setDaysOfWeek((cur) => (on ? [...cur, d] : cur.filter((x) => x !== d)));
 
@@ -371,10 +402,11 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     };
 
     const save = async () => {
+        if (operation.current || !canManageMaintenance()) return;
         let payload;
         try { payload = buildPayload(); }
-        catch (e) { errorModal('Cannot Save Window', e.message || String(e)); return; }
-        setBusy('save');
+        catch (e) { setInlineError(e.message || String(e)); return; }
+        operation.current = 'save'; setInlineError(''); setBusy('save');
         try {
             if (isNew) await createMaintenanceWindow(payload);
             else await updateMaintenanceWindow(win.id, payload);
@@ -383,20 +415,22 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
             onClose();
         } catch (e) {
             // 400 validation messages from MaintenanceWindowService arrive here.
-            errorModal(isNew ? 'Create Failed' : 'Save Failed', errText(e), payload.name);
+            setInlineError(`Save failed: ${errText(e)}. If the connection was lost, check the schedule list before retrying; the server may have saved it.`);
         } finally {
-            setBusy(null);
+            operation.current = null; setBusy(null);
         }
     };
 
     const del = async () => {
+        if (operation.current || !canManageMaintenance()) return;
+        operation.current = 'confirm'; setBusy('confirm');
         const ok = await confirmDialog('Delete Schedule',
             win.mode === 'ACTIVE'
                 ? `Delete "${win.name}"? Its alerting schedule is removed and alerts on its channels notify normally again.`
                 : `Delete "${win.name}"? Problems on its channels stop being suppressed immediately.`,
             { danger: true, okLabel: 'Delete' });
-        if (!ok) return;
-        setBusy('delete');
+        if (!ok || !canManageMaintenance()) { operation.current = null; setBusy(null); return; }
+        operation.current = 'delete'; setBusy('delete');
         try {
             await deleteMaintenanceWindow(win.id);
             toast(`Schedule "${win.name}" deleted.`, 'success');
@@ -405,7 +439,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
         } catch (e) {
             errorModal('Delete Failed', errText(e), win.name);
         } finally {
-            setBusy(null);
+            operation.current = null; setBusy(null);
         }
     };
 
@@ -414,16 +448,20 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
             <div className="panel-header">
                 {isNew ? 'New schedule' : `Edit schedule — ${win.name}`}
                 <div className="panel-tools">
-                    <button className="btn btn-sm" onClick={onClose}>Back to list</button>
+                    <span className="sn-hint" role="status">{dirty ? 'Unsaved changes' : 'No changes'}</span>
+                    <button className="btn btn-sm" disabled={!!busy} onClick={close}>Back to list</button>
                 </div>
             </div>
             <div className="panel-body">
+                {initialDraft ? <p className="sn-hint">Restored unsaved draft from this browser session. Review dates, scope and permissions before saving.</p> : null}
+                {inlineError ? <div className="text-err" role="alert">{inlineError}</div> : null}
+                {isNew && win ? <p>This disabled copy has no saved identity. Review copied dates, timezone and scope before enabling.</p> : null}
                 {!manage ? (
                     <div className="sn-hint" style={{ marginBottom: 10 }}>
                         Read-only: the Manage Schedules permission is required to change schedules.
                     </div>
                 ) : null}
-                <fieldset disabled={!manage} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+                <fieldset disabled={!manage || !!busy} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
                     <div className="form-grid">
                         <div className="field span-2">
                             <label>Name</label>
@@ -584,16 +622,19 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
                 </fieldset>
             </div>
             <div className="panel-body"
-                style={{ borderTop: '1px solid var(--line)', display: 'flex', gap: 8, alignItems: 'center' }}>
+                style={{ borderTop: '1px solid var(--line)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
                 {manage ? (
                     <button className="btn btn-primary" onClick={save} disabled={!!busy}>
                         {busy === 'save' ? 'Saving…' : (isNew ? 'Create window' : 'Save changes')}
                     </button>
                 ) : null}
-                <button className="btn" onClick={onClose} disabled={!!busy}>
+                <button className="btn" onClick={close} disabled={!!busy}>
                     {manage ? 'Cancel' : 'Close'}
                 </button>
                 <span style={{ flex: 1 }} />
+                {manage && !isNew ? <button className="btn" disabled={!!busy} onClick={async () => {
+                    if (await leave() && canManageMaintenance()) onDuplicate(duplicateSchedule(win));
+                }}>Duplicate saved schedule</button> : null}
                 {manage && !isNew ? (
                     <button className="btn btn-danger" onClick={del} disabled={!!busy}>
                         {busy === 'delete' ? 'Deleting…' : 'Delete'}
@@ -611,7 +652,7 @@ export function MaintenancePage() {
     const channels = useApi(getCoreChannels, []);
     const groups = useApi(getCoreChannelGroups, []);
     const tags = useApi(getCoreTags, []);
-    const [view, setView] = React.useState(null); // null | { mode: 'new' } | { mode: 'edit', window }
+    const [view, setView] = React.useState(() => platform.store.getState('sentinel.scheduleDraft') || null); // null | { mode: 'new' } | { mode: 'edit', window }
     const manage = canManageMaintenance();
 
     // Scope names silently degrade to raw ids when these fail — still surface
@@ -783,13 +824,17 @@ export function MaintenancePage() {
             </div>
             {view ? (
                 <WindowEditor
-                    key={view.window ? `edit-${view.window.id}` : 'new'}
+                    key={view.mode === 'copy' ? 'copy' : view.window ? `edit-${view.window.id}` : 'new'}
                     window={view.window || null}
                     channels={Array.isArray(channels.data) ? channels.data : null}
                     groups={Array.isArray(groups.data) ? groups.data : null}
                     tags={Array.isArray(tags.data) ? tags.data : null}
                     manage={manage}
-                    onClose={() => setView(null)}
+                    initialDraft={view.draft || null}
+                    onDraftChange={(draft) => platform.store.setState('sentinel.scheduleDraft', draft ? { ...view, draft } : null)}
+                    onDraftDiscard={() => platform.store.setState('sentinel.scheduleDraft', null)}
+                    onDuplicate={(draft) => setView({ mode: 'copy', window: draft })}
+                    onClose={() => { platform.store.setState('sentinel.scheduleDraft', null); setView(null); }}
                     onChanged={windows.reload}
                 />
             ) : null}
