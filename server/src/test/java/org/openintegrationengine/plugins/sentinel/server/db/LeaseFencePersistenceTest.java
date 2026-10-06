@@ -56,8 +56,8 @@ class LeaseFencePersistenceTest {
             url = baseUrl + (baseUrl.contains("?") ? "&" : "?") + "currentSchema=" + schema;
         }
         try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
-            for (String suffix : List.of("-sentinel-tables.sql", "-sentinel-v4.sql", "-sentinel-v7.sql",
-                    "-sentinel-v8.sql", "-sentinel-v11.sql", "-sentinel-v12.sql")) {
+            for (String suffix : List.of("-sentinel-tables.sql", "-sentinel-v2.sql", "-sentinel-v3.sql", "-sentinel-v4.sql", "-sentinel-v5.sql", "-sentinel-v6.sql", "-sentinel-v7.sql",
+                    "-sentinel-v8.sql", "-sentinel-v11.sql", "-sentinel-v12.sql", "-sentinel-v13.sql", "-sentinel-v14.sql")) {
                 try (InputStream in = getClass().getResourceAsStream("/" + vendor + suffix)) {
                     assertNotNull(in);
                     for (String statement : new String(in.readAllBytes(), StandardCharsets.UTF_8).split("\\r?\\n\\s*\\r?\\n")) {
@@ -65,6 +65,10 @@ class LeaseFencePersistenceTest {
                     }
                 }
             }
+        }
+        try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
+            sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN problem_pending BOOLEAN");
+            sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN resolution_pending BOOLEAN");
         }
         Configuration cfg = new Configuration(new Environment("fencing", new JdbcTransactionFactory(),
                 new UnpooledDataSource(driver, url, null, null)));
@@ -92,6 +96,45 @@ class LeaseFencePersistenceTest {
                     () -> DriverManager.getConnection(url + ";drop=true"));
             assertEquals("08006", dropped.getSQLState());
         }
+    }
+
+    @Test
+    void inboxFiltersBeforeCountAndPreservesCapturedContextAfterDeletion() throws Exception {
+        try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
+            sql.executeUpdate("INSERT INTO sentinel_monitor (name, monitor_type, scope_type, config_json, created_time) VALUES ('inbox','INACTIVITY','ALL','{}',CURRENT_TIMESTAMP)");
+            sql.executeUpdate("INSERT INTO sentinel_action (name, action_type, condition_json, config_json, created_time) VALUES ('current name','EMAIL','[]','{}',CURRENT_TIMESTAMP)");
+            for (String channel : List.of(CHANNEL, "00000000-0000-0000-0000-000000000002"))
+                sql.executeUpdate("INSERT INTO sentinel_alert_event (monitor_id, channel_id, severity, status, message, opened_time, problem_pending) VALUES (1,'" + channel + "','WARNING','PROBLEM','test',CURRENT_TIMESTAMP,TRUE)");
+        }
+        for (long event : List.of(1L,2L)) {
+            var row = new org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog();
+            row.setAlertEventId(event);row.setActionId(1);row.setDispatchTime(Instant.parse("2026-10-06T12:00:00Z"));row.setSuccess(event==1);
+            row.setActionIdAtAttempt(1);row.setActionNameAtAttempt("original name");row.setActionTypeAtAttempt("EMAIL");row.setEventPhaseAtAttempt("PROBLEM");
+            ActionDispatchLogRepository.insertActionDispatchLog(row);
+        }
+        var visible = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(Set.of(CHANNEL),null,null,null,null,null,null,null,null,0,25);
+        assertEquals(1,visible.total());assertEquals("original name",visible.items().get(0).actionName());
+        assertEquals("CAPTURED",visible.items().get(0).actionContextSource());
+        var denied = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(Set.of(),null,null,null,null,null,null,null,null,0,25);
+        assertEquals(0,denied.total());assertTrue(denied.items().isEmpty());
+        assertEquals(0,org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(Set.of(CHANNEL),null,null,"UNKNOWN",null,null,null,null,null,0,25).total());
+        assertEquals(1,org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.pending(Set.of(CHANNEL),null,null,null,0,25).total());
+        try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) { sql.executeUpdate("DELETE FROM sentinel_action WHERE id=1"); }
+        var deleted = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,1,"EMAIL",1L,"PROBLEM",true,1791288000000L,1791288000000L,0,25);
+        assertEquals(1,deleted.total());assertTrue(deleted.items().get(0).actionDeleted());
+        assertNull(deleted.items().get(0).attempt().getActionId());assertEquals(1,deleted.items().get(0).attempt().getActionIdAtAttempt());
+        assertEquals("original name",deleted.items().get(0).actionName());
+        var old = new org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog();old.setAlertEventId(1L);old.setDispatchTime(Instant.parse("2026-10-06T12:00:00Z"));old.setSuccess(false);
+        ActionDispatchLogRepository.insertActionDispatchLog(old);
+        var unknown = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,null,"UNKNOWN",null,"UNKNOWN",null,null,null,0,25);
+        assertEquals(1,unknown.total());assertEquals("UNRECORDED",unknown.items().get(0).actionContextSource());
+        assertNull(unknown.items().get(0).attempt().getEventPhaseAtAttempt());
+        var first = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,null,null,null,null,null,null,null,0,1);
+        var second = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,null,null,null,null,null,null,null,1,1);
+        assertEquals(3,first.total());assertTrue(first.items().get(0).attempt().getId()>second.items().get(0).attempt().getId());
+        assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,null,"INVALID",null,null,null,null,null,0,25));
+        assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,-1,null,null,null,null,null,null,0,25));
+        assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.pending(null,null,2L,1L,0,25));
     }
 
     private LeaseFence acquire(String name, String node, int seconds) {

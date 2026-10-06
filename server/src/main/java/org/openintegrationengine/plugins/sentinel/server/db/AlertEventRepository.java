@@ -414,6 +414,7 @@ public final class AlertEventRepository {
         params.put("monitorId", filter.getMonitorId());
         params.put("monitorType", filter.getMonitorType() != null ? filter.getMonitorType().name() : null);
         params.put("acknowledged", filter.getAcknowledged());
+        params.put("pendingOnly", filter.isPendingOnly());
         params.put("from", toTimestamp(filter.getFrom()));
         params.put("to", toTimestamp(filter.getTo()));
         params.put("q", escapeLikeWildcards(filter.getQ()));

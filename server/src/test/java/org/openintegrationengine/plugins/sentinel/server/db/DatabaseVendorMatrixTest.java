@@ -67,7 +67,7 @@ class DatabaseVendorMatrixTest {
 
     @Test
     void retriesInterruptedNewMigrations() throws Exception {
-        for (int target = 8; target <= 10; target++) {
+        for (int target : List.of(8,9,10,14)) {
             DatabaseMatrixSupport.verifyInterruptedMigration(derbyDatabase("interrupted-v" + target), target);
         }
     }

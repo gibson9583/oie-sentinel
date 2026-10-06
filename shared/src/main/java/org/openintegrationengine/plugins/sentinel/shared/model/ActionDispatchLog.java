@@ -26,6 +26,19 @@ public class ActionDispatchLog {
     private boolean success;
     private String errorMessage;
 
+    private Integer actionIdAtAttempt;
+    private String actionNameAtAttempt;
+    private String actionTypeAtAttempt;
+    private String eventPhaseAtAttempt;
+    public Integer getActionIdAtAttempt() { return actionIdAtAttempt; }
+    public void setActionIdAtAttempt(Integer value) { actionIdAtAttempt = value; }
+    public String getActionNameAtAttempt() { return actionNameAtAttempt; }
+    public void setActionNameAtAttempt(String value) { actionNameAtAttempt = value; }
+    public String getActionTypeAtAttempt() { return actionTypeAtAttempt; }
+    public void setActionTypeAtAttempt(String value) { actionTypeAtAttempt = value; }
+    public String getEventPhaseAtAttempt() { return eventPhaseAtAttempt; }
+    public void setEventPhaseAtAttempt(String value) { eventPhaseAtAttempt = value; }
+
     /**
      * Creates an empty dispatch log entry. Callers populate fields via the
      * setters before handing the instance to {@code ActionDispatchLogRepository}.

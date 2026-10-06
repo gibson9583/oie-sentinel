@@ -105,6 +105,8 @@ final class DatabaseMatrixSupport {
                             + "('matrix-legacy-channel', 0, 'matrix-legacy-node', 'STOPPED', 'STARTED', CURRENT_TIMESTAMP)");
                 }
 
+                if (sourceVersion >= 13) execute(connection,"INSERT INTO sentinel_maintenance_request (request_id,fingerprint,channel_id,window_id) VALUES ('preserved-request','preserved-fingerprint','preserved-channel',NULL)");
+
                 // A new instance models the next engine start. Detection, not
                 // the mocked property, is authoritative in production.
                 migrator(connection, database.vendor()).migrate();
@@ -116,6 +118,13 @@ final class DatabaseMatrixSupport {
                             "SELECT deployment_time FROM sentinel_connector_status_event WHERE node_id = 'matrix-legacy-node'")) {
                         assertTrue(rows.next(), "Deployment identity migration dropped legacy observation");
                         org.junit.jupiter.api.Assertions.assertNull(rows.getObject(1), "Legacy observation was assigned an invented deployment identity");
+                    }
+                }
+
+                if (sourceVersion >= 13) {
+                    try (Statement sql=connection.createStatement();ResultSet rows=sql.executeQuery("SELECT fingerprint,channel_id,window_id FROM sentinel_maintenance_request WHERE request_id='preserved-request'")) {
+                        assertTrue(rows.next(),"Maintenance receipt/tombstone lost during cumulative upgrade");
+                        assertEquals("preserved-fingerprint",rows.getString(1));assertEquals("preserved-channel",rows.getString(2));org.junit.jupiter.api.Assertions.assertNull(rows.getObject(3));
                     }
                 }
 
@@ -205,8 +214,8 @@ final class DatabaseMatrixSupport {
             try (Connection connection = database.open()) {
                 resetDatabase(connection, database.vendor());
                 migrator(connection, database.vendor()).migrateTo(target - 1);
-                String column = target == 8 ? "node_id" : target == 9 ? "resolution_pending" : "problem_pending";
-                String table = target == 8 ? "sentinel_connector_status_event" : "sentinel_alert_event";
+                String column = target == 14 ? "action_name_at_attempt" : target == 8 ? "node_id" : target == 9 ? "resolution_pending" : "problem_pending";
+                String table = target == 14 ? "sentinel_action_dispatch_log" : target == 8 ? "sentinel_connector_status_event" : "sentinel_alert_event";
                 if (target == 8) {
                     try (java.io.InputStream resource = DatabaseMatrixSupport.class.getResourceAsStream(
                             "/" + database.vendor() + "-sentinel-v8.sql")) {
@@ -214,7 +223,7 @@ final class DatabaseMatrixSupport {
                         execute(connection, new String(resource.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
                     }
                 } else {
-                    String type = "oracle".equals(database.vendor()) ? "NUMBER(1)"
+                    String type = target == 14 ? ("oracle".equals(database.vendor()) ? "VARCHAR2(255)" : "VARCHAR(255)") : "oracle".equals(database.vendor()) ? "NUMBER(1)"
                             : "sqlserver".equals(database.vendor()) ? "BIT" : "BOOLEAN";
                     String add = "oracle".equals(database.vendor()) || "sqlserver".equals(database.vendor())
                             ? " ADD " : " ADD COLUMN ";
@@ -322,6 +331,8 @@ final class DatabaseMatrixSupport {
         for (String table : LIVE_TABLES) {
             assertTrue(tableExists(connection, table), vendor + " missing latest table " + table);
         }
+        for(String field:List.of("action_id_at_attempt","action_name_at_attempt","action_type_at_attempt","event_phase_at_attempt")) assertTrue(columnExists(connection,"sentinel_action_dispatch_log",field),vendor+" missing delivery snapshot "+field);
+        assertTrue(indexExists(connection,"sentinel_action_dispatch_log","idx_sentinel_dispatch_time"),vendor+" missing delivery paging index");
         assertTrue(columnExists(connection, "sentinel_alert_event", "problem_pending"),
                 vendor + " missing problem dispatch outbox");
         assertTrue(columnExists(connection, "sentinel_alert_event", "resolution_pending"),

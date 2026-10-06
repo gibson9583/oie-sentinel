@@ -35,6 +35,7 @@ import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
 import org.openintegrationengine.plugins.sentinel.server.service.DashboardService;
+import org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService;
 import org.openintegrationengine.plugins.sentinel.server.service.ExportImportService;
 import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWindowService;
 import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
@@ -645,6 +646,22 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         } catch (Exception e) {
             throw translate("getActivitySummary", e);
         }
+    }
+
+    @Override
+    public String getDeliveries(String channelId, Integer actionId, String transport, Long eventId,
+            String phase, Boolean success, Long from, Long to, int page, int pageSize) {
+        try {
+            return Json.write(DeliveryInboxService.attempts(authorizedChannelIds(channelId), channelId,
+                    actionId, transport, eventId, phase, success, from, to, page, pageSize));
+        } catch (Exception e) { throw translate("getDeliveries", e); }
+    }
+
+    @Override
+    public String getPendingDeliveries(String channelId, Long from, Long to, int page, int pageSize) {
+        try {
+            return Json.write(DeliveryInboxService.pending(authorizedChannelIds(channelId), channelId, from, to, page, pageSize));
+        } catch (Exception e) { throw translate("getPendingDeliveries", e); }
     }
 
     // ========== Metrics ==========

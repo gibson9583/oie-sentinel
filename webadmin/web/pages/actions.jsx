@@ -570,7 +570,7 @@ function pruneConfig(actionType, c) {
 
 /* ---- editor -------------------------------------------------------------- */
 
-function ActionEditor({ action, actions, manage, onClose, onSaved }) {
+export function ActionEditor({ action, actions, manage, onClose, onSaved }) {
     const existing = action && action.id != null;
     const [name, setName] = React.useState(action ? action.name || '' : '');
     const [description, setDescription] = React.useState(action ? action.description || '' : '');
@@ -603,6 +603,8 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
         return base;
     });
     const [busy, setBusy] = React.useState(false);   // false | 'save' | 'test' | 'delete'
+    const [testReceipt, setTestReceipt] = React.useState(null);
+    const testInFlight = React.useRef(false);
 
     const config = configs[actionType] || {};
     const setConfig = (patch) => setConfigs((all) => ({
@@ -648,6 +650,20 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
         configJson: JSON.stringify(pruneConfig(actionType, config)),
     });
 
+    const savedDraft = React.useRef(JSON.stringify(buildAction()));
+    const unsaved = JSON.stringify(buildAction()) !== savedDraft.current;
+    const savedConfig = parseConfig(action);
+    const savedDestination = (() => {
+        if (!existing) return '';
+        switch (action.actionType) {
+            case 'EMAIL': return `To: ${savedConfig.to || 'not configured'}; Cc: ${savedConfig.cc || 'none'}`;
+            case 'CHANNEL': return `Channel: ${savedConfig.channelId || 'not configured'}`;
+            case 'SNS': return `Topic: ${savedConfig.topicArn || 'not configured'}`;
+            case 'WEBHOOK': try { return `${new URL(savedConfig.url).origin} (webhook origin; path and credentials omitted)`; } catch { return 'Webhook origin unavailable'; }
+            default: return 'Destination unavailable';
+        }
+    })();
+
     const save = async () => {
         setBusy('save');
         try {
@@ -681,15 +697,17 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
     };
 
     const sendTest = async () => {
-        setBusy('test');
+        if (testInFlight.current) return;
+        testInFlight.current = true;
+        setBusy('test');setTestReceipt(null);
         try {
             const result = await testAction(action.id);
-            if (result && result.success) toast(result.message || 'Test alert sent.', 'success');
-            else errorModal('Test Failed', (result && result.message) || 'The test send did not succeed.');
+            if (!result || typeof result.success !== 'boolean') throw new Error('Invalid test receipt');
+            setTestReceipt(result);
         } catch (e) {
-            errorModal('Test Failed', errText(e));
+            setTestReceipt({ success: false, message: `Request failed; external outcome unknown: ${errText(e)}` });
         } finally {
-            setBusy(false);
+            testInFlight.current = false;setBusy(false);
         }
     };
 
@@ -701,7 +719,7 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                 {existing ? `Edit action — ${action.name}` : 'New action'}
                 <div className="panel-tools">
                     <button type="button" className="btn btn-sm" onClick={onClose}
-                        disabled={busy === 'save'}>Back</button>
+                        disabled={!!busy}>Back</button>
                 </div>
             </div>
             <div className="panel-body">
@@ -842,13 +860,23 @@ function ActionEditor({ action, actions, manage, onClose, onSaved }) {
                     {actionType === 'WEBHOOK' ? <WebhookConfigFields config={config} setConfig={setConfig} /> : null}
                 </fieldset>
 
+                {manage && existing ? <div style={{marginTop:14,overflowWrap:'anywhere'}}>
+                    <p>Test uses saved {action.actionType} action “{action.name}”: {savedDestination}.</p>
+                    <p className="sn-hint">This destination was observed when the editor opened. The server reads the saved action again at send time; its receipt identifies the transport and destination used. A real synthetic notification is sent.</p>
+                    {unsaved ? <p role="status">Unsaved changes are excluded from the test. Save first to test these changes.</p> : null}
+                    <div aria-live="polite">{testReceipt ? <p role={testReceipt.success ? 'status' : 'alert'}>
+                        {testReceipt.success ? 'Transport succeeded' : 'Transport failed / uncertain'}: {testReceipt.message}
+                        {testReceipt.transport ? <><br />Used saved {testReceipt.transport} action “{testReceipt.actionName}”: {testReceipt.destination}</> : null}
+                        <br />Transport acceptance does not establish human receipt. A failed or timed-out request may still have delivered; testing again sends another notification.
+                    </p> : null}</div>
+                </div> : null}
                 <div className="form-row" style={{ marginTop: 14, gap: 8, alignItems: 'center' }}>
                     {manage ? (
                         <button type="button" className="btn btn-primary" onClick={save} disabled={!!busy}>
                             {busy === 'save' ? 'Saving…' : 'Save'}
                         </button>
                     ) : null}
-                    <button type="button" className="btn" onClick={onClose} disabled={busy === 'save'}>
+                    <button type="button" className="btn" onClick={onClose} disabled={!!busy}>
                         {manage ? 'Cancel' : 'Close'}
                     </button>
                     {manage && existing ? (

@@ -657,6 +657,31 @@ public interface SentinelServletInterface extends BaseServletInterface {
             @Param("windowSeconds") @QueryParam("windowSeconds") @DefaultValue("3600") int windowSeconds,
             @Param("buckets") @QueryParam("buckets") @DefaultValue("20") int buckets) throws ClientException;
 
+    @GET
+    @Path("/deliveries")
+    @Operation(summary = "Pages real notification attempts with per-channel authorization")
+    @MirthOperation(name = "sentinelGetDeliveries", display = "Get Sentinel deliveries", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getDeliveries(@Param("channelId") @QueryParam("channelId") String channelId,
+            @Param("actionId") @QueryParam("actionId") Integer actionId,
+            @Param("transport") @QueryParam("transport") String transport,
+            @Param("eventId") @QueryParam("eventId") Long eventId,
+            @Param("phase") @QueryParam("phase") String phase,
+            @Param("success") @QueryParam("success") Boolean success,
+            @Param("from") @QueryParam("from") Long from,
+            @Param("to") @QueryParam("to") Long to,
+            @Param("page") @QueryParam("page") @DefaultValue("0") int page,
+            @Param("pageSize") @QueryParam("pageSize") @DefaultValue("25") int pageSize) throws ClientException;
+
+    @GET
+    @Path("/deliveries/pending")
+    @Operation(summary = "Pages pending lifecycle accounting separately from transport attempts")
+    @MirthOperation(name = "sentinelGetPendingDeliveries", display = "Get pending Sentinel deliveries", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getPendingDeliveries(@Param("channelId") @QueryParam("channelId") String channelId,
+            @Param("from") @QueryParam("from") Long from,
+            @Param("to") @QueryParam("to") Long to,
+            @Param("page") @QueryParam("page") @DefaultValue("0") int page,
+            @Param("pageSize") @QueryParam("pageSize") @DefaultValue("25") int pageSize) throws ClientException;
+
     // ========== Metrics ==========
 
     /**

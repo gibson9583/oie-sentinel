@@ -20,6 +20,15 @@ public class ActionTestResult {
 
     private boolean success;
     private String message;
+    private String actionName;
+    private String transport;
+    private String destination;
+    public String getActionName() { return actionName; }
+    public void setActionName(String value) { actionName = value; }
+    public String getTransport() { return transport; }
+    public void setTransport(String value) { transport = value; }
+    public String getDestination() { return destination; }
+    public void setDestination(String value) { destination = value; }
 
     public ActionTestResult() {
     }

@@ -69,6 +69,10 @@ public class AlertEventFilter {
      */
     public static final Set<String> ALLOWED_SORT_COLUMNS = Set.of("opened_time", "severity", "channel_id");
 
+    private boolean pendingOnly;
+    public boolean isPendingOnly() { return pendingOnly; }
+    public void setPendingOnly(boolean value) { pendingOnly = value; }
+
     private AlertStatus status;
     private List<Severity> severityIn;
     private List<String> channelIdIn;
