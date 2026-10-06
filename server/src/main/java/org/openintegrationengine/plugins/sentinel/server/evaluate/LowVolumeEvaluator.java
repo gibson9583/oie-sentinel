@@ -118,7 +118,7 @@ public final class LowVolumeEvaluator {
     }
 
     /** FIXED mode: compare the window sum against a hand-configured floor. */
-    private static EvaluationOutcome evaluateFixed(JsonNode config, int windowSeconds, long current) {
+    public static EvaluationOutcome evaluateFixed(JsonNode config, int windowSeconds, long current) {
         long minCount = config.path("minCount").asLong(DEFAULT_MIN_COUNT);
         String valueJson = buildValueJson(current, (double) minCount, null, null, null);
 

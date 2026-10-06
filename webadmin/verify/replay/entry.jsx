@@ -1,0 +1,6 @@
+import {platform,control} from './host.jsx';
+import {MonitorEditor} from '../../web/pages/monitors.jsx';
+const React=platform.React;
+const monitor={id:9,name:'Error rate replay',monitorType:'ERROR_RATE',scopeType:'CHANNEL',scopeId:'c',enabled:true,severity:'HIGH',minConsecutiveBreaches:2,configJson:'{"thresholdPercent":5,"windowSeconds":300,"minMessages":100}'};
+platform.ReactDOM.createRoot(document.getElementById('app')).render(<MonitorEditor monitor={monitor} monitors={[monitor]} channels={[{channelId:'c',name:'ADT'}]} groups={[]} tags={[]} manage={true} onClose={()=>{control.closed=true;}} onChanged={()=>{}}/>);
+window.replayResponse=()=>({channelId:'c',evaluationCount:2,breachCount:1,unknownCount:1,rawSampleCount:6,windowSeconds:300,stepSeconds:300,rawFrom:'2026-10-06T10:00:00Z',rawTo:'2026-10-06T10:05:00Z',comparisonOnly:true,historicalDeploymentKnown:false,historicalSchedulesKnown:false,limitation:'Historical context unknown; raw samples only.',runs:[{status:'BREACH',from:'2026-10-06T10:00:00Z',to:'2026-10-06T10:00:00Z',evaluations:1},{status:'INSUFFICIENT_DATA',from:'2026-10-06T10:05:00Z',to:'2026-10-06T10:05:00Z',evaluations:1}],points:[{at:'2026-10-06T10:00:00Z',status:'BREACH',valueJson:'{"errorPercent":5,"thresholdPercent":5}'},{at:'2026-10-06T10:05:00Z',status:'INSUFFICIENT_DATA',valueJson:'{"reason":"Missing raw coverage"}'}]});

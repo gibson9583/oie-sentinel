@@ -123,6 +123,26 @@ class AlertLifecyclePersistenceTest {
     }
 
     @Test
+    void boundedReplayUsesActualRawMapperWithoutWritingIncidentsOrReplacingSamples() {
+        for (int i = 0; i < 20; i++) {
+            ActivitySample sample = new ActivitySample(); sample.setChannelId(channel);
+            sample.setSampleTime(now.minusSeconds((19-i)*15)); sample.setReceivedDelta(10); sample.setErrorDelta(1);
+            ActivityRepository.insertActivitySample(sample);
+        }
+        List<ActivitySample> limited = ActivityRepository.listActivitySamplesBounded(channel, now.minusSeconds(300), now, 5);
+        assertEquals(5, limited.size()); assertEquals(now.minusSeconds(285), limited.get(0).getSampleTime());
+        monitor.setMonitorType(MonitorType.ERROR_RATE);
+        monitor.setConfigJson("{\"windowSeconds\":60,\"thresholdPercent\":10,\"minMessages\":1}");
+        ActivityReplayRequest request = new ActivityReplayRequest(); request.setMonitor(monitor); request.setChannelId(channel);
+        request.setFrom(now.minusSeconds(60).toEpochMilli()); request.setTo(now.toEpochMilli()); request.setStepSeconds(60);
+        var result = ActivityReplayService.replay(request, now, Set.of(channel));
+        assertEquals(2, result.get("breachCount")); assertEquals(0, result.get("unknownCount"));
+        assertEquals(20, ActivityRepository.listActivitySamples(channel, now.minusSeconds(300), now).size());
+        assertTrue(TriggerStateRepository.listTriggerStatesByMonitor(monitor.getId()).isEmpty());
+        dispatch.verifyNoInteractions();
+    }
+
+    @Test
     void failedTriggerInsertRollsBackAlertAndRetryDeliversOnlyCommittedIncident() throws Exception {
         sql("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT reject_problem CHECK (state <> 'PROBLEM')");
         assertThrows(RuntimeException.class, this::breach);

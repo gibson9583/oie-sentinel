@@ -256,6 +256,19 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    @Override
+    public String replayActivity(String requestJson) {
+        try {
+            var request = readBody(requestJson, org.openintegrationengine.plugins.sentinel.shared.model.ActivityReplayRequest.class);
+            if (request == null || request.getChannelId() == null || request.getChannelId().isBlank())
+                throw new IllegalArgumentException("Replay channel is required");
+            // Check the explicit target before any raw read; never broaden an
+            // empty or rejected restriction into all-channel replay.
+            return Json.write(org.openintegrationengine.plugins.sentinel.server.service.ActivityReplayService.replay(
+                    request, java.time.Instant.now(), authorizedChannelIds(request.getChannelId())));
+        } catch (Exception e) { throw translate("replayActivity", e); }
+    }
+
     // ========== Actions ==========
 
     /**
