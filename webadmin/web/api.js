@@ -176,11 +176,11 @@ export const acknowledgeProblem = (id, comment) =>
 export const resolveProblem = (id, comment) =>
     apiPost(`${BASE}/problems/${enc(id)}/_resolve`, { comment: comment || '' });
 
-/** POST /problems/_bulkAcknowledge {ids, comment} -> { acknowledged: n } */
+/** POST /problems/_bulkAcknowledge {ids, comment} -> { acknowledged: n, receipts: [{id, status}] } */
 export const bulkAcknowledgeProblems = (ids, comment) =>
     apiPost(`${BASE}/problems/_bulkAcknowledge`, { ids: ids || [], comment: comment || '' });
 
-/** POST /problems/_bulkResolve {ids, comment} -> { resolved: n }.
+/** POST /problems/_bulkResolve {ids, comment} -> { resolved: n, receipts: [{id, status}] }.
     Note the response key is `resolved`, not `acknowledged` — same shape, verb-matched name.
     Ids the caller cannot see, or that are already RESOLVED, are skipped, so the returned
     count can be lower than ids.length. */

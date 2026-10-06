@@ -768,12 +768,12 @@ export function resolveCoverage(monitors, groups, tags) {
  * one fetch across pickers). Single: value = channelId ('' = the emptyLabel
  * row). multiple: value = channelId[].
  */
-export function ChannelPicker({ value, onChange, channels, multiple, emptyLabel = 'All channels', size }) {
+export function ChannelPicker({ value, onChange, channels, multiple, emptyLabel = 'All channels', size, ariaLabel }) {
     const self = useApi(() => (channels ? Promise.resolve(channels) : getCoreChannels()), [channels]);
     const list = self.data || [];
     return (
         <PickerShell loading={self.loading} error={self.error} reload={self.reload}>
-            <select multiple={multiple || undefined} size={multiple ? (size || 5) : undefined}
+            <select aria-label={ariaLabel} multiple={multiple || undefined} size={multiple ? (size || 5) : undefined}
                 value={multiple ? (value || []) : (value == null ? '' : value)}
                 onChange={(e) => onChange && onChange(multiple ? multiValue(e) : e.target.value)}>
                 {!multiple ? <option value="">{emptyLabel}</option> : null}
@@ -868,7 +868,7 @@ export function FilterBar({ value, onChange, monitors, channels }) {
         v.severity.includes(s) ? v.severity.filter((x) => x !== s) : [...v.severity, s]);
     return (
         <div className="sn-filterbar">
-            <select value={v.status} onChange={(e) => set('status', e.target.value)}>
+            <select aria-label="Problem status" value={v.status} onChange={(e) => set('status', e.target.value)}>
                 <option value="">Any status</option>
                 <option value="PROBLEM">Problem</option>
                 <option value="RESOLVED">Resolved</option>
@@ -879,26 +879,27 @@ export function FilterBar({ value, onChange, monitors, channels }) {
                         className={`tag sn-sev sn-sev-toggle${v.severity.includes(s) ? ' on' : ''}`}
                         style={{ borderColor: `color-mix(in srgb, ${SEVERITY_META[s].color} 55%, transparent)` }}
                         title={`Filter severity: ${SEVERITY_META[s].label}`}
+                        aria-pressed={v.severity.includes(s)}
                         onClick={() => toggleSeverity(s)}>
                         <span className="sn-sev-dot" style={{ background: SEVERITY_META[s].color }} />
                         {SEVERITY_META[s].label}
                     </button>
                 ))}
             </span>
-            <ChannelPicker value={v.channelId} channels={channels}
+            <ChannelPicker ariaLabel="Problem channel" value={v.channelId} channels={channels}
                 onChange={(id) => set('channelId', id)} />
             {monitors ? (
-                <select value={v.monitorId} onChange={(e) => set('monitorId', e.target.value)}>
+                <select aria-label="Problem monitor" value={v.monitorId} onChange={(e) => set('monitorId', e.target.value)}>
                     <option value="">All monitors</option>
                     {monitors.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
                 </select>
             ) : null}
-            <select value={v.acknowledged} onChange={(e) => set('acknowledged', e.target.value)}>
+            <select aria-label="Acknowledgement state" value={v.acknowledged} onChange={(e) => set('acknowledged', e.target.value)}>
                 <option value="">Ack: any</option>
                 <option value="false">Unacknowledged</option>
                 <option value="true">Acknowledged</option>
             </select>
-            <input placeholder="Search message…" value={v.q}
+            <input aria-label="Search problem messages" placeholder="Search message…" value={v.q}
                 onChange={(e) => set('q', e.target.value)} />
             <button type="button" className="btn btn-sm"
                 onClick={() => onChange && onChange({ ...DEFAULT_PROBLEM_FILTERS, status: '' })}>

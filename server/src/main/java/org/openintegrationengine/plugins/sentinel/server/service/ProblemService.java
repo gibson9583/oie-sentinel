@@ -8,6 +8,8 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.function.Predicate;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -280,35 +282,7 @@ public final class ProblemService {
      *                                  catch below
      */
     public static int bulkAcknowledge(List<Long> ids, String comment, int userId) {
-        validateComment(comment);
-        if (ids == null || ids.isEmpty()) {
-            return 0;
-        }
-        int acknowledged = 0;
-        for (Long id : ids) {
-            if (id == null) {
-                continue;
-            }
-            try {
-                AlertEvent event = AlertEventRepository.getAlertEvent(id);
-                if (event == null || event.getAcknowledgedBy() != null
-                        || event.getStatus() != AlertStatus.PROBLEM) {
-                    continue;
-                }
-                applyAck(event, comment, userId);
-                if (AlertEventRepository.acknowledgeAlertEvent(event)) {
-                    acknowledged++;
-                }
-            } catch (Exception e) {
-                // One bad row must not abort the batch; the count tells the
-                // client how many actually took.
-                log.warn("Bulk acknowledge skipped problem {}", id, e);
-            }
-        }
-        if (acknowledged > 0) {
-            SentinelAuditLog.problemBulkAcknowledged(userId, acknowledged, comment);
-        }
-        return acknowledged;
+        return appliedCount(bulkReceipts(ids, comment, userId, false, event -> true));
     }
 
     /**
@@ -344,33 +318,57 @@ public final class ProblemService {
      *                                  catch below
      */
     public static int bulkResolve(List<Long> ids, String comment, int userId) {
+        return appliedCount(bulkReceipts(ids, comment, userId, true, event -> true));
+    }
+
+    /**
+     * One receipt per distinct requested ID, in request order. Visibility is
+     * checked on the row immediately before mutation, before reporting state.
+     * Missing and forbidden are deliberately indistinguishable. A write that
+     * throws may have committed, so its outcome is UNKNOWN, never FAILED.
+     * Conditional repository updates preserve the first operator's ownership.
+     */
+    public static List<Map<String, Object>> bulkReceipts(List<Long> ids, String comment,
+            int userId, boolean resolve, Predicate<AlertEvent> visible) {
         validateComment(comment);
-        if (ids == null || ids.isEmpty()) {
-            return 0;
-        }
-        int resolved = 0;
-        for (Long id : ids) {
-            if (id == null) {
-                continue;
-            }
+        List<Map<String, Object>> receipts = new ArrayList<>();
+        if (ids == null) return receipts;
+        for (Long id : new LinkedHashSet<>(ids)) {
+            if (id == null) continue;
+            String status;
+            boolean writing = false;
             try {
                 AlertEvent event = AlertEventRepository.getAlertEvent(id);
-                if (event == null || event.getStatus() != AlertStatus.PROBLEM) {
-                    continue;
-                }
-                if (applyResolve(event, comment, userId)) {
-                    resolved++;
+                if (event == null || !visible.test(event)) {
+                    status = "UNAVAILABLE";
+                } else if (event.getStatus() != AlertStatus.PROBLEM) {
+                    status = "ALREADY_RESOLVED";
+                } else if (!resolve && event.getAcknowledgedBy() != null) {
+                    status = "ALREADY_ACKNOWLEDGED";
+                } else {
+                    writing = true;
+                    if (!resolve) applyAck(event, comment, userId);
+                    boolean applied = resolve ? applyResolve(event, comment, userId)
+                            : AlertEventRepository.acknowledgeAlertEvent(event);
+                    // A conditional update losing a race is not our mutation.
+                    status = applied ? "APPLIED" : "NOT_APPLIED";
                 }
             } catch (Exception e) {
-                // One bad row must not abort the batch; the count tells the
-                // client how many actually took.
-                log.warn("Bulk resolve skipped problem {}", id, e);
+                log.warn("Bulk problem mutation could not confirm problem {}", id, e);
+                status = writing ? "UNKNOWN" : "FAILED";
             }
+            receipts.add(Map.of("id", id, "status", status));
         }
-        if (resolved > 0) {
-            SentinelAuditLog.problemBulkResolved(userId, resolved, comment);
+        int applied = appliedCount(receipts);
+        if (applied > 0) {
+            if (resolve) SentinelAuditLog.problemBulkResolved(userId, applied, comment);
+            else SentinelAuditLog.problemBulkAcknowledged(userId, applied, comment);
         }
-        return resolved;
+        return receipts;
+    }
+
+    public static int appliedCount(List<Map<String, Object>> receipts) {
+        return (int) receipts.stream().filter(r -> "APPLIED".equals(r.get("status"))).count();
     }
 
     /**
