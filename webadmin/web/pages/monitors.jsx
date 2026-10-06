@@ -24,6 +24,7 @@ import {
     ChannelGroupPicker, TagPicker, fmtNum, fmtTime, fmtAgo,
 } from '../ui.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
+import { MONITOR_RECIPES, duplicateMonitor, eligibilityCopy, registerAuthoringGuard } from '../authoring.js';
 
 const React = platform.React;
 const { h } = platform.ui;
@@ -311,10 +312,11 @@ function buildConfig(type, cfg) {
 /* ---- small form pieces --------------------------------------------------- */
 
 function NumField({ label, value, onChange, hint, min, max, step }) {
+    const id = React.useId();
     return (
         <div className="field">
-            <label>{label}</label>
-            <input type="number" value={value == null ? '' : value}
+            <label htmlFor={id}>{label}</label>
+            <input id={id} type="number" value={value == null ? '' : value}
                 min={min} max={max} step={step == null ? 1 : step}
                 onChange={(e) => onChange(e.target.value)} />
             {hint ? <div className="hint">{hint}</div> : null}
@@ -323,10 +325,11 @@ function NumField({ label, value, onChange, hint, min, max, step }) {
 }
 
 function SelectField({ label, value, options, onChange, hint }) {
+    const id = React.useId();
     return (
         <div className="field">
-            <label>{label}</label>
-            <select value={value} onChange={(e) => onChange(e.target.value)}>
+            <label htmlFor={id}>{label}</label>
+            <select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
                 {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
             {hint ? <div className="hint">{hint}</div> : null}
@@ -529,7 +532,7 @@ function ConfigFields({ type, cfg, setCfg }) {
                         hint="The state must persist at least this long before it counts as a breach." />
                     <div className="field span-2">
                         <div className="hint">
-                            The only monitor type evaluated against channels that are not started —
+                            Evaluates configured channels even when they are not started —
                             that is the point of it. Duration is counted from the first tick that saw
                             the current state, so a monitor created while a channel is already
                             stopped breaches one minimum-duration later rather than immediately.
@@ -545,7 +548,7 @@ function ConfigFields({ type, cfg, setCfg }) {
 
 /* ---- test result panel --------------------------------------------------- */
 
-function showTestResult(name, result) {
+function showTestResult(name, result, type) {
     const r = result || {};
     const outcomes = Array.isArray(r.outcomes) ? r.outcomes : [];
     detailModal({
@@ -559,7 +562,7 @@ function showTestResult(name, result) {
             }))
             : [{
                 label: 'No channels',
-                text: 'No started channels matched this monitor\'s scope.',
+                text: `No eligible channels were returned. ${eligibilityCopy(type)} Check scope and inventory; this is not a healthy result.`,
             }],
     });
 }
@@ -815,23 +818,81 @@ function MonitorHistoryPanel({ monitorId }) {
 
 /* ---- editor sub-view ----------------------------------------------------- */
 
-function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onClose, onChanged }) {
-    const isNew = !monitor;
-    const [name, setName] = React.useState((monitor && monitor.name) || '');
-    const [description, setDescription] = React.useState((monitor && monitor.description) || '');
-    const [runbookUrl, setRunbookUrl] = React.useState((monitor && monitor.runbookUrl) || '');
-    const [monitorType, setMonitorType] = React.useState((monitor && monitor.monitorType) || 'INACTIVITY');
-    const [scopeType, setScopeType] = React.useState((monitor && monitor.scopeType) || 'ALL');
-    const [scopeId, setScopeId] = React.useState((monitor && monitor.scopeId) || '');
-    const [severity, setSeverity] = React.useState((monitor && monitor.severity) || 'HIGH');
-    const [minBreaches, setMinBreaches] = React.useState(
-        monitor ? String(Math.max(1, monitor.minConsecutiveBreaches || 1)) : '1');
-    const [suppressedBy, setSuppressedBy] = React.useState(
-        monitor && monitor.suppressedByMonitorId != null ? String(monitor.suppressedByMonitorId) : '');
-    const [enabled, setEnabled] = React.useState(monitor ? !!monitor.enabled : true);
-    const [configs, setConfigs] = React.useState(() => seedConfigs(monitor));
+export function MonitorEditor({ monitor, monitors, channels, groups, tags, lookupErrors = [], manage, onClose, onChanged, onDuplicate, initialDraft = null, onDraftChange = () => {}, onDraftDiscard = () => {} }) {
+    const isNew = !monitor || monitor.id == null;
+    const [name, setName] = React.useState(initialDraft?.name ?? ((monitor && monitor.name) || ''));
+    const [description, setDescription] = React.useState(initialDraft?.description ?? ((monitor && monitor.description) || ''));
+    const [runbookUrl, setRunbookUrl] = React.useState(initialDraft?.runbookUrl ?? ((monitor && monitor.runbookUrl) || ''));
+    const [monitorType, setMonitorType] = React.useState(initialDraft?.monitorType ?? ((monitor && monitor.monitorType) || 'INACTIVITY'));
+    const [scopeType, setScopeType] = React.useState(initialDraft?.scopeType ?? ((monitor && monitor.scopeType) || 'ALL'));
+    const [scopeId, setScopeId] = React.useState(initialDraft?.scopeId ?? ((monitor && monitor.scopeId) || ''));
+    const [severity, setSeverity] = React.useState(initialDraft?.severity ?? ((monitor && monitor.severity) || 'HIGH'));
+    const [minBreaches, setMinBreaches] = React.useState(initialDraft?.minBreaches ?? (
+        monitor ? String(Math.max(1, monitor.minConsecutiveBreaches || 1)) : '1'));
+    const [suppressedBy, setSuppressedBy] = React.useState(initialDraft?.suppressedBy ?? (
+        monitor && monitor.suppressedByMonitorId != null ? String(monitor.suppressedByMonitorId) : ''));
+    const [enabled, setEnabled] = React.useState(initialDraft?.enabled ?? (monitor ? !!monitor.enabled : true));
+    const [configs, setConfigs] = React.useState(() => initialDraft?.configs || seedConfigs(monitor));
     const [busy, setBusy] = React.useState(null);
 
+    const [wizard, setWizard] = React.useState(isNew);
+    const [step, setStep] = React.useState(0);
+    const [maxStep, setMaxStep] = React.useState(isNew && !initialDraft ? 0 : 3);
+    const [inlineError, setInlineError] = React.useState('');
+    const operation = React.useRef(null);
+    const draft = JSON.stringify({ name, description, runbookUrl, monitorType, scopeType,
+        scopeId, severity, minBreaches, suppressedBy, enabled, configs });
+    const initial = React.useRef(draft);
+    const dirty = draft !== initial.current || !!initialDraft || (isNew && !!monitor);
+    React.useEffect(() => {
+        onDraftChange(dirty ? JSON.parse(draft) : null);
+    }, [draft, dirty]);
+    const live = React.useRef({});
+    live.current = { dirty, busy };
+    const leave = async () => {
+        if (live.current.busy || operation.current) return false;
+        if (!live.current.dirty) return true;
+        operation.current = 'leave'; setBusy('leave');
+        try {
+            const ok = await confirmDialog('Discard monitor draft?',
+                'Your unsaved monitor changes will be discarded.', { danger: true, okLabel: 'Discard' });
+            if (ok) onDraftDiscard();
+            return ok;
+        }
+        finally { operation.current = null; setBusy(null); }
+    };
+    const close = async () => { if (await leave()) onClose(); };
+    React.useEffect(() => registerAuthoringGuard(leave), []);
+    React.useEffect(() => {
+        const unload = (e) => { if (live.current.dirty || operation.current) { e.preventDefault(); e.returnValue = ''; } };
+        window.addEventListener('beforeunload', unload);
+        return () => window.removeEventListener('beforeunload', unload);
+    }, []);
+    const visible = (i) => !wizard || step === i;
+    const validateStep = (i) => {
+        if (i === 0) {
+            if (!name.trim()) throw new Error('Name is required.');
+            if (runbookUrl.trim() && !/^https?:\/\/[^\s/?#]+[^\s]*$/i.test(runbookUrl.trim()))
+                throw new Error('Runbook URL must be an absolute http:// or https:// link.');
+        }
+        if (i === 1) {
+            buildConfig(monitorType, configs[monitorType] || {});
+            if (minBreaches.trim() && (!Number.isInteger(Number(minBreaches)) || Number(minBreaches) < 1))
+                throw new Error('Minimum consecutive breaches must be a whole number of at least 1.');
+        }
+        if (i === 2 && scopeType !== 'ALL' && !scopeId) throw new Error('Select a scope target.');
+    };
+    const next = () => {
+        try { validateStep(step); setInlineError(''); setStep(step + 1); setMaxStep(Math.max(maxStep, step + 1)); }
+        catch (e) { setInlineError(e.message); }
+    };
+    const recipe = (key) => {
+        const r = MONITOR_RECIPES.find((r) => r.key === key);
+        if (!r) return;
+        setName(r.name); setMonitorType(r.monitorType);
+        setConfigs((c) => ({ ...c, [r.monitorType]: normalizeTypeConfig(r.monitorType, editableConfig(r.config), false) }));
+        setEnabled(false); setMinBreaches('1'); setInlineError('');
+    };
     const cfg = configs[monitorType] || {};
     const setCfg = (patch) => setConfigs((c) => ({
         ...c, [monitorType]: { ...(c[monitorType] || {}), ...patch },
@@ -877,10 +938,11 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
     };
 
     const save = async () => {
+        if (operation.current || !canManage()) return;
         let payload;
         try { payload = buildPayload(); }
-        catch (e) { errorModal('Cannot Save Monitor', e.message || String(e)); return; }
-        setBusy('save');
+        catch (e) { setInlineError(e.message || String(e)); return; }
+        operation.current = 'save'; setInlineError(''); setBusy('save');
         try {
             if (isNew) await createMonitor(payload);
             else await updateMonitor(monitor.id, payload);
@@ -889,32 +951,35 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
             onClose();
         } catch (e) {
             // 400 validation messages from MonitorService arrive here.
-            errorModal(isNew ? 'Create Failed' : 'Save Failed', errText(e), payload.name);
+            setInlineError(`Save failed: ${errText(e)}. If the connection was lost, check the monitor list before retrying; the server may have saved it.`);
         } finally {
-            setBusy(null);
+            operation.current = null; setBusy(null);
         }
     };
 
     const test = async () => {
+        if (operation.current || !canManage()) return;
         let payload;
         try { payload = buildPayload(); }
-        catch (e) { errorModal('Cannot Test Monitor', e.message || String(e)); return; }
-        setBusy('test');
+        catch (e) { setInlineError(e.message || String(e)); return; }
+        operation.current = 'test'; setInlineError(''); setBusy('test');
         try {
-            showTestResult(payload.name, await testMonitor(payload));
+            showTestResult(payload.name, await testMonitor(payload), payload.monitorType);
         } catch (e) {
-            errorModal('Test Failed', errText(e), payload.name);
+            setInlineError(`Test failed: ${errText(e)}. Your draft is preserved.`);
         } finally {
-            setBusy(null);
+            operation.current = null; setBusy(null);
         }
     };
 
     const del = async () => {
+        if (operation.current || !canManage()) return;
+        operation.current = 'confirm'; setBusy('confirm');
         const ok = await confirmDialog('Delete Monitor',
             `Delete "${monitor.name}"? Its trigger states are removed and it stops being evaluated.`,
             { danger: true, okLabel: 'Delete' });
-        if (!ok) return;
-        setBusy('delete');
+        if (!ok || !canManage()) { operation.current = null; setBusy(null); return; }
+        operation.current = 'delete'; setBusy('delete');
         try {
             await deleteMonitor(monitor.id);
             toast(`Monitor "${monitor.name}" deleted.`, 'success');
@@ -923,7 +988,7 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
         } catch (e) {
             errorModal('Delete Failed', errText(e), monitor.name);
         } finally {
-            setBusy(null);
+            operation.current = null; setBusy(null);
         }
     };
 
@@ -933,25 +998,47 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
             <div className="panel-header">
                 {isNew ? 'New monitor' : `Edit monitor — ${monitor.name}`}
                 <div className="panel-tools">
-                    <button className="btn btn-sm" onClick={onClose}>Back to list</button>
+                    <span className="sn-hint" role="status">{dirty ? 'Unsaved changes' : 'No changes'}</span>
+                    <button className="btn btn-sm" disabled={!!busy} onClick={() => setWizard(!wizard)}>
+                        {wizard ? 'Quick edit' : 'Wizard'}
+                    </button>
+                    <button className="btn btn-sm" disabled={!!busy} onClick={close}>Back to list</button>
                 </div>
             </div>
+            {wizard ? <nav aria-label="Monitor setup steps" className="panel-body" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {['Basics', 'Condition', 'Scope', 'Review & Test'].map((label, i) => (
+                    <button key={label} type="button" className={`btn ${step === i ? 'btn-primary' : ''}`}
+                        aria-current={step === i ? 'step' : undefined} disabled={i > maxStep || !!busy}
+                        onClick={() => { setStep(i); setInlineError(''); }}>{i + 1}. {label}</button>
+                ))}
+            </nav> : null}
             <div className="panel-body">
+                {initialDraft ? <p className="sn-hint">Restored unsaved draft from this browser session. Review current scope and permissions before saving.</p> : null}
+                {inlineError ? <div className="text-err" role="alert" style={{ marginBottom: 12 }}>{inlineError}</div> : null}
+                {lookupErrors.length ? <div className="text-err" role="status">Scope lookups incomplete: {lookupErrors.join('; ')}. Draft test resolves eligible scope on the server.</div> : null}
                 {!manage ? (
                     <div className="sn-hint" style={{ marginBottom: 10 }}>
                         Read-only: the Manage Monitoring permission is required to change monitors.
                     </div>
                 ) : null}
-                <fieldset disabled={!manage} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
-                    <div className="form-grid">
+                <fieldset disabled={!manage || !!busy} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+                    <div className="form-grid" style={{ display: visible(0) ? undefined : 'none' }}>
+                        {isNew ? <div className="field span-2"><label htmlFor="sn-recipe">Start from a recipe</label>
+                            <select id="sn-recipe" value="" onChange={(e) => recipe(e.target.value)}>
+                                <option value="">Choose editable defaults…</option>
+                                {MONITOR_RECIPES.map((r) => <option key={r.key} value={r.key}>{r.name}</option>)}
+                            </select>
+                            <div className="hint">Recipes start disabled. Review defaults, scope and dependencies before enabling.</div>
+                            {MONITOR_RECIPES.filter((r) => r.monitorType === monitorType).map((r) => <div key={r.key} className="hint">{r.hint}</div>)}
+                        </div> : null}
                         <div className="field">
-                            <label>Name</label>
-                            <input value={name} onChange={(e) => setName(e.target.value)}
+                            <label htmlFor="sn-monitor-name">Name</label>
+                            <input id="sn-monitor-name" value={name} onChange={(e) => setName(e.target.value)}
                                 placeholder="e.g. ADT feed inactivity" />
                         </div>
                         <div className="field">
-                            <label>Type</label>
-                            <select value={monitorType} onChange={(e) => setMonitorType(e.target.value)}>
+                            <label htmlFor="sn-monitor-monitorType">Type</label>
+                            <select id="sn-monitor-monitorType" value={monitorType} onChange={(e) => setMonitorType(e.target.value)}>
                                 {MONITOR_TYPE_ORDER.map((t) => (
                                     <option key={t} value={t}>{MONITOR_TYPE_META[t].label}</option>
                                 ))}
@@ -959,13 +1046,13 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                             <div className="hint">{(MONITOR_TYPE_META[monitorType] || {}).description}</div>
                         </div>
                         <div className="field span-2">
-                            <label>Description</label>
-                            <input value={description} onChange={(e) => setDescription(e.target.value)}
+                            <label htmlFor="sn-monitor-description">Description</label>
+                            <input id="sn-monitor-description" value={description} onChange={(e) => setDescription(e.target.value)}
                                 placeholder="Optional operator notes" />
                         </div>
                         <div className="field span-2">
-                            <label>Runbook URL</label>
-                            <input type="url" value={runbookUrl}
+                            <label htmlFor="sn-monitor-runbookUrl">Runbook URL</label>
+                            <input id="sn-monitor-runbookUrl" type="url" value={runbookUrl}
                                 onChange={(e) => setRunbookUrl(e.target.value)}
                                 placeholder="https://wiki.example.org/runbooks/adt-inactivity" />
                             <div className="hint">
@@ -973,13 +1060,15 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                                 notification; must be an absolute http:// or https:// link.
                             </div>
                         </div>
+                    </div>
+                    <div className="form-grid" style={{ display: visible(2) ? undefined : 'none' }}>
                         <div className="field span-2">
                             <label>Scope</label>
                             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                                 <div className="segpill">
                                     {SCOPE_TYPES.map((s) => (
                                         <button key={s.key} type="button"
-                                            className={scopeType === s.key ? 'on' : ''}
+                                            className={scopeType === s.key ? 'on' : ''} aria-pressed={scopeType === s.key}
                                             onClick={() => {
                                                 if (scopeType !== s.key) { setScopeType(s.key); setScopeId(''); }
                                             }}>
@@ -1000,12 +1089,14 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                                         emptyLabel="Select a tag…" onChange={setScopeId} />
                                 ) : null}
                             </div>
-                            <div className="hint">Only started channels are evaluated.</div>
+                            <div className="hint">{eligibilityCopy(monitorType)}</div>
                         </div>
+                    </div>
+                    <div className="form-grid" style={{ display: visible(1) ? undefined : 'none' }}>
                         <div className="field">
-                            <label>Severity</label>
+                            <label htmlFor="sn-monitor-severity">Severity</label>
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                                <select value={severity} onChange={(e) => setSeverity(e.target.value)}>
+                                <select id="sn-monitor-severity" value={severity} onChange={(e) => setSeverity(e.target.value)}>
                                     {SEVERITY_ORDER.map((s) => (
                                         <option key={s} value={s}>{SEVERITY_META[s].label}</option>
                                     ))}
@@ -1014,16 +1105,16 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                             </div>
                         </div>
                         <div className="field">
-                            <label>Min consecutive breaches</label>
-                            <input type="number" min="1" step="1" value={minBreaches}
+                            <label htmlFor="sn-monitor-minBreaches">Min consecutive breaches</label>
+                            <input id="sn-monitor-minBreaches" type="number" min="1" step="1" value={minBreaches}
                                 onChange={(e) => setMinBreaches(e.target.value)} />
                             <div className="hint">
                                 Ticks the condition must hold before a problem opens.
                             </div>
                         </div>
                         <div className="field">
-                            <label>Suppressed by</label>
-                            <select value={suppressedBy} onChange={(e) => setSuppressedBy(e.target.value)}>
+                            <label htmlFor="sn-monitor-suppressedBy">Suppressed by</label>
+                            <select id="sn-monitor-suppressedBy" value={suppressedBy} onChange={(e) => setSuppressedBy(e.target.value)}>
                                 <option value="">None</option>
                                 {others.map((m) => (
                                     <option key={m.id} value={String(m.id)}>{m.name}</option>
@@ -1045,31 +1136,50 @@ function MonitorEditor({ monitor, monitors, channels, groups, tags, manage, onCl
                         </div>
                     </div>
 
+                    <div style={{ display: visible(1) ? undefined : 'none' }}>
                     <div style={{ borderTop: '1px solid var(--line)', margin: '4px 0 12px' }} />
                     <div className="sn-tile-label" style={{ marginBottom: 8 }}>
                         {(MONITOR_TYPE_META[monitorType] || { label: monitorType }).label} settings
                     </div>
                     <ConfigFields type={monitorType} cfg={cfg} setCfg={setCfg} />
+                    </div>
+                    {wizard && step === 3 ? <div>
+                        <h3>Review {name || 'monitor draft'}</h3>
+                        <p>{(MONITOR_TYPE_META[monitorType] || {}).label} · {severity} · {enabled ? 'Enabled' : 'Disabled'}</p>
+                        <p>Configured scope: {scopeLabel({ scopeType, scopeId },
+                            Object.fromEntries((channels || []).map((c) => [c.channelId, c.name])),
+                            Object.fromEntries((groups || []).map((g) => [g.id, g.name])),
+                            Object.fromEntries((tags || []).map((t) => [t.id, t.name])))}</p>
+                        <p>{eligibilityCopy(monitorType)}</p>
+                        <p>Opens after {minBreaches || '1'} consecutive breaches. Dependency: {others.find((m) => String(m.id) === suppressedBy)?.name || (suppressedBy ? `Monitor ${suppressedBy} (not in current list)` : 'None')}.</p>
+                        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{JSON.stringify(cfg, null, 2)}</pre>
+                        <p>Test resolves eligible channels using current server inventory. It evaluates this draft without saving or sending notifications; duration and history prerequisites may remain insufficient.</p>
+                    </div> : null}
                 </fieldset>
             </div>
             <div className="panel-body"
-                style={{ borderTop: '1px solid var(--line)', display: 'flex', gap: 8, alignItems: 'center' }}>
-                {manage ? (
+                style={{ borderTop: '1px solid var(--line)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                {wizard && step > 0 ? <button className="btn" disabled={!!busy} onClick={() => { setStep(step - 1); setInlineError(''); }}>Previous</button> : null}
+                {wizard && step < 3 ? <button className="btn btn-primary" disabled={!!busy} onClick={next}>Next</button> : null}
+                {manage && (!wizard || step === 3) ? (
                     <button className="btn btn-primary" onClick={save} disabled={!!busy}>
                         {busy === 'save' ? 'Saving…' : (isNew ? 'Create monitor' : 'Save changes')}
                     </button>
                 ) : null}
-                {manage ? (
+                {manage && (!wizard || step === 3) ? (
                     <button className="btn" onClick={test} disabled={!!busy}
-                        title="Dry-run this configuration against every started channel in scope">
+                        title="Evaluate this draft against eligible channels without saving or sending notifications">
                         {busy === 'test' ? 'Testing…' : 'Test'}
                     </button>
                 ) : null}
-                <button className="btn" onClick={onClose}
-                    disabled={busy === 'save' || busy === 'delete'}>
+                <button className="btn" onClick={close}
+                    disabled={!!busy}>
                     {manage ? 'Cancel' : 'Close'}
                 </button>
                 <span style={{ flex: 1 }} />
+                {manage && !isNew ? <button className="btn" disabled={!!busy} onClick={async () => {
+                    if (await leave() && canManage()) onDuplicate(duplicateMonitor(monitor));
+                }}>Duplicate saved monitor</button> : null}
                 {manage && !isNew ? (
                     <button className="btn btn-danger" onClick={del} disabled={!!busy}>
                         {busy === 'delete' ? 'Deleting…' : 'Delete'}
@@ -1091,7 +1201,7 @@ export function MonitorsPage() {
     const channels = useApi(getCoreChannels, []);
     const groups = useApi(getCoreChannelGroups, []);
     const tags = useApi(getCoreTags, []);
-    const [view, setView] = React.useState(null); // null | { mode: 'new' } | { mode: 'edit', monitor }
+    const [view, setView] = React.useState(() => platform.store.getState('sentinel.monitorDraft') || null); // null | { mode: 'new' } | { mode: 'edit', monitor }
     const manage = canManage();
 
     /* The "New Sentinel Monitor" palette command lands here (see host.jsx).
@@ -1234,14 +1344,19 @@ export function MonitorsPage() {
             </div>
             {view ? (
                 <MonitorEditor
-                    key={view.monitor ? `edit-${view.monitor.id}` : 'new'}
+                    key={view.mode === 'copy' ? 'copy' : view.monitor ? `edit-${view.monitor.id}` : 'new'}
                     monitor={view.monitor || null}
                     monitors={monitorList}
                     channels={Array.isArray(channels.data) ? channels.data : null}
                     groups={Array.isArray(groups.data) ? groups.data : null}
                     tags={Array.isArray(tags.data) ? tags.data : null}
+                    lookupErrors={[channels.error, groups.error, tags.error].filter(Boolean)}
                     manage={manage}
-                    onClose={() => setView(null)}
+                    initialDraft={view.draft || null}
+                    onDraftChange={(draft) => platform.store.setState('sentinel.monitorDraft', draft ? { ...view, draft } : null)}
+                    onDraftDiscard={() => platform.store.setState('sentinel.monitorDraft', null)}
+                    onDuplicate={(draft) => setView({ mode: 'copy', monitor: draft })}
+                    onClose={() => { platform.store.setState('sentinel.monitorDraft', null); setView(null); }}
                     onChanged={monitors.reload}
                 />
             ) : null}

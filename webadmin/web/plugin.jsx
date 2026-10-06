@@ -7,6 +7,7 @@
 // and shared pieces through ./ui.jsx; editors and detail panes are page-local
 // state.
 
+import { mayLeaveAuthoring } from './authoring.js';
 import { platform } from '@oie/web-shell';
 import { canManage, canManageSettings } from './ui.jsx';
 import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
@@ -120,13 +121,19 @@ function SentinelView() {
        read the intent in a state initializer (to get the first fetch right),
        and an initializer only runs at mount. */
     const [intentStamp, setIntentStamp] = React.useState(0);
+    const navigationRequest = React.useRef(0);
 
     React.useEffect(() => {
         try {
-            return platform.store.subscribe(INTENT_KEY, (value) => {
+            return platform.store.subscribe(INTENT_KEY, async (value) => {
                 // Null is the consuming page clearing it, not a new request.
                 const target = tabForIntent(value);
                 if (target) {
+                    const current = ++navigationRequest.current;
+                    if (!(await mayLeaveAuthoring()) || current !== navigationRequest.current) {
+                        if (readIntent() === value) clearIntent();
+                        return;
+                    }
                     setTab(target);
                     setIntentStamp((n) => n + 1);
                     if (SHELL_CONSUMED.has(value.kind)) clearIntent();
@@ -151,7 +158,11 @@ function SentinelView() {
                 {visible.map((t) => (
                     <button key={t.key}
                         className={`tab ${active.key === t.key ? 'active' : ''}`}
-                        onClick={() => setTab(t.key)}>
+                        onClick={async () => {
+                            if (t.key === tab) return;
+                            const current = ++navigationRequest.current;
+                            if (await mayLeaveAuthoring() && current === navigationRequest.current) setTab(t.key);
+                        }}>
                         {t.label}
                     </button>
                 ))}
