@@ -131,6 +131,19 @@ class ActivityCollectorJobTest {
         }
     }
 
+    @Test
+    void detectedCollectorFailureIsNotRecordedAsSuccessfulSharedTick() {
+        var fence=new LeaseFence("sentinel-engine","node-a",1L);
+        try(var leadership=mockStatic(SentinelLeadership.class);
+            var observations=mockStatic(org.openintegrationengine.plugins.sentinel.server.db.JobObservationRepository.class)) {
+            leadership.when(SentinelLeadership::captureFence).thenReturn(fence);
+            when(engine.getDeployedIds()).thenThrow(new IllegalStateException("inventory unavailable"));
+            new ActivityCollectorJob().execute(null);
+            observations.verify(()->org.openintegrationengine.plugins.sentinel.server.db.JobObservationRepository.finish(
+                org.mockito.ArgumentMatchers.eq("collector"),anyString(),org.mockito.ArgumentMatchers.eq(fence),org.mockito.ArgumentMatchers.eq(false)));
+        }
+    }
+
     @BeforeEach
     void setUp() {
         // Per-test rather than @BeforeAll: an aborted @BeforeAll reports the

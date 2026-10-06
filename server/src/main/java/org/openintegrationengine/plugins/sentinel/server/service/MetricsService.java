@@ -273,11 +273,11 @@ public final class MetricsService {
         CollectorState state = CollectorState.getInstance();
 
         family(out, COLLECTOR_HEARTBEAT, "gauge",
-                "Seconds since the Sentinel activity collector last completed a tick.");
+                "Seconds since this serving node activity collector last completed a tick; absent on standby is not leader failure. Shared epoch evidence: Sentinel /health.");
         appendAge(out, COLLECTOR_HEARTBEAT, state.getLastCollectorRun(), now);
 
         family(out, EVALUATOR_HEARTBEAT, "gauge",
-                "Seconds since the Sentinel trigger evaluator last completed a tick.");
+                "Seconds since this serving node trigger evaluator last completed a tick; absent on standby is not leader failure. Shared epoch evidence: Sentinel /health.");
         appendAge(out, EVALUATOR_HEARTBEAT, state.getLastEvaluatorRun(), now);
     }
 

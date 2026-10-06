@@ -258,6 +258,7 @@ final class MapperStatementMatrix {
         Timestamp earlier = Timestamp.from(Instant.parse("2026-08-30T12:00:00.123Z"));
 
         Map<String, Object> values = new HashMap<>();
+        values.put("job", "collector");values.put("runId", "00000000-0000-0000-0000-000000000001");values.put("outcome", "SUCCESS");
         values.put("id", monitorId);
         values.put("name", "matrix-exercise-row");
         values.put("description", "database matrix exercise");

@@ -127,51 +127,55 @@ public class ActivityCollectorJob implements Job {
         if (fence == null) {
             return;
         }
-        try {
-            EngineController engineController = ControllerFactory.getFactory().createEngineController();
-            Set<String> deployedIds = engineController.getDeployedIds();
-            List<ChannelStatistics> statisticsList = engineController.getChannelStatisticsList(null, false);
+        try (JobObservation observation = JobObservation.begin("collector", fence)) {
+            try {
+                EngineController engineController = ControllerFactory.getFactory().createEngineController();
+                Set<String> deployedIds = engineController.getDeployedIds();
+                List<ChannelStatistics> statisticsList = engineController.getChannelStatisticsList(null, false);
 
-            Instant now = Instant.now();
-            CollectorState state = CollectorState.getInstance();
-            state.prepareCounterEpoch(fence);
+                Instant now = Instant.now();
+                CollectorState state = CollectorState.getInstance();
+                state.prepareCounterEpoch(fence);
 
-            List<ActivitySample> samples = new ArrayList<>();
-            // Insertion-ordered so the snapshot advance in flushSamples walks
-            // channels in the same order the rows were queued, which keeps
-            // debug logs of a partial tick readable.
-            Map<String, CollectorState.Counters> observed = new LinkedHashMap<>();
+                List<ActivitySample> samples = new ArrayList<>();
+                // Insertion-ordered so the snapshot advance in flushSamples walks
+                // channels in the same order the rows were queued, which keeps
+                // debug logs of a partial tick readable.
+                Map<String, CollectorState.Counters> observed = new LinkedHashMap<>();
 
-            for (ChannelStatistics statistics : statisticsList) {
-                String channelId = statistics.getChannelId();
-                // The stats list can lag the deployed set during an
-                // undeploy; skip anything not currently deployed so we never
-                // sample a channel mid-teardown.
-                if (channelId == null || !deployedIds.contains(channelId)) {
-                    continue;
+                for (ChannelStatistics statistics : statisticsList) {
+                    String channelId = statistics.getChannelId();
+                    // The stats list can lag the deployed set during an
+                    // undeploy; skip anything not currently deployed so we never
+                    // sample a channel mid-teardown.
+                    if (channelId == null || !deployedIds.contains(channelId)) {
+                        continue;
+                    }
+
+                    // Per-channel try/catch: one channel's unreadable statistics
+                    // must not cost every other channel its sample for this tick.
+                    // A channel that throws here contributes neither a row nor a
+                    // pending snapshot, so it simply retries next tick.
+                    try {
+                        ChannelReading reading = readChannel(state, statistics, now);
+                        samples.add(reading.sample());
+                        observed.put(channelId, reading.counters());
+                    } catch (Exception e) {
+                        JobObservation.failedUnit();
+                        log.error("Failed to read activity sample for channel {}", channelId, e);
+                    }
                 }
 
-                // Per-channel try/catch: one channel's unreadable statistics
-                // must not cost every other channel its sample for this tick.
-                // A channel that throws here contributes neither a row nor a
-                // pending snapshot, so it simply retries next tick.
-                try {
-                    ChannelReading reading = readChannel(state, statistics, now);
-                    samples.add(reading.sample());
-                    observed.put(channelId, reading.counters());
-                } catch (Exception e) {
-                    log.error("Failed to read activity sample for channel {}", channelId, e);
-                }
+                flushSamples(state, samples, observed, fence);
+
+                maintainStartedStamps(state, deployedIds, now);
+                evictDepartedState(state, deployedIds);
+
+                state.recordCollectorRun(now);
+            } catch (Throwable t) {
+                JobObservation.failedUnit();
+                log.error("Activity collector tick failed", t);
             }
-
-            flushSamples(state, samples, observed, fence);
-
-            maintainStartedStamps(state, deployedIds, now);
-            evictDepartedState(state, deployedIds);
-
-            state.recordCollectorRun(now);
-        } catch (Throwable t) {
-            log.error("Activity collector tick failed", t);
         }
     }
 
@@ -214,6 +218,7 @@ public class ActivityCollectorJob implements Job {
                     state.retainConnectorStates(knownId, connectorNames.keySet());
                 }
             } catch (Exception e) {
+                JobObservation.failedUnit();
                 log.warn("Failed to prune collector state for channel {}", knownId, e);
             }
         }
@@ -311,6 +316,7 @@ public class ActivityCollectorJob implements Job {
         try {
             ActivityRepository.insertActivitySamples(samples, fence);
         } catch (Exception e) {
+            JobObservation.failedUnit();
             log.error("Failed to insert activity sample batch of {} rows; leaving all previous-counter "
                     + "snapshots unadvanced so the next successful tick covers this interval",
                     samples.size(), e);

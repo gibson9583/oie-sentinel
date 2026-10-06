@@ -996,4 +996,45 @@
           AND lease.lease_name LIKE 'sentinel-presence-%' AND lease.expires_time &gt; CURRENT_TIMESTAMP
     </select>
 
+    <resultMap id="jobObservationResult" type="map">
+        <result property="job_name" column="job_name" />
+        <result property="run_id" column="run_id" />
+        <result property="node_id" column="node_id" />
+        <result property="lease_epoch" column="lease_epoch" />
+        <result property="started_time" column="started_time" />
+        <result property="finished_time" column="finished_time" />
+        <result property="outcome" column="outcome" />
+        <result property="last_success_time" column="last_success_time" />
+        <result property="last_success_node" column="last_success_node" />
+        <result property="last_success_epoch" column="last_success_epoch" />
+    </resultMap>
+
+    <select id="listJobObservations" resultMap="jobObservationResult">SELECT job_name, run_id, node_id, lease_epoch, started_time, finished_time, outcome, last_success_time, last_success_node, last_success_epoch FROM sentinel_job_observation ORDER BY job_name</select>
+    <insert id="insertJobObservation" parameterType="map">
+        INSERT INTO sentinel_job_observation (job_name, run_id, node_id, lease_epoch, started_time, outcome)
+        VALUES (#{job}, #{runId}, #{nodeId}, #{leaseEpoch}, CURRENT_TIMESTAMP, 'RUNNING')
+    </insert>
+    <update id="startJobObservation" parameterType="map">
+        UPDATE sentinel_job_observation SET run_id=#{runId}, node_id=#{nodeId}, lease_epoch=#{leaseEpoch},
+            started_time=CURRENT_TIMESTAMP, finished_time=NULL, outcome='RUNNING' WHERE job_name=#{job}
+    </update>
+    <update id="finishJobObservation" parameterType="map">
+        UPDATE sentinel_job_observation SET finished_time=CURRENT_TIMESTAMP, outcome=#{outcome}
+        <if test="outcome == 'SUCCESS'">, last_success_time=CURRENT_TIMESTAMP, last_success_node=#{nodeId}, last_success_epoch=#{leaseEpoch}</if>
+        WHERE job_name=#{job} AND run_id=#{runId} AND node_id=#{nodeId} AND lease_epoch=#{leaseEpoch}
+    </update>
+    <sql id="healthChannelFilter">
+        <if test="channelIdIn != null"><choose><when test="!channelIdIn.isEmpty()">AND channel_id IN
+            <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+        </when><otherwise>AND 1=0</otherwise></choose></if>
+    </sql>
+    <select id="countHealthSamples" parameterType="map" resultType="Long">SELECT COUNT(*) FROM sentinel_channel_activity_sample WHERE 1=1 <include refid="healthChannelFilter" /></select>
+    <select id="countHealthTrends" parameterType="map" resultType="Long">SELECT COUNT(*) FROM sentinel_channel_activity_trend WHERE 1=1 <include refid="healthChannelFilter" /></select>
+    <select id="countHealthEvents" parameterType="map" resultType="Long">SELECT COUNT(*) FROM sentinel_alert_event WHERE 1=1 <include refid="healthChannelFilter" /></select>
+    <select id="countHealthPending" parameterType="map" resultType="Long">SELECT COUNT(*) FROM sentinel_alert_event WHERE (problem_pending=TRUE OR resolution_pending=TRUE) <include refid="healthChannelFilter" /></select>
+    <select id="oldestHealthPending" parameterType="map" resultType="java.sql.Timestamp">
+        SELECT CASE WHEN COUNT(*) = COUNT(CASE WHEN problem_pending=TRUE THEN opened_time ELSE resolved_time END) THEN MIN(CASE WHEN problem_pending=TRUE THEN opened_time ELSE resolved_time END) ELSE NULL END
+        FROM sentinel_alert_event WHERE (problem_pending=TRUE OR resolution_pending=TRUE) <include refid="healthChannelFilter" />
+    </select>
+
 </mapper>

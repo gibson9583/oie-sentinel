@@ -101,6 +101,7 @@ import org.slf4j.LoggerFactory;
  *   <li><b>11</b> — Per-node deployed-channel inventory for cluster-wide evaluation.</li>
  *   <li><b>13</b> — Durable channel-maintenance request identities.</li>
  *   <li><b>14</b> — Nullable delivery context snapshots and paging index.</li>
+ *   <li><b>15</b> — Shared fenced job observations.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
  * </ul>
  * <p>Versions 7–12 are this release's sequence after released schema v6.
@@ -121,7 +122,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 14;
+    public static final int LATEST_VERSION = 15;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -203,6 +204,7 @@ public class SentinelMigrator extends Migrator {
         }
         if (current < 13 && targetVersion >= 13) { applyV13(); }
         if (current < 14 && targetVersion >= 14) { applyV14(); }
+        if (current < 15 && targetVersion >= 15) { applyV15(); }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -421,7 +423,14 @@ public class SentinelMigrator extends Migrator {
                 && columnExists("sentinel_action_dispatch_log", "action_name_at_attempt")
                 && columnExists("sentinel_action_dispatch_log", "action_type_at_attempt")
                 && columnExists("sentinel_action_dispatch_log", "event_phase_at_attempt")
-                && indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id") ? 14 : 13;
+                && indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time, id") ? (tableExists("sentinel_job_observation") ? 15 : 14) : 13;
+    }
+
+    private void applyV15() throws MigrationException {
+        try {
+            if (!tableExists("sentinel_job_observation")) executeScript("/" + getDatabaseType() + "-sentinel-v15.sql");
+        } catch (MigrationException e) { throw e; }
+        catch (Exception e) { throw new MigrationException("Failed to add shared Sentinel job observations", e); }
     }
 
     private void applyV14() throws MigrationException {
@@ -683,7 +692,8 @@ public class SentinelMigrator extends Migrator {
             "sentinel_maintenance_window",
             "sentinel_monitor",
             "sentinel_node_lease",
-            "sentinel_maintenance_request"};
+            "sentinel_maintenance_request",
+            "sentinel_job_observation"};
 
     /**
      * Explicit secondary indexes created by Sentinel. The naming convention is
@@ -731,6 +741,7 @@ public class SentinelMigrator extends Migrator {
      * one explicitly named FK, so a fresh v1 script cannot collide.
      */
     private static final NamedObject[] POSTGRES_CONSTRAINTS = {
+            object("sentinel_job_observation", "pk_sentinel_job_observation"),
             object("sentinel_maintenance_request", "sentinel_maintenance_request_pkey"),
 
             object("sentinel_monitor", "sentinel_monitor_pkey"),
@@ -757,6 +768,7 @@ public class SentinelMigrator extends Migrator {
 
     /** Oracle constraints that were explicitly named by shipped scripts. */
     private static final NamedObject[] ORACLE_CONSTRAINTS = {
+            object("sentinel_job_observation", "pk_sentinel_job_observation"),
 
             object("sentinel_trigger_state", "uq_sentinel_trigger_state"),
             object("sentinel_trigger_state", "fk_sentinel_trigger_state_alert_event"),
@@ -764,6 +776,7 @@ public class SentinelMigrator extends Migrator {
 
     /** SQL Server schema-global constraint names introduced by v7/v8. */
     private static final NamedObject[] SQLSERVER_CONSTRAINTS = {
+            object("sentinel_job_observation", "pk_sentinel_job_observation"),
 
             object("sentinel_node_lease", "df_sentinel_node_lease_epoch"),
             object("sentinel_connector_status_event", "df_sentinel_connector_node_id")};

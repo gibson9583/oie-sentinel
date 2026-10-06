@@ -101,70 +101,76 @@ public class ActivityRollupJob implements Job {
         if (fence == null) {
             return;
         }
-        try {
-            // Hour buckets are truncated on the Instant (UTC-aligned). This
-            // MUST match how the evaluators compute their reference hour
-            // (now.truncatedTo(HOURS) on the Instant —
-            // AnomalyEvaluator/LowVolumeEvaluator): in fractional-offset
-            // zones (+05:30 India, +09:30 ACST, ...) a wall-clock truncation
-            // would shift every trend bucket 30-45 minutes from the
-            // evaluated hour, letting BaselineResolver's reference-hour
-            // exclusion admit the bucket that overlaps the very hour under
-            // test. BaselineResolver's hour-of-day tiering still classifies
-            // these buckets via atZone(systemDefault()), so local
-            // seasonality is unaffected.
-            Instant prevHourStart = Instant.now().truncatedTo(ChronoUnit.HOURS)
-                    .minus(1, ChronoUnit.HOURS);
-            Instant firstHour = resolveFirstHourToRoll(prevHourStart);
-            if (firstHour.isAfter(prevHourStart)) {
-                // The previous hour is already rolled up (a second fire
-                // inside the same hour, or a clock step backwards).
-                log.debug("No un-rolled hours before {}", prevHourStart);
-                return;
-            }
+        try (JobObservation observation = JobObservation.begin("rollup", fence)) {
+            try {
+                // Hour buckets are truncated on the Instant (UTC-aligned). This
+                // MUST match how the evaluators compute their reference hour
+                // (now.truncatedTo(HOURS) on the Instant —
+                // AnomalyEvaluator/LowVolumeEvaluator): in fractional-offset
+                // zones (+05:30 India, +09:30 ACST, ...) a wall-clock truncation
+                // would shift every trend bucket 30-45 minutes from the
+                // evaluated hour, letting BaselineResolver's reference-hour
+                // exclusion admit the bucket that overlaps the very hour under
+                // test. BaselineResolver's hour-of-day tiering still classifies
+                // these buckets via atZone(systemDefault()), so local
+                // seasonality is unaffected.
+                Instant prevHourStart = Instant.now().truncatedTo(ChronoUnit.HOURS)
+                        .minus(1, ChronoUnit.HOURS);
+                Instant firstHour = resolveFirstHourToRoll(prevHourStart);
+                if (firstHour.isAfter(prevHourStart)) {
+                    // The previous hour is already rolled up (a second fire
+                    // inside the same hour, or a clock step backwards).
+                    log.debug("No un-rolled hours before {}", prevHourStart);
+                    return;
+                }
 
-            List<Channel> channels = ChannelController.getInstance().getChannels(null);
-            if (channels == null) {
-                return;
-            }
+                List<Channel> channels = ChannelController.getInstance().getChannels(null);
+                if (channels == null) {
+                    JobObservation.failedUnit();
+                    return;
+                }
 
-            int bucketsWritten = 0;
-            int hoursRolled = 0;
-            for (Instant hourStart = firstHour; !hourStart.isAfter(prevHourStart);
-                    hourStart = hourStart.plus(1, ChronoUnit.HOURS)) {
-                // listActivitySamples' bounds are inclusive; back the upper
-                // bound off by 1ms so a sample landing exactly on the next
-                // hour boundary is counted once (in the next hour), never
-                // twice.
-                Instant hourEndInclusive = hourStart.plus(1, ChronoUnit.HOURS).minusMillis(1);
-                hoursRolled++;
+                int bucketsWritten = 0;
+                int hoursRolled = 0;
+                for (Instant hourStart = firstHour; !hourStart.isAfter(prevHourStart);
+                        hourStart = hourStart.plus(1, ChronoUnit.HOURS)) {
+                    // listActivitySamples' bounds are inclusive; back the upper
+                    // bound off by 1ms so a sample landing exactly on the next
+                    // hour boundary is counted once (in the next hour), never
+                    // twice.
+                    Instant hourEndInclusive = hourStart.plus(1, ChronoUnit.HOURS).minusMillis(1);
+                    hoursRolled++;
 
-                for (Channel channel : channels) {
-                    if (!SentinelLeadership.recheckFence(fence)) {
-                        log.info("Activity rollup stopped between channels because leadership epoch changed");
-                        return;
-                    }
-                    // Per-channel try/catch: one channel's bad rollup must not
-                    // cost every other channel its trend bucket for the hour.
-                    try {
-                        if (rollupChannel(channel.getId(), hourStart, hourEndInclusive, fence)) {
-                            bucketsWritten++;
+                    for (Channel channel : channels) {
+                        if (!SentinelLeadership.recheckFence(fence)) {
+                            JobObservation.failedUnit();
+                            log.info("Activity rollup stopped between channels because leadership epoch changed");
+                            return;
                         }
-                    } catch (Exception e) {
-                        log.error("Failed to roll up activity for channel {} hour {}", channel.getId(), hourStart, e);
+                        // Per-channel try/catch: one channel's bad rollup must not
+                        // cost every other channel its trend bucket for the hour.
+                        try {
+                            if (rollupChannel(channel.getId(), hourStart, hourEndInclusive, fence)) {
+                                bucketsWritten++;
+                            }
+                        } catch (Exception e) {
+                            JobObservation.failedUnit();
+                            log.error("Failed to roll up activity for channel {} hour {}", channel.getId(), hourStart, e);
+                        }
                     }
                 }
-            }
 
-            if (bucketsWritten > 0) {
-                log.info("Rolled up {} channel bucket(s) across {} hour(s) ending {}",
-                        bucketsWritten, hoursRolled, prevHourStart);
-            } else {
-                log.debug("No channels had activity samples in the {} hour(s) ending {}",
-                        hoursRolled, prevHourStart);
+                if (bucketsWritten > 0) {
+                    log.info("Rolled up {} channel bucket(s) across {} hour(s) ending {}",
+                            bucketsWritten, hoursRolled, prevHourStart);
+                } else {
+                    log.debug("No channels had activity samples in the {} hour(s) ending {}",
+                            hoursRolled, prevHourStart);
+                }
+            } catch (Throwable t) {
+                JobObservation.failedUnit();
+                log.error("Activity rollup run failed", t);
             }
-        } catch (Throwable t) {
-            log.error("Activity rollup run failed", t);
         }
     }
 

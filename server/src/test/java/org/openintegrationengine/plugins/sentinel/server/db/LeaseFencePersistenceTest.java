@@ -57,7 +57,7 @@ class LeaseFencePersistenceTest {
         }
         try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
             for (String suffix : List.of("-sentinel-tables.sql", "-sentinel-v2.sql", "-sentinel-v3.sql", "-sentinel-v4.sql", "-sentinel-v5.sql", "-sentinel-v6.sql", "-sentinel-v7.sql",
-                    "-sentinel-v8.sql", "-sentinel-v11.sql", "-sentinel-v12.sql", "-sentinel-v13.sql", "-sentinel-v14.sql")) {
+                    "-sentinel-v8.sql", "-sentinel-v11.sql", "-sentinel-v12.sql", "-sentinel-v13.sql", "-sentinel-v14.sql", "-sentinel-v15.sql")) {
                 try (InputStream in = getClass().getResourceAsStream("/" + vendor + suffix)) {
                     assertNotNull(in);
                     for (String statement : new String(in.readAllBytes(), StandardCharsets.UTF_8).split("\\r?\\n\\s*\\r?\\n")) {
@@ -119,6 +119,16 @@ class LeaseFencePersistenceTest {
         assertEquals(0,denied.total());assertTrue(denied.items().isEmpty());
         assertEquals(0,org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(Set.of(CHANNEL),null,null,"UNKNOWN",null,null,null,null,null,0,25).total());
         assertEquals(1,org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.pending(Set.of(CHANNEL),null,null,null,0,25).total());
+        assertEquals(1L,JobObservationRepository.storage(Set.of(CHANNEL)).get("events"));
+        assertEquals(0L,JobObservationRepository.storage(Set.of()).get("pending"));
+        try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
+            sql.executeUpdate("UPDATE sentinel_alert_event SET problem_pending=FALSE, resolution_pending=TRUE WHERE id=1");
+        }
+        assertNull(JobObservationRepository.storage(null).get("oldestPendingEdge"),"One missing pending edge timestamp makes the oldest age unknown");
+        try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) {
+            sql.executeUpdate("UPDATE sentinel_alert_event SET problem_pending=TRUE, resolution_pending=FALSE WHERE id=1");
+        }
+
         try (Connection connection = DriverManager.getConnection(url); Statement sql = connection.createStatement()) { sql.executeUpdate("DELETE FROM sentinel_action WHERE id=1"); }
         var deleted = org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,1,"EMAIL",1L,"PROBLEM",true,1791288000000L,1791288000000L,0,25);
         assertEquals(1,deleted.total());assertTrue(deleted.items().get(0).actionDeleted());
@@ -135,6 +145,32 @@ class LeaseFencePersistenceTest {
         assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,null,"INVALID",null,null,null,null,null,0,25));
         assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.attempts(null,null,-1,null,null,null,null,null,null,0,25));
         assertThrows(IllegalArgumentException.class,()->org.openintegrationengine.plugins.sentinel.server.service.DeliveryInboxService.pending(null,null,2L,1L,0,25));
+    }
+
+    @Test
+    void sharedJobEvidenceRejectsSupersededAndOldEpochCompletions() {
+        LeaseFence first=acquire("sentinel-engine","node-a",90);
+        JobObservationRepository.start("collector","first",first);
+        JobObservationRepository.finish("collector","first",first,true);
+        var success=JobObservationRepository.list().get(0);
+        assertEquals("SUCCESS",success.get("outcome"));assertEquals("node-a",success.get("last_success_node"));
+        assertNotNull(success.get("last_success_time"));
+        JobObservationRepository.start("collector","second",first);
+        assertThrows(IllegalStateException.class,()->JobObservationRepository.finish("collector","first",first,true));
+        assertEquals("RUNNING",JobObservationRepository.list().get(0).get("outcome"));
+        JobObservationRepository.finish("collector","second",first,false);
+        assertEquals("ERROR",JobObservationRepository.list().get(0).get("outcome"));
+        assertEquals(success.get("last_success_time"),JobObservationRepository.list().get(0).get("last_success_time"));
+        assertTrue(NodeLeaseRepository.releaseNodeLease(first.leaseName(),first.nodeId(),first.epoch()));
+        long epoch=NodeLeaseRepository.getNodeLease(first.leaseName()).getLeaseEpoch();
+        assertTrue(NodeLeaseRepository.stealExpiredNodeLease(first.leaseName(),"node-b",epoch,90));
+        var successor=new LeaseFence(first.leaseName(),"node-b",epoch+1);
+        JobObservationRepository.start("collector","successor",successor);
+        assertThrows(RepositoryException.class,()->JobObservationRepository.finish("collector","second",first,true));
+        var current=JobObservationRepository.list().get(0);
+        assertEquals("node-b",current.get("node_id"));assertEquals("RUNNING",current.get("outcome"));
+        assertEquals("node-a",current.get("last_success_node"));
+        assertThrows(IllegalArgumentException.class,()->JobObservationRepository.start("collector","unmanaged",LeaseFence.unmanaged()));
     }
 
     private LeaseFence acquire(String name, String node, int seconds) {
