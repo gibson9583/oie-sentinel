@@ -6,6 +6,9 @@
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
 import java.time.Instant;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,30 +56,45 @@ public final class NotificationSuppression {
         return decision(event, now) != Decision.ALLOW;
     }
 
-    /**
-     * Re-evaluates policy without collapsing lookup failure into an actual
-     * suppressing rule. Repeating problem paths treat UNKNOWN as suppressed;
-     * the one-shot resolve path can instead fall back to its durable snapshot
-     * rather than permanently losing a recovery because a read failed.
-     */
+    /** A concrete current policy gate; historical decisions are not reconstructed. */
+    public record Reason(String code, Integer scheduleId, String name, String timezone,
+            Long parentEventId, Instant nextBoundary) { }
+
+    /** Read-only current policy. Reasons describe the first decisive policy gate,
+     * not historical routing, flap control, storm control, or delivery certainty. */
+    public record Explanation(Decision decision, List<Reason> reasons, String lookupError) { }
+
     public static Decision decision(AlertEvent event, Instant now) {
+        return explain(event, now).decision();
+    }
+
+    public static Explanation explain(AlertEvent event, Instant now) {
         if (event == null || event.getChannelId() == null || now == null) {
-            return Decision.UNKNOWN;
+            return new Explanation(Decision.UNKNOWN, List.of(), "Policy inputs are unavailable");
         }
         try {
-            Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
-            if (monitor == null || !monitor.isEnabled()) {
-                return Decision.SUPPRESS;
-            }
-            return suppressedByWindows(event.getChannelId(), now)
-                            || dependencyOpen(monitor, event.getChannelId())
-                    ? Decision.SUPPRESS : Decision.ALLOW;
+            return explain(MonitorRepository.getMonitor(event.getMonitorId()), event.getChannelId(), now);
         } catch (Throwable t) {
-            log.error("Failed to re-evaluate notification suppression for alert event {} and monitor {}; "
-                            + "suppressing this attempt so a later tick can retry",
-                    event.getId(), event.getMonitorId(), t);
-            return Decision.UNKNOWN;
+            log.error("Failed to read notification policy for event {}", event.getId(), t);
+            return new Explanation(Decision.UNKNOWN, List.of(), "Current policy lookup failed; refresh to retry");
         }
+    }
+
+    private static Explanation explain(Monitor monitor, String channelId, Instant now) {
+        if (monitor == null || !monitor.isEnabled()) {
+            return new Explanation(Decision.SUPPRESS, List.of(new Reason(
+                    monitor == null ? "MONITOR_MISSING" : "MONITOR_DISABLED", null,
+                    monitor == null ? null : monitor.getName(), null, null, null)), null);
+        }
+        List<Reason> windows = windowReasons(channelId, now);
+        if (!windows.isEmpty()) {
+            return new Explanation(Decision.SUPPRESS, windows, null);
+        }
+        Reason dependency = openDependency(monitor, channelId);
+        if (dependency != null) {
+            return new Explanation(Decision.SUPPRESS, List.of(dependency), null);
+        }
+        return new Explanation(Decision.ALLOW, List.of(), null);
     }
 
     /** Creation-time snapshot stored on a new alert; dispatch always rechecks. */
@@ -85,7 +103,7 @@ public final class NotificationSuppression {
             return true;
         }
         try {
-            return suppressedByWindows(channelId, now) || dependencyOpen(monitor, channelId);
+            return explain(monitor, channelId, now).decision() != Decision.ALLOW;
         } catch (Throwable t) {
             log.error("Failed to evaluate notification suppression for monitor {} channel {}; "
                             + "recording the alert as suppressed so a later tick can retry",
@@ -101,7 +119,8 @@ public final class NotificationSuppression {
      * scope-resolution failure is caught by the caller and fails this attempt
      * closed.
      */
-    private static boolean suppressedByWindows(String channelId, Instant now) {
+    private static List<Reason> windowReasons(String channelId, Instant now) {
+        List<Reason> inactive = new ArrayList<>();
         boolean hasAlertingSchedule = false;
         boolean insideAlertingSchedule = false;
         for (MaintenanceWindow window : MaintenanceWindowRepository.listEnabledMaintenanceWindows()) {
@@ -111,14 +130,32 @@ public final class NotificationSuppression {
             Boolean activeNow = WindowSchedule.isActiveNow(window, now);
             if (window.getMode() == WindowMode.ACTIVE) {
                 hasAlertingSchedule = true;
+                inactive.add(scheduleReason("OUTSIDE_ALERTING_SCHEDULE", window, now));
                 if (activeNow == null || activeNow) {
                     insideAlertingSchedule = true;
                 }
             } else if (Boolean.TRUE.equals(activeNow)) {
-                return true;
+                return List.of(scheduleReason("SUPPRESS_SCHEDULE", window, now));
             }
         }
-        return hasAlertingSchedule && !insideAlertingSchedule;
+        return hasAlertingSchedule && !insideAlertingSchedule ? inactive : List.of();
+    }
+
+    private static Reason scheduleReason(String code, MaintenanceWindow window, Instant now) {
+        // Only absolute one-time boundaries are exposed: recurring DST boundaries
+        // need a dedicated schedule calculator, not a guessed clock duration.
+        Instant next = null;
+        if (window.getRepeatType() == null || window.getRepeatType()
+                == org.openintegrationengine.plugins.sentinel.shared.model.WindowRepeat.NONE) {
+            if (window.getActiveFrom() != null && window.getActiveFrom().isAfter(now)) {
+                next = window.getActiveFrom();
+            } else if (window.getActiveUntil() != null && window.getActiveUntil().isAfter(now)) {
+                next = window.getActiveUntil();
+            }
+        }
+        String zone = window.getTimezone();
+        if (zone == null || zone.isBlank()) zone = ZoneId.systemDefault().getId();
+        return new Reason(code, window.getId(), window.getName(), zone, null, next);
     }
 
     private static boolean windowCoversChannel(MaintenanceWindow window, String channelId) {
@@ -144,14 +181,14 @@ public final class NotificationSuppression {
      * open alert is the durable problem fact, making chained dependencies and
      * INSUFFICIENT_DATA gaps independent of evaluation order.
      */
-    private static boolean dependencyOpen(Monitor monitor, String channelId) {
+    private static Reason openDependency(Monitor monitor, String channelId) {
         Integer parentId = monitor.getSuppressedByMonitorId();
         if (parentId == null) {
-            return false;
+            return null;
         }
         Monitor parent = MonitorRepository.getMonitor(parentId);
         if (parent == null || !parent.isEnabled()) {
-            return false;
+            return null;
         }
         for (TriggerState parentState : TriggerStateRepository.listTriggerStatesByMonitor(parentId)) {
             if (!channelId.equals(parentState.getChannelId())
@@ -160,9 +197,9 @@ public final class NotificationSuppression {
             }
             AlertEvent open = AlertEventRepository.getAlertEvent(parentState.getOpenAlertEventId());
             if (open != null && open.getStatus() == AlertStatus.PROBLEM) {
-                return true;
+                return new Reason("DEPENDENCY_OPEN", null, parent.getName(), null, open.getId(), null);
             }
         }
-        return false;
+        return null;
     }
 }

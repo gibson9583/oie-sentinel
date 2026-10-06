@@ -518,6 +518,13 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @MirthOperation(name = "sentinelGetProblem", display = "Get Sentinel problem", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
     String getProblem(@Param("id") @PathParam("id") long id) throws ClientException;
 
+    /** Read-only current decision explanation; never dispatches notifications. */
+    @GET
+    @Path("/problems/{id}/decision")
+    @Operation(summary = "Explains current notification policy and matching actions")
+    @MirthOperation(name = "sentinelInspectDecision", display = "Inspect Sentinel decision", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String inspectDecision(@Param("id") @PathParam("id") long id) throws ClientException;
+
     /**
      * Acknowledges an open problem — records who has eyes on it without
      * closing it. Re-acknowledging an already-acknowledged problem is

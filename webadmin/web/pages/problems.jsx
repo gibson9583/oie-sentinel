@@ -22,6 +22,7 @@ import {
     MONITOR_TYPE_META, fmtTime, fmtAgo,
 } from '../ui.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
+import { DecisionInspector } from '../decision-inspector.jsx';
 
 const React = platform.React;
 const { h, modal } = platform.ui;
@@ -428,6 +429,7 @@ export function ProblemsPage() {
             {detailId != null ? (
                 <ProblemDetailPane id={detailId}
                     monitors={monitorsApi.data}
+                    onOpenProblem={setDetailId}
                     onBack={() => setDetailId(null)}
                     onChanged={() => load(true)} />
             ) : null}
@@ -538,7 +540,7 @@ function RunbookLink({ url }) {
     );
 }
 
-function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
+function ProblemDetailPane({ id, monitors, onBack, onChanged, onOpenProblem }) {
     const userNameOf = useUsernames();
     const [detail, setDetail] = React.useState(null);
     const [error, setError] = React.useState(null);
@@ -692,6 +694,7 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
 
             {detail ? (
                 <>
+                    <DecisionInspector key={ev.id} event={ev} onOpenProblem={onOpenProblem} />
                     {ev.suppressed ? (
                         <div className="panel mb-3"><div className="panel-body">
                             <span className="tag amber">Suppressed</span>{' '}

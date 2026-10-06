@@ -61,6 +61,46 @@ class NotificationSuppressionTest {
     }
 
     @Test
+    void explanationNamesCurrentGateAndDoesNotInventHistory() {
+        Monitor monitor = monitor(1);
+        monitors.when(() -> MonitorRepository.getMonitor(1)).thenReturn(monitor);
+        AlertEvent event = new AlertEvent();
+        event.setId(99L); event.setMonitorId(1); event.setChannelId(CHANNEL_ID);
+        event.setSuppressed(true); // historical latch must not force today's reason
+        assertEquals(NotificationSuppression.Decision.ALLOW, NotificationSuppression.explain(event, NOW).decision());
+        monitor.setEnabled(false);
+        assertEquals("MONITOR_DISABLED", NotificationSuppression.explain(event, NOW).reasons().get(0).code());
+        monitor.setEnabled(true);
+        MaintenanceWindow window = oneTime(WindowMode.SUPPRESS, NOW.minusSeconds(10), NOW.plusSeconds(10));
+        window.setId(42); window.setName("Change window"); window.setTimezone("America/New_York");
+        windows.when(MaintenanceWindowRepository::listEnabledMaintenanceWindows).thenReturn(List.of(window));
+        NotificationSuppression.Reason reason = NotificationSuppression.explain(event, NOW).reasons().get(0);
+        assertEquals("SUPPRESS_SCHEDULE", reason.code());
+        assertEquals(42, reason.scheduleId()); assertEquals("Change window", reason.name());
+        assertEquals("America/New_York", reason.timezone()); assertEquals(NOW.plusSeconds(10), reason.nextBoundary());
+        assertEquals(NotificationSuppression.Decision.ALLOW, NotificationSuppression.explain(event, NOW.plusSeconds(11)).decision());
+        windows.when(MaintenanceWindowRepository::listEnabledMaintenanceWindows).thenThrow(new RuntimeException("secret SQL"));
+        var unknown = NotificationSuppression.explain(event, NOW);
+        assertEquals(NotificationSuppression.Decision.UNKNOWN, unknown.decision());
+        assertTrue(unknown.reasons().isEmpty()); assertFalse(unknown.lookupError().contains("secret"));
+    }
+
+    @Test
+    void explanationLinksOpenDependencyAndRefreshesAfterResolution() {
+        Monitor child = monitor(1); child.setSuppressedByMonitorId(2);
+        monitors.when(() -> MonitorRepository.getMonitor(1)).thenReturn(child);
+        monitors.when(() -> MonitorRepository.getMonitor(2)).thenReturn(monitor(2));
+        TriggerState state = new TriggerState(); state.setChannelId(CHANNEL_ID); state.setOpenAlertEventId(88L);
+        states.when(() -> TriggerStateRepository.listTriggerStatesByMonitor(2)).thenReturn(List.of(state));
+        AlertEvent parent = new AlertEvent(); parent.setId(88L); parent.setStatus(AlertStatus.PROBLEM);
+        alerts.when(() -> AlertEventRepository.getAlertEvent(88L)).thenReturn(parent);
+        AlertEvent event = new AlertEvent(); event.setMonitorId(1); event.setChannelId(CHANNEL_ID);
+        assertEquals(88L, NotificationSuppression.explain(event, NOW).reasons().get(0).parentEventId());
+        parent.setStatus(AlertStatus.RESOLVED);
+        assertEquals(NotificationSuppression.Decision.ALLOW, NotificationSuppression.explain(event, NOW).decision());
+    }
+
+    @Test
     void suppressWindowBlocksOnlyWhileItIsActive() {
         MaintenanceWindow window = oneTime(WindowMode.SUPPRESS,
                 NOW.minusSeconds(60), NOW.plusSeconds(60));
