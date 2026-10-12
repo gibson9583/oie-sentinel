@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
 import java.time.Instant;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -47,6 +48,10 @@ public final class AlertPayload {
     private final Instant openedTime;
     private final String valueJson;
     private final String runbookUrl;
+    // Internal delivery context, deliberately without a public JSON getter.
+    record RollupSummary(int sent, int windowSeconds) { }
+    @JsonIgnore
+    private final RollupSummary rollupSummary;
 
     /**
      * Package-private so that {@link ActionDispatcher#sendTest(org.openintegrationengine.plugins.sentinel.shared.model.Action)}
@@ -76,6 +81,14 @@ public final class AlertPayload {
             String channelId, String channelName, Integer metadataId, Severity severity,
             String eventType, String message, Instant openedTime, String valueJson,
             String runbookUrl) {
+        this(alertEventId, monitorId, monitorName, monitorType, channelId, channelName, metadataId,
+                severity, eventType, message, openedTime, valueJson, runbookUrl, null);
+    }
+
+    private AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
+            String channelId, String channelName, Integer metadataId, Severity severity,
+            String eventType, String message, Instant openedTime, String valueJson,
+            String runbookUrl, RollupSummary rollupSummary) {
         this.alertEventId = alertEventId;
         this.monitorId = monitorId;
         this.monitorName = monitorName;
@@ -89,7 +102,16 @@ public final class AlertPayload {
         this.openedTime = openedTime;
         this.valueJson = valueJson;
         this.runbookUrl = runbookUrl;
+        this.rollupSummary = rollupSummary;
     }
+
+    AlertPayload withRollupSummary(int sent, int windowSeconds) {
+        return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
+                metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl,
+                new RollupSummary(sent, windowSeconds));
+    }
+
+    RollupSummary rollupSummary() { return rollupSummary; }
 
     /**
      * Builds the payload for a real alert event, resolving the channel's

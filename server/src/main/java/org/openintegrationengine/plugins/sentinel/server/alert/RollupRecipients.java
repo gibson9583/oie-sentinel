@@ -18,6 +18,19 @@ final class RollupRecipients {
 
     private RollupRecipients() { }
 
+    /** Reauthorizes disclosed subjects on the I/O worker without reserving another budget slot. */
+    static AlertPayload refreshPayload(Action action, AlertPayload payload, Instant now) {
+        if (payload == null || payload.rollupSummary() == null) return payload;
+        AlertPayload.RollupSummary summary = payload.rollupSummary();
+        var verdict = new AlertStormControl.CeilingVerdict(AlertStormControl.CeilingOutcome.ROLLUP,
+                summary.sent(), summary.windowSeconds(),
+                channels(action, now.minusSeconds(summary.windowSeconds()), now));
+        return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(), payload.getMonitorName(),
+                payload.getMonitorType(), payload.getChannelId(), payload.getChannelName(), payload.getMetadataId(),
+                payload.getSeverity(), payload.getEventType(), AlertStormControl.rollupMessage(verdict),
+                payload.getOpenedTime(), payload.getValueJson(), payload.getRunbookUrl());
+    }
+
     static List<String> channels(Action action, Instant from, Instant now) {
         Map<String, String> names = new TreeMap<>();
         for (AlertEvent candidate : AlertEventRepository.listRecentAlertEvents(CANDIDATE_LIMIT)) {

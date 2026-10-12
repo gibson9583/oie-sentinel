@@ -948,6 +948,12 @@ public final class ActionDispatcher {
         Future<Void> future;
         try {
             future = executor.submit(() -> {
+                AlertPayload currentPayload;
+                try {
+                    currentPayload = RollupRecipients.refreshPayload(action, payload, Instant.now());
+                } catch (Exception uncertainty) {
+                    throw new DispatchDeferredException("Cannot verify rollup recipient scope before delivery", uncertainty);
+                }
                 beforeTransport.run();
                 if (Thread.currentThread().isInterrupted()) {
                     throw new DispatchDeferredException("Transport was cancelled before delivery");
@@ -955,7 +961,7 @@ public final class ActionDispatcher {
                 if (!transportState.compareAndSet(0, 1)) {
                     throw new DispatchDeferredException("Transport was cancelled before delivery");
                 }
-                sender.send(action, event, payload);
+                sender.send(action, event, currentPayload);
                 return null;
             });
         } catch (RejectedExecutionException e) {
@@ -1366,7 +1372,8 @@ public final class ActionDispatcher {
                 payload.getMonitorType(), payload.getChannelId(), payload.getChannelName(),
                 payload.getMetadataId(), payload.getSeverity(), "ROLLUP",
                 AlertStormControl.rollupMessage(verdict), payload.getOpenedTime(),
-                payload.getValueJson(), payload.getRunbookUrl());
+                payload.getValueJson(), payload.getRunbookUrl())
+                .withRollupSummary(verdict.sent(), verdict.windowSeconds());
         String marker = resolvedPhase
                 ? AlertStormControl.ROLLUP_MARKER + " " + RESOLUTION_MARKER
                 : AlertStormControl.ROLLUP_MARKER;
