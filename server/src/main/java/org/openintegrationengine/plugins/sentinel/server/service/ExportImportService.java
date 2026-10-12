@@ -359,9 +359,7 @@ public final class ExportImportService {
      *                                  non-array where an entity list belongs
      */
     public static ImportResult importDocument(JsonNode document, int userId) {
-        if (document == null || !document.isObject()) {
-            throw new IllegalArgumentException("The import body must be an export document (a JSON object)");
-        }
+        validateDocument(document);
         int schemaVersion = requireSchemaVersion(document);
 
         List<ImportEntry> entries = new ArrayList<>();
@@ -378,6 +376,17 @@ public final class ExportImportService {
         result.setSkipped(countOf(entries, OUTCOME_SKIPPED));
         result.setSecretsNotice(secretsNotice(entries));
         return result;
+    }
+
+    /** Validates the document envelope without reading or writing any entities. */
+    public static void validateDocument(JsonNode document) {
+        if (document == null || !document.isObject()) {
+            throw new IllegalArgumentException("The import body must be an export document (a JSON object)");
+        }
+        requireSchemaVersion(document);
+        entityArray(document, KEY_MONITORS);
+        entityArray(document, KEY_ACTIONS);
+        entityArray(document, KEY_WINDOWS);
     }
 
     /**

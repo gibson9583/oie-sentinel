@@ -839,6 +839,11 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * nothing behind it is reported as {@code secretsRequired}, per action,
      * naming the exact fields to go enter. Import never invents a credential.</p>
      *
+     * <p>Documents containing maintenance-window entries additionally require
+     * {@link #PERMISSION_MAINTENANCE}, checked before any entity is written.
+     * Empty or absent maintenance-window arrays require no extra permission.
+     * The document envelope is also validated before any writes.</p>
+     *
      * <p>There is no enclosing transaction: a failure part way through leaves
      * the entries already applied in place. That is safe to re-run — the
      * import is additive and idempotent, so a second pass reports the landed

@@ -25,7 +25,10 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.mirth.connect.client.core.ExtensionOperation;
+import com.mirth.connect.client.core.Operation;
 import com.mirth.connect.client.core.api.MirthApiException;
+import com.mirth.connect.client.core.api.util.OperationUtil;
 import com.mirth.connect.model.User;
 import com.mirth.connect.server.api.MirthServlet;
 import com.mirth.connect.server.controllers.ControllerFactory;
@@ -789,14 +792,38 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String importConfiguration(String bodyJson) {
         try {
+            JsonNode document = readBodyTree(bodyJson);
+            ExportImportService.validateDocument(document);
+            if (!document.path("maintenanceWindows").isEmpty()
+                    && document.path("maintenanceWindows").isArray()) {
+                requireScheduleImportPermission();
+            }
             return Json.write(ExportImportService.importDocument(
-                    readBodyTree(bodyJson), getCurrentUserId()));
+                    document, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("importConfiguration", e);
         }
     }
 
     // ========== Boundary helpers ==========
+
+    /**
+     * Import already requires Manage Monitoring. A document that can write
+     * schedules also requires the same permission as the schedule editor,
+     * before any monitor, action, or window is changed. Reuse the engine's
+     * authorization path (including bypass/auditing behavior) and restore
+     * the request operation even when authorization fails.
+     */
+    private void requireScheduleImportPermission() {
+        Operation importOperation = operation;
+        try {
+            operation = new ExtensionOperation(PLUGIN_POINT, OperationUtil.getOperation(
+                    SentinelServletInterface.class, "createMaintenanceWindow", String.class));
+            checkUserAuthorized();
+        } finally {
+            operation = importOperation;
+        }
+    }
 
     /**
      * Maps a service-layer failure onto the HTTP status contract:
