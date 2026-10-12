@@ -317,7 +317,7 @@ async function refreshCoverage() {
     }
 }
 
-async function refresh() {
+async function refreshSnapshot() {
     if (!pollGate()) {
         return;
     }
@@ -347,6 +347,16 @@ async function refresh() {
         // column: stale counts during a blip are far less alarming to read than
         // every channel suddenly reporting clear.
     }
+}
+
+// Keep coverage and problems in the same serialized refresh. A slow request
+// must finish before another timer/remount can publish a newer snapshot.
+let inFlightRefresh = null;
+function refresh() {
+    if (inFlightRefresh === null) {
+        inFlightRefresh = refreshSnapshot().finally(() => { inFlightRefresh = null; });
+    }
+    return inFlightRefresh;
 }
 
 /** Subscribes a cell to the shared snapshot, starting the poll on the first. */
