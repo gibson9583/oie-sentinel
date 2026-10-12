@@ -15,13 +15,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivityAggregate;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
-import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
-import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
 
 /**
  * Evaluates LOW_VOLUME monitors: breach when received-message volume over a
@@ -91,20 +88,10 @@ public final class LowVolumeEvaluator {
         // Verified never null (the query COALESCEs every aggregate); guard anyway.
         long current = aggregate != null ? aggregate.getReceivedSum() : 0L;
 
-        // A window the channel was not running for all of cannot prove low
-        // volume: the collector keeps writing zero-delta samples for
-        // deployed-but-stopped channels, so a channel restarted after
-        // maintenance would otherwise breach on its very first tick (same
-        // "watched while running" rule as InactivityEvaluator). An
-        // already-PROBLEM trigger keeps evaluating so a plugin restart —
-        // which blanks the in-memory started stamp — cannot flap an open
-        // problem into INSUFFICIENT_DATA and back.
-        if (!CollectorState.getInstance().isChannelStartedThroughout(channelId, now.minusSeconds(windowSeconds))) {
-            TriggerState state = TriggerStateRepository.getTriggerState(monitor.getId(), channelId, null);
-            boolean alreadyProblem = state != null && state.getState() == TriggerStatus.PROBLEM;
-            if (!alreadyProblem) {
-                return EvaluationOutcome.insufficientData(buildValueJson(current, null, null, null, null));
-            }
+        // A STARTED stamp alone cannot prove that samples reached durable storage.
+        if (!CollectorState.getInstance().isChannelStartedThroughout(channelId, now.minusSeconds(windowSeconds))
+                || !ActivityCoverage.covers(channelId, now.minusSeconds(windowSeconds), now)) {
+            return EvaluationOutcome.insufficientData(buildValueJson(current, null, null, null, null));
         }
 
         if ("BASELINE_RELATIVE".equalsIgnoreCase(compareTo)) {

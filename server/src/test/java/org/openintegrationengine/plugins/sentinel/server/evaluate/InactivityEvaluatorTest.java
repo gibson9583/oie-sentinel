@@ -35,22 +35,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
  * <em>absence</em> of evidence, which is precisely why most of its logic is
  * about refusing to.
  *
- * <p>A zero received-sum is consistent with three very different worlds: the
- * feed is dead (breach), the collector was not watching for the whole window
- * (unknowable), or the channel was not running for the whole window
- * (unknowable — the collector deliberately keeps writing zero-delta rows for
- * deployed-but-stopped channels). Only the first may page. These tests pin
- * the two proofs the evaluator demands before breaching — a sample at or
- * before the window start, and a continuous STARTED stretch covering the
- * window — and the one deliberate exception: a trigger already in PROBLEM
- * keeps breaching without proof, because a server restart blanks the
- * in-memory started stamp and a genuinely dead channel's alert must not flap
- * to INSUFFICIENT_DATA on every restart.</p>
- *
- * <p>The coverage probe is stubbed with exact arguments — {@code windowStart
- * - 600s} of slack, sized to the maximum legal collector interval — so a
- * change to the probe range fails these cases instead of silently widening
- * or narrowing what counts as "watched".</p>
+ * <p>Coverage requires a continuous persisted cadence and a continuous
+ * STARTED stretch. Existing incidents stay open through insufficient data;
+ * an unmeasured window must not invent another breach.</p>
  */
 @DisplayName("InactivityEvaluator")
 class InactivityEvaluatorTest {
@@ -63,14 +50,18 @@ class InactivityEvaluatorTest {
     private static final int WINDOW_SECONDS = 3600;
     private static final Instant WINDOW_START = NOW.minusSeconds(WINDOW_SECONDS);
 
-    /** Mirrors the evaluator's coverage-probe slack (max collector interval). */
-    private static final int COLLECTOR_SLACK_SECONDS = 600;
+    /** Default30s interval plus15s scheduling tolerance. */
+    private static final int COLLECTOR_SLACK_SECONDS = 45;
 
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.service.SettingsService> settings;
     private MockedStatic<ActivityRepository> activityRepository;
     private MockedStatic<TriggerStateRepository> triggerStateRepository;
 
     @BeforeEach
     void setUp() {
+        settings = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.service.SettingsService.class);
+        settings.when(org.openintegrationengine.plugins.sentinel.server.service.SettingsService::get)
+                .thenReturn(new org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings());
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
         triggerStateRepository = Mockito.mockStatic(TriggerStateRepository.class);
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
@@ -81,6 +72,7 @@ class InactivityEvaluatorTest {
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
         triggerStateRepository.close();
         activityRepository.close();
+        settings.close();
     }
 
     // ---------------------------------------------------------------- helpers
@@ -115,7 +107,8 @@ class InactivityEvaluatorTest {
      */
     private void givenSamplesOldestAt(long... secondsAgoDescending) {
         List<ActivitySample> samples = new ArrayList<>();
-        for (long secondsAgo : secondsAgoDescending) {
+        // Populate the complete cadence; sparse endpoint fixtures no longer prove coverage.
+        for (long secondsAgo = secondsAgoDescending[0]; secondsAgo >= 0; secondsAgo -= 30) {
             ActivitySample sample = new ActivitySample();
             sample.setChannelId(CHANNEL_ID);
             sample.setSampleTime(NOW.minusSeconds(secondsAgo));
@@ -240,17 +233,14 @@ class InactivityEvaluatorTest {
     }
 
     @Nested
-    @DisplayName("the already-PROBLEM carve-out")
+    @DisplayName("existing incidents during missing coverage")
     class AlreadyProblem {
 
         @Test
-        @DisplayName("an open problem keeps breaching without coverage proof")
+        @DisplayName("an open problem remains unmeasured without coverage proof")
         void openProblemBreachesThroughTheGap() {
-            // A server restart blanks the in-memory started stamp and can
-            // empty the young end of the sample table. Without this carve-out
-            // a genuinely dead channel's trigger would cycle PROBLEM ->
-            // INSUFFICIENT_DATA -> PROBLEM across restarts, and the operator
-            // would see flapping instead of one continuous outage.
+            // A restart cannot prove a fresh breach. The trigger state
+            // machine retains the incident while its measurement is unknown.
             TriggerState problem = new TriggerState();
             problem.setState(TriggerStatus.PROBLEM);
             triggerStateRepository.when(() -> TriggerStateRepository.getTriggerState(41, CHANNEL_ID, null))
@@ -259,11 +249,11 @@ class InactivityEvaluatorTest {
             // No started stamp, no samples: the unprovable case.
             givenProbeReturns(List.of());
 
-            assertEquals(EvaluationOutcome.Result.BREACH, evaluate().getResult());
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, evaluate().getResult());
         }
 
         @Test
-        @DisplayName("a trigger in any non-PROBLEM state gets no carve-out")
+        @DisplayName("an OK trigger also needs coverage")
         void nonProblemStateStillNeedsProof() {
             // The carve-out is for continuity of an existing alert only. An OK
             // trigger crossing into an unprovable window must park, not open a

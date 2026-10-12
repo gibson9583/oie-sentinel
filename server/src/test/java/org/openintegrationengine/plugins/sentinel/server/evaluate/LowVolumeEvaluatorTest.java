@@ -41,15 +41,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
  * LOW_VOLUME evaluation: the FIXED floor, the BASELINE_RELATIVE threshold
  * arithmetic, and the "watched while running" gate the two modes share.
  *
- * <p>The gate is where the expensive false positive lives. The collector
- * keeps writing zero-delta rows for deployed-but-stopped channels, so a
- * channel restarted after maintenance presents a perfectly plausible window
- * of zeros — and without the {@link CollectorState} started-throughout check
- * it would breach on its very first tick back. The carve-out for triggers
- * already in PROBLEM points the other way: a plugin restart blanks the
- * in-memory started stamp, and an open problem that flapped to
- * INSUFFICIENT_DATA and back on every restart would double-notify the
- * operator for nothing. Both directions are pinned here.</p>
+ * <p>The started gate prevents maintenance zeros from becoming a new
+ * problem. Missing coverage yields insufficient data for existing problems
+ * too; the lifecycle retains the open incident until evidence returns.</p>
  *
  * <p>Repositories are static-mocked; {@link CollectorState} is the real
  * process-wide singleton (it is the thing whose semantics the gate depends
@@ -76,11 +70,15 @@ class LowVolumeEvaluatorTest {
     private static final Instant LAST_COMPLETED_HOUR =
             NOW.truncatedTo(ChronoUnit.HOURS).minus(1, ChronoUnit.HOURS);
 
+    private MockedStatic<ActivityCoverage> coverage;
     private MockedStatic<ActivityRepository> activityRepository;
     private MockedStatic<TriggerStateRepository> triggerStateRepository;
 
     @BeforeEach
     void setUp() {
+        coverage = Mockito.mockStatic(ActivityCoverage.class);
+        coverage.when(() -> ActivityCoverage.covers(Mockito.anyString(), Mockito.any(), Mockito.any()))
+                .thenReturn(true);
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
         triggerStateRepository = Mockito.mockStatic(TriggerStateRepository.class);
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
@@ -91,6 +89,7 @@ class LowVolumeEvaluatorTest {
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
         triggerStateRepository.close();
         activityRepository.close();
+        coverage.close();
     }
 
     // ---------------------------------------------------------------- helpers
@@ -249,19 +248,15 @@ class LowVolumeEvaluatorTest {
         }
 
         @Test
-        @DisplayName("an open problem keeps evaluating through a blanked started stamp")
+        @DisplayName("an open problem becomes unmeasured through a blanked started stamp")
         void openProblemSurvivesRestart() {
-            // A plugin restart blanks the in-memory stamp. Without this
-            // carve-out every open LOW_VOLUME problem would flap to
-            // INSUFFICIENT_DATA and back across a restart, double-notifying
-            // when it re-crossed the hysteresis threshold.
             TriggerState problem = new TriggerState();
             problem.setState(TriggerStatus.PROBLEM);
             triggerStateRepository.when(() -> TriggerStateRepository.getTriggerState(31, CHANNEL_ID, null))
                     .thenReturn(problem);
             givenWindowSum(3600, 0);
 
-            assertEquals(EvaluationOutcome.Result.BREACH, evaluate("{}").getResult());
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, evaluate("{}").getResult());
         }
     }
 
