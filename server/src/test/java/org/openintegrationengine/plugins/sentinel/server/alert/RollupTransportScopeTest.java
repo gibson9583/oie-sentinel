@@ -54,7 +54,7 @@ class RollupTransportScopeTest {
                         events.when(() -> AlertEventRepository.getAlertEvent(2L)).thenReturn(other);
                         monitors.when(() -> MonitorRepository.getMonitor(7)).thenReturn(monitor);
                         scopes.when(() -> ScopeResolver.channelName(anyString())).thenAnswer(c -> c.getArgument(0));
-                        scopes.when(() -> ScopeResolver.groupChannelIds("group")).thenAnswer(c ->
+                        scopes.when(() -> ScopeResolver.strictGroupChannelIds("group")).thenAnswer(c ->
                                 changed.get() && change.equals("membership") ? Set.of("origin") : Set.of("origin", "other-sensitive"));
                         policy.when(() -> NotificationSuppression.decision(any(), any())).thenAnswer(c ->
                                 c.getArgument(0) == other && changed.get() && change.equals("suppressed")

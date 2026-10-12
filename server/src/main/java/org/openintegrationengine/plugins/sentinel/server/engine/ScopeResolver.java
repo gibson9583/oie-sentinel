@@ -372,24 +372,22 @@ public final class ScopeResolver {
      * for a picker/filter, but would let a notification leak through a
      * maintenance window that actually covers the unread member.
      */
-    static Set<String> strictGroupChannelIds(String groupId) {
+    public static Set<String> strictGroupChannelIds(String groupId) {
         Set<String> channelIds = new HashSet<>();
-        if (groupId == null) {
-            return channelIds;
-        }
+        if (groupId == null) return channelIds;
         List<ChannelGroup> groups = ChannelController.getInstance().getChannelGroups(null);
-        if (groups == null) {
-            throw new IllegalStateException("Channel-group inventory is unavailable");
-        }
+        if (groups == null) throw new IllegalStateException("Channel-group inventory is unavailable");
         for (ChannelGroup group : groups) {
+            if (group == null || group.getId() == null) {
+                throw new IllegalStateException("Channel-group identity is unavailable");
+            }
             if (groupId.equals(group.getId())) {
-                if (group.getChannels() != null) {
-                    for (Channel member : group.getChannels()) {
-                        String channelId = member.getId();
-                        if (channelId != null) {
-                            channelIds.add(channelId);
-                        }
-                    }
+                List<Channel> members = group.getChannels();
+                if (members == null) throw new IllegalStateException("Channel-group membership is unavailable");
+                for (Channel member : members) {
+                    String channelId = member != null ? member.getId() : null;
+                    if (channelId == null) throw new IllegalStateException("Channel-group member identity is unavailable");
+                    channelIds.add(channelId);
                 }
                 return channelIds;
             }
@@ -428,20 +426,22 @@ public final class ScopeResolver {
     }
 
     /** Completeness-preserving tag resolution for safety policy decisions. */
-    static Set<String> strictTagChannelIds(String tagId) {
+    public static Set<String> strictTagChannelIds(String tagId) {
         Set<String> channelIds = new HashSet<>();
-        if (tagId == null) {
-            return channelIds;
-        }
+        if (tagId == null) return channelIds;
         Set<ChannelTag> tags = ControllerFactory.getFactory()
                 .createConfigurationController().getChannelTags();
-        if (tags == null) {
-            throw new IllegalStateException("Channel-tag inventory is unavailable");
-        }
+        if (tags == null) throw new IllegalStateException("Channel-tag inventory is unavailable");
         for (ChannelTag tag : tags) {
+            if (tag == null || tag.getId() == null) {
+                throw new IllegalStateException("Channel-tag identity is unavailable");
+            }
             if (tagId.equals(tag.getId())) {
-                if (tag.getChannelIds() != null) {
-                    channelIds.addAll(tag.getChannelIds());
+                Set<String> members = tag.getChannelIds();
+                if (members == null) throw new IllegalStateException("Channel-tag membership is unavailable");
+                for (String channelId : members) {
+                    if (channelId == null) throw new IllegalStateException("Channel-tag member identity is unavailable");
+                    channelIds.add(channelId);
                 }
                 return channelIds;
             }

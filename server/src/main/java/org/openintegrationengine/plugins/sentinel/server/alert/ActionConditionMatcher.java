@@ -45,10 +45,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  *       exact match)</li>
  *   <li>{@code CHANNEL_GROUP} — {@code =}, {@code !=}, {@code IN}
  *       (membership resolved live via
- *       {@link ScopeResolver#groupChannelIds(String)}, so group edits apply
+ *       {@link ScopeResolver#strictGroupChannelIds(String)}, so group edits apply
  *       to the next dispatch without touching the action)</li>
  *   <li>{@code CHANNEL_TAG} — {@code =}, {@code !=}, {@code IN} (membership
- *       resolved live via {@link ScopeResolver#tagChannelIds(String)}, same
+ *       resolved live via {@link ScopeResolver#strictTagChannelIds(String)}, same
  *       live-resolution contract as CHANNEL_GROUP)</li>
  *   <li>{@code EVENT_TYPE} — {@code =} only ({@code PROBLEM} or
  *       {@code RESOLVED}; lifecycle gating normally belongs to
@@ -81,6 +81,8 @@ public final class ActionConditionMatcher {
      * @return {@code true} if every condition row matches (or there are no
      *         rows); {@code false} on any non-matching or non-understood row
      */
+    // Scope lookup uncertainty deliberately propagates: callers defer delivery
+    // rather than negating an unknown membership into an allowed exclusion.
     public static boolean matches(Action action, AlertPayload payload) {
         String conditionJson = action != null ? action.getConditionJson() : null;
         if (conditionJson == null || conditionJson.isBlank()) {
@@ -262,7 +264,7 @@ public final class ActionConditionMatcher {
 
     /** True iff the channel is currently a member of the group (unknown group = empty set = no). */
     private static boolean isMember(String groupId, String channelId) {
-        Set<String> members = ScopeResolver.groupChannelIds(groupId);
+        Set<String> members = ScopeResolver.strictGroupChannelIds(groupId);
         return members.contains(channelId);
     }
 
@@ -298,7 +300,7 @@ public final class ActionConditionMatcher {
 
     /** True iff the channel currently bears the tag (unknown tag = empty set = no). */
     private static boolean isTagged(String tagId, String channelId) {
-        return ScopeResolver.tagChannelIds(tagId).contains(channelId);
+        return ScopeResolver.strictTagChannelIds(tagId).contains(channelId);
     }
 
     /** Parses a Severity name, logging + returning {@code null} (fail closed) on an unknown one. */

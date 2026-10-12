@@ -72,7 +72,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'=' matches when the payload's channel is in the named group")
         void equalsMatchesMember() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(CHANNEL_ID, OTHER_CHANNEL_ID));
                 assertTrue(matches("[{'field':'CHANNEL_GROUP','operator':'=','value':'Production'}]"));
             }
@@ -82,7 +82,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'=' does not match a group the channel is absent from")
         void equalsRejectsNonMember() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(OTHER_CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_GROUP','operator':'=','value':'Production'}]"));
             }
@@ -92,9 +92,9 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'!=' excludes members of the named group")
         void notEqualsExcludesMembers() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(CHANNEL_ID));
-                scope.when(() -> ScopeResolver.groupChannelIds("Staging"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Staging"))
                         .thenReturn(Set.of(OTHER_CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_GROUP','operator':'!=','value':'Production'}]"));
                 assertTrue(matches("[{'field':'CHANNEL_GROUP','operator':'!=','value':'Staging'}]"));
@@ -105,9 +105,9 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'IN' matches membership of any listed group")
         void inMatchesAnyGroup() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Staging"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Staging"))
                         .thenReturn(Set.of(OTHER_CHANNEL_ID));
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(CHANNEL_ID));
                 assertTrue(matches(
                         "[{'field':'CHANNEL_GROUP','operator':'IN','value':['Staging','Production']}]"));
@@ -124,7 +124,7 @@ class ActionConditionMatcherScopeTest {
             // to a group somebody deleted should stop firing, not start
             // firing for every channel.
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Deleted")).thenReturn(Set.of());
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Deleted")).thenReturn(Set.of());
                 assertFalse(matches("[{'field':'CHANNEL_GROUP','operator':'=','value':'Deleted'}]"));
                 assertFalse(matches("[{'field':'CHANNEL_GROUP','operator':'IN','value':['Deleted']}]"));
             }
@@ -139,10 +139,10 @@ class ActionConditionMatcherScopeTest {
             // the channel group instead of hunting down every action that
             // references it.
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Production")).thenReturn(Set.of());
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production")).thenReturn(Set.of());
                 assertFalse(matches("[{'field':'CHANNEL_GROUP','operator':'=','value':'Production'}]"));
 
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(CHANNEL_ID));
                 assertTrue(matches("[{'field':'CHANNEL_GROUP','operator':'=','value':'Production'}]"));
             }
@@ -152,7 +152,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("an unsupported operator fails the condition")
         void unknownOperatorFailsClosed() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.groupChannelIds("Production"))
+                scope.when(() -> ScopeResolver.strictGroupChannelIds("Production"))
                         .thenReturn(Set.of(CHANNEL_ID));
                 // Fail closed even though the channel *is* in the group: the
                 // matcher does not know what ">=" means over group
@@ -171,7 +171,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'=' matches when the payload's channel bears the tag")
         void equalsMatchesTaggedChannel() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
                 assertTrue(matches("[{'field':'CHANNEL_TAG','operator':'=','value':'pii'}]"));
             }
         }
@@ -180,7 +180,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'=' does not match an untagged channel")
         void equalsRejectsUntaggedChannel() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(OTHER_CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(OTHER_CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_TAG','operator':'=','value':'pii'}]"));
             }
         }
@@ -189,8 +189,8 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("'!=' excludes channels bearing the tag")
         void notEqualsExcludesTagged() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
-                scope.when(() -> ScopeResolver.tagChannelIds("lab")).thenReturn(Set.of(OTHER_CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("lab")).thenReturn(Set.of(OTHER_CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_TAG','operator':'!=','value':'pii'}]"));
                 assertTrue(matches("[{'field':'CHANNEL_TAG','operator':'!=','value':'lab'}]"));
             }
@@ -202,8 +202,8 @@ class ActionConditionMatcherScopeTest {
             // The tag multi-select is an OR across tags, unlike the AND
             // across separate condition rows.
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("lab")).thenReturn(Set.of(OTHER_CHANNEL_ID));
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("lab")).thenReturn(Set.of(OTHER_CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
                 assertTrue(matches("[{'field':'CHANNEL_TAG','operator':'IN','value':['lab','pii']}]"));
                 assertFalse(matches("[{'field':'CHANNEL_TAG','operator':'IN','value':['lab']}]"));
             }
@@ -213,7 +213,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("an empty tag list matches nothing")
         void emptyTagListMatchesNothing() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_TAG','operator':'IN','value':[]}]"));
             }
         }
@@ -222,7 +222,7 @@ class ActionConditionMatcherScopeTest {
         @DisplayName("an unsupported operator fails the condition")
         void unknownOperatorFailsClosed() {
             try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
-                scope.when(() -> ScopeResolver.tagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
+                scope.when(() -> ScopeResolver.strictTagChannelIds("pii")).thenReturn(Set.of(CHANNEL_ID));
                 assertFalse(matches("[{'field':'CHANNEL_TAG','operator':'LIKE','value':'pii'}]"));
             }
         }
