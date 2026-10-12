@@ -21,7 +21,9 @@ import org.slf4j.LoggerFactory;
 public final class PendingConnectorObservations {
     private static final Logger log = LoggerFactory.getLogger(PendingConnectorObservations.class);
     private record Identity(String channelId, int metadataId) { }
-    private static final ConcurrentHashMap<Identity, ConnectorStatusEvent> pending = new ConcurrentHashMap<>();
+    /** The row's changedTime is the onset; observedThrough orders later callbacks. */
+    record PendingObservation(ConnectorStatusEvent row, Instant observedThrough) { }
+    private static final ConcurrentHashMap<Identity, PendingObservation> pending = new ConcurrentHashMap<>();
     private static final ReentrantLock writer = new ReentrantLock();
     private static final Object retryWorkerLock = new Object();
     private static ExecutorService retryExecutor;
@@ -30,12 +32,41 @@ public final class PendingConnectorObservations {
 
     static void observe(ConnectorStatusEvent row) {
         Identity key = new Identity(row.getChannelId(), row.getMetadataId());
-        // Prune on new identities too: a blocked JDBC writer must not retain
-        // an unbounded succession of undeployed channels until it returns.
-        if (!pending.containsKey(key)) pruneObsolete();
-        pending.compute(key, (ignored, prior) -> prior != null
-                && prior.getDeploymentTime().equals(row.getDeploymentTime())
-                && prior.getChangedTime().isAfter(row.getChangedTime()) ? prior : row);
+        boolean alreadyPending = pending.containsKey(key);
+        // The same per-identity operation also publishes committed state below.
+        // No JDBC or engine inventory reads are allowed inside it: new events
+        // must still be admitted while the single writer is blocked.
+        pending.compute(key, (ignored, prior) -> {
+            CollectorState collector = CollectorState.getInstance();
+            CollectorState.ConnectorState committed = collector.getConnectorState(key.channelId(), key.metadataId());
+            if (committed != null && (!row.getDeploymentTime().equals(committed.deploymentTime)
+                    || committed.since == null || committed.since.isBefore(row.getDeploymentTime()))) {
+                committed = null;
+            }
+            if (prior != null && prior.row().getDeploymentTime().equals(row.getDeploymentTime())) {
+                if (prior.observedThrough().isAfter(row.getChangedTime())) return prior;
+                if (prior.row().getNewState().equals(row.getNewState())) {
+                    // Keep the original continuous-state onset, but remember
+                    // this newer observation so delayed different states lose.
+                    return new PendingObservation(prior.row(), row.getChangedTime());
+                }
+            } else if (committed != null) {
+                if (committed.observedThrough != null && committed.observedThrough.isAfter(row.getChangedTime())) {
+                    return prior;
+                }
+                if (committed.state.name().equals(row.getNewState())) {
+                    collector.putConnectorState(key.channelId(), key.metadataId(), committed.state,
+                            committed.since, committed.deploymentTime, row.getChangedTime());
+                    return null; // current steady state, with its ordering watermark advanced
+                }
+            }
+            row.setPreviousState(committed != null ? committed.state.name() : null);
+            return new PendingObservation(row, row.getChangedTime());
+        });
+        // New pending identities also prune while JDBC is blocked. Do this
+        // after admission so steady committed callbacks do not scan every
+        // other pending connector just to discover they are duplicates.
+        if (!alreadyPending && pending.containsKey(key)) pruneObsolete();
         flush(key);
     }
 
@@ -45,7 +76,7 @@ public final class PendingConnectorObservations {
                 Channel current = ControllerFactory.getFactory().createEngineController()
                         .getDeployedChannel(entry.getKey().channelId());
                 if (current == null || (current.getDeployDate() != null
-                        && !current.getDeployDate().toInstant().equals(entry.getValue().getDeploymentTime()))
+                        && !current.getDeployDate().toInstant().equals(entry.getValue().row().getDeploymentTime()))
                         || (current.getMetaDataIds() != null
                         && !current.getMetaDataIds().contains(entry.getKey().metadataId()))) {
                     pending.remove(entry.getKey(), entry.getValue());
@@ -119,21 +150,22 @@ public final class PendingConnectorObservations {
         if (!SentinelLeadership.isConnectorObservationGenerationCurrent(generation)) return;
         if (pending.isEmpty() || !writer.tryLock()) return;
         try {
-            ConnectorStatusEvent selected = only == null ? null : pending.get(only);
+            PendingObservation selected = only == null ? null : pending.get(only);
             if (only != null && selected == null) return;
             var entries = only == null ? pending.entrySet()
                     : java.util.Set.of(java.util.Map.entry(only, selected));
             for (var entry : entries) {
                 if (!SentinelLeadership.isConnectorObservationGenerationCurrent(generation)) return;
                 Identity key = entry.getKey();
-                ConnectorStatusEvent row = entry.getValue();
+                PendingObservation observation = entry.getValue();
+                ConnectorStatusEvent row = observation.row();
                 try {
                     Channel channel = ControllerFactory.getFactory().createEngineController()
                             .getDeployedChannel(key.channelId());
                     if (channel == null || (channel.getDeployDate() != null
                             && !channel.getDeployDate().toInstant().equals(row.getDeploymentTime()))
                             || (channel.getMetaDataIds() != null && !channel.getMetaDataIds().contains(key.metadataId()))) {
-                        pending.remove(key, row);
+                        pending.remove(key, observation);
                         continue;
                     }
                     if (channel.getDeployDate() == null || channel.getMetaDataIds() == null) continue;
@@ -144,14 +176,21 @@ public final class PendingConnectorObservations {
                         if (current == null || (current.getDeployDate() != null
                                 && !current.getDeployDate().toInstant().equals(row.getDeploymentTime()))
                                 || (current.getMetaDataIds() != null && !current.getMetaDataIds().contains(key.metadataId()))) {
-                            pending.remove(key, row);
+                            pending.remove(key, observation);
                             return;
                         }
                         if (current.getDeployDate() == null || current.getMetaDataIds() == null) return;
-                        CollectorState.getInstance().putConnectorState(key.channelId(), key.metadataId(),
-                                ConnectionStatusEventType.valueOf(row.getNewState()), row.getChangedTime(), row.getDeploymentTime());
-                        CollectorState.getInstance().recordConnectorEvent(Instant.now());
-                        pending.remove(key, row);
+                        pending.compute(key, (ignored, latest) -> {
+                            // Same-state observations admitted during the write
+                            // share its row, so no duplicate INSERT is needed.
+                            boolean sameTransition = latest != null && latest.row() == row;
+                            Instant observedThrough = sameTransition ? latest.observedThrough() : observation.observedThrough();
+                            CollectorState.getInstance().putConnectorState(key.channelId(), key.metadataId(),
+                                    ConnectionStatusEventType.valueOf(row.getNewState()), row.getChangedTime(),
+                                    row.getDeploymentTime(), observedThrough);
+                            CollectorState.getInstance().recordConnectorEvent(Instant.now());
+                            return sameTransition ? null : latest;
+                        });
                     });
                 } catch (Exception failure) {
                     log.warn("Connector observation for {}/{} remains pending; heartbeat will retry",

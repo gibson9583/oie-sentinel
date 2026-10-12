@@ -126,32 +126,14 @@ public class SentinelConnectorStatusListener extends EventListener {
                 return; // old queued event or an ambiguous reading after clock rollback
             }
 
-            CollectorState collectorState = CollectorState.getInstance();
-            CollectorState.ConnectorState previous = collectorState.getConnectorState(channelId, metadataId);
-            if (previous != null && deployedAt.equals(previous.deploymentTime)
-                    && previous.since != null && previous.since.isAfter(occurred)) {
-                return; // an older queued callback cannot roll a committed state backward
-            }
-            if (previous != null && (!deployedAt.equals(previous.deploymentTime)
-                    || previous.since == null || previous.since.isBefore(deployedAt)
-                    || previous.since.isAfter(occurred))) {
-                previous = null; // same state on a new deployment still needs a fresh durable observation
-            }
-
-            // Enum comparison by == per the engine's overridden toString():
-            // DeployedState/ConnectionStatusEventType render capitalized
-            // human text, so name()/identity are the only safe comparisons.
-            if (previous != null && previous.state == state
-                    && !PendingConnectorObservations.isPending(channelId, metadataId)) {
-                return; // steady state (e.g. repeated IDLE) — no transition to record
-            }
-
+            // Admission decides ordering and duplicate suppression atomically
+            // with retry publication. A cache snapshot taken here could become
+            // stale before the pending check and discard a real transition.
             org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent row =
                     new org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent();
             row.setChannelId(channelId);
             row.setMetadataId(metadataId);
             row.setNodeId(SentinelLeadership.nodeId());
-            row.setPreviousState(previous != null ? previous.state.name() : null);
             row.setNewState(state.name());
             row.setChangedTime(occurred);
             row.setDeploymentTime(deployedAt);

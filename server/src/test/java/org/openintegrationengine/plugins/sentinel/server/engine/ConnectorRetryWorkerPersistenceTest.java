@@ -113,9 +113,10 @@ class ConnectorRetryWorkerPersistenceTest {
         // Once our only worker has exited, remove only this fixture's identity
         // so failed cases also release their in-memory state before DB cleanup.
         @SuppressWarnings("unchecked")
-        Map<Object, ConnectorStatusEvent> pending = (Map<Object, ConnectorStatusEvent>)
+        Map<Object, PendingConnectorObservations.PendingObservation> pending =
+                (Map<Object, PendingConnectorObservations.PendingObservation>)
                 field(PendingConnectorObservations.class, "pending").get(null);
-        pending.entrySet().removeIf(entry -> CHANNEL.equals(entry.getValue().getChannelId()));
+        pending.entrySet().removeIf(entry -> CHANNEL.equals(entry.getValue().row().getChannelId()));
         assertFalse(PendingConnectorObservations.isPending(CHANNEL, 0));
         CollectorState.getInstance().forgetChannel(CHANNEL);
         if (url != null) System.out.println("Final isolated blocked-retry rows before database drop: " + snapshot());
