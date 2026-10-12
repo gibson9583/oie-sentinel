@@ -314,7 +314,7 @@ final class AlertStormControl {
             if (!snap.reserveRollupIfNone(actionId, from, now)) {
                 return CeilingVerdict.silent(sent, windowSeconds);
             }
-            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, snap.channels(),
+            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, RollupRecipients.channels(action, now.minusSeconds(windowSeconds), now),
                     new Reservation(snap, actionId, CeilingOutcome.ROLLUP, now));
         } catch (Throwable t) {
             // Fail open: a ceiling that cannot be computed must not silence
