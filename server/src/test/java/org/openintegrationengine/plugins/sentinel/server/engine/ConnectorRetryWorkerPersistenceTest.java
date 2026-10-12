@@ -212,7 +212,8 @@ class ConnectorRetryWorkerPersistenceTest {
         try (MockedStatic<ConnectorStatusRepository> insert = mockStatic(ConnectorStatusRepository.class)) {
             insert.when(() -> ConnectorStatusRepository.insertConnectorStatusEvent(any()))
                     .thenThrow(new IllegalStateException("first write unavailable"));
-            PendingConnectorObservations.observe(row(SentinelLeadership.nodeId(), "CONNECTED", 5));
+            PendingConnectorObservations.observe(row(SentinelLeadership.nodeId(), "CONNECTED", 5),
+                    SentinelLeadership.connectorObservationGeneration(), () -> true);
         }
         assertTrue(PendingConnectorObservations.isPending(CHANNEL, 0));
         ownedWorker = Executors.newSingleThreadExecutor(task -> new Thread(() -> {

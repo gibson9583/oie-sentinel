@@ -9,6 +9,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
 import com.mirth.connect.donkey.server.channel.Channel;
 import com.mirth.connect.server.controllers.ControllerFactory;
@@ -30,13 +31,24 @@ public final class PendingConnectorObservations {
     private static boolean retryInFlight;
     private PendingConnectorObservations() { }
 
-    static void observe(ConnectorStatusEvent row) {
+    /**
+     * Admission follows the listener's lifetime, not heartbeat readiness: a
+     * newly registered listener must retain events before the first heartbeat.
+     * The predicate only reads that listener's retirement flag.
+     */
+    static void observe(ConnectorStatusEvent row, long generation, BooleanSupplier acceptingObservations) {
         Identity key = new Identity(row.getChannelId(), row.getMetadataId());
         boolean alreadyPending = pending.containsKey(key);
+        boolean[] admitted = { false };
         // The same per-identity operation also publishes committed state below.
         // No JDBC or engine inventory reads are allowed inside it: new events
         // must still be admitted while the single writer is blocked.
         pending.compute(key, (ignored, prior) -> {
+            // Serialize the retirement decision with current admission and
+            // publication. Checking only before compute could clobber a newer
+            // listener's observation after waiting for this connector's lock.
+            if (!acceptingObservations.getAsBoolean()) return prior;
+            admitted[0] = true;
             CollectorState collector = CollectorState.getInstance();
             CollectorState.ConnectorState committed = collector.getConnectorState(key.channelId(), key.metadataId());
             if (committed != null && (!row.getDeploymentTime().equals(committed.deploymentTime)
@@ -63,15 +75,19 @@ public final class PendingConnectorObservations {
             row.setPreviousState(committed != null ? committed.state.name() : null);
             return new PendingObservation(row, row.getChangedTime());
         });
+        if (!admitted[0]) return;
         // New pending identities also prune while JDBC is blocked. Do this
         // after admission so steady committed callbacks do not scan every
         // other pending connector just to discover they are duplicates.
-        if (!alreadyPending && pending.containsKey(key)) pruneObsolete();
-        flush(key);
+        if (!alreadyPending && pending.containsKey(key)) pruneObsolete(acceptingObservations);
+        // A callback admitted before heartbeat startup may retain its intent
+        // for the new heartbeat, but must not borrow that lifecycle to flush.
+        flush(key, generation);
     }
 
-    private static void pruneObsolete() {
+    private static void pruneObsolete(BooleanSupplier acceptingObservations) {
         for (var entry : pending.entrySet()) {
+            if (!acceptingObservations.getAsBoolean()) return;
             try {
                 Channel current = ControllerFactory.getFactory().createEngineController()
                         .getDeployedChannel(entry.getKey().channelId());
@@ -79,7 +95,8 @@ public final class PendingConnectorObservations {
                         && !current.getDeployDate().toInstant().equals(entry.getValue().row().getDeploymentTime()))
                         || (current.getMetaDataIds() != null
                         && !current.getMetaDataIds().contains(entry.getKey().metadataId()))) {
-                    pending.remove(entry.getKey(), entry.getValue());
+                    pending.computeIfPresent(entry.getKey(), (ignored, latest) ->
+                            acceptingObservations.getAsBoolean() && latest == entry.getValue() ? null : latest);
                 }
             } catch (Exception uncertainInventory) {
                 // Keep an uncertain observation; retry after inventory recovers.

@@ -117,7 +117,9 @@ class ConnectorObservationRetryTest {
                 var newer = new org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent();
                 newer.setChannelId(ID); newer.setMetadataId(0); newer.setNodeId(SentinelLeadership.nodeId());
                 newer.setChangedTime(now.minusSeconds(10)); newer.setDeploymentTime(deployed); newer.setNewState("CONNECTED");
-                Thread arrival = new Thread(() -> PendingConnectorObservations.observe(newer), "sentinel-observation-race-test");
+                long generation = SentinelLeadership.connectorObservationGeneration();
+                Thread arrival = new Thread(() -> PendingConnectorObservations.observe(newer, generation, () -> true),
+                        "sentinel-observation-race-test");
                 arrival.start(); arrival.join(2000); assertFalse(arrival.isAlive());
             }
             return null;

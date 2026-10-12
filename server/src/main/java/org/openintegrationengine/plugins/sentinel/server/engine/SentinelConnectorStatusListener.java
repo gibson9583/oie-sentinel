@@ -50,6 +50,9 @@ public class SentinelConnectorStatusListener extends EventListener {
 
     private static final Logger log = LoggerFactory.getLogger(SentinelConnectorStatusListener.class);
 
+    /** Shutdown interrupts the consumer without waiting for its in-flight callback. */
+    private volatile boolean retired;
+
     /**
      * Subscribes to connection-status events only — the event controller
      * routes each listener exclusively to the queues for the types it
@@ -62,12 +65,13 @@ public class SentinelConnectorStatusListener extends EventListener {
     }
 
     /**
-     * Nothing to release: state lives in {@link CollectorState} (which
-     * deliberately survives listener shutdown so a plugin restart does not
-     * blank the dashboard) and the repository is stateless.
+     * Fence callbacks still reading the old deployment when the engine
+     * interrupts this consumer. Already-admitted observations remain available
+     * for retry; a late callback must not replace a new listener's intent.
      */
     @Override
     protected void onShutdown() {
+        retired = true;
     }
 
     /**
@@ -84,6 +88,8 @@ public class SentinelConnectorStatusListener extends EventListener {
     @Override
     protected void processEvent(Event event) {
         try {
+            if (retired) return;
+            long generation = SentinelLeadership.connectorObservationGeneration();
             if (!(event instanceof ConnectionStatusEvent)) {
                 return;
             }
@@ -137,7 +143,7 @@ public class SentinelConnectorStatusListener extends EventListener {
             row.setNewState(state.name());
             row.setChangedTime(occurred);
             row.setDeploymentTime(deployedAt);
-            PendingConnectorObservations.observe(row);
+            PendingConnectorObservations.observe(row, generation, () -> !retired);
         } catch (Throwable t) {
             // Never propagate: this thread services every connector's status
             // events; one bad event (or a transient DB outage) must not stop
