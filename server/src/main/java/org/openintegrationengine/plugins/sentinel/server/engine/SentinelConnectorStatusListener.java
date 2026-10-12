@@ -20,7 +20,6 @@ import com.mirth.connect.server.event.EventListener;
 import com.mirth.connect.server.controllers.ControllerFactory;
 import com.mirth.connect.donkey.server.channel.Channel;
 
-import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
 
 /**
  * Sentinel's own {@code CONNECTION_STATUS} event listener — the source of
@@ -118,7 +117,8 @@ public class SentinelConnectorStatusListener extends EventListener {
             Instant occurred = Instant.ofEpochMilli(statusEvent.getDateTime());
             Instant now = Instant.now();
             Channel deployed = ControllerFactory.getFactory().createEngineController().getDeployedChannel(channelId);
-            if (deployed == null || deployed.getDeployDate() == null) {
+            if (deployed == null || deployed.getDeployDate() == null
+                    || (deployed.getMetaDataIds() != null && !deployed.getMetaDataIds().contains(metadataId))) {
                 return;
             }
             Instant deployedAt = deployed.getDeployDate().toInstant();
@@ -128,6 +128,10 @@ public class SentinelConnectorStatusListener extends EventListener {
 
             CollectorState collectorState = CollectorState.getInstance();
             CollectorState.ConnectorState previous = collectorState.getConnectorState(channelId, metadataId);
+            if (previous != null && deployedAt.equals(previous.deploymentTime)
+                    && previous.since != null && previous.since.isAfter(occurred)) {
+                return; // an older queued callback cannot roll a committed state backward
+            }
             if (previous != null && (!deployedAt.equals(previous.deploymentTime)
                     || previous.since == null || previous.since.isBefore(deployedAt)
                     || previous.since.isAfter(occurred))) {
@@ -137,7 +141,8 @@ public class SentinelConnectorStatusListener extends EventListener {
             // Enum comparison by == per the engine's overridden toString():
             // DeployedState/ConnectionStatusEventType render capitalized
             // human text, so name()/identity are the only safe comparisons.
-            if (previous != null && previous.state == state) {
+            if (previous != null && previous.state == state
+                    && !PendingConnectorObservations.isPending(channelId, metadataId)) {
                 return; // steady state (e.g. repeated IDLE) — no transition to record
             }
 
@@ -150,10 +155,7 @@ public class SentinelConnectorStatusListener extends EventListener {
             row.setNewState(state.name());
             row.setChangedTime(occurred);
             row.setDeploymentTime(deployedAt);
-            ConnectorStatusRepository.insertConnectorStatusEvent(row);
-
-            collectorState.putConnectorState(channelId, metadataId, state, occurred, deployedAt);
-            collectorState.recordConnectorEvent(now);
+            PendingConnectorObservations.observe(row);
         } catch (Throwable t) {
             // Never propagate: this thread services every connector's status
             // events; one bad event (or a transient DB outage) must not stop

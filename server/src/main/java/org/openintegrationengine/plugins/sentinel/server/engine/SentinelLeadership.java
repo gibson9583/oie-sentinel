@@ -428,7 +428,12 @@ public final class SentinelLeadership {
             if (!isCurrentGeneration(generation)) {
                 return;
             }
-            heartbeatNodePresence(databaseNow, generation);
+            PendingConnectorObservations.flush();
+            // Never renew confidence in connector history while a transition
+            // is missing. Existing remote confidence expires with its lease.
+            if (!PendingConnectorObservations.hasPending()) {
+                heartbeatNodePresence(databaseNow, generation);
+            }
             if (!isCurrentGeneration(generation)) {
                 return;
             }
@@ -656,6 +661,17 @@ public final class SentinelLeadership {
     private static void clearLocalClaim() {
         leadershipEpoch = null;
         leadershipValidUntilNanos = 0L;
+    }
+
+    static long connectorObservationGeneration() {
+        return lifecycleGeneration;
+    }
+
+    /** Serializes a completed observation's local publication with stop/restart. */
+    static synchronized boolean publishConnectorObservation(long generation, Runnable publication) {
+        if (!isCurrentGeneration(generation)) return false;
+        publication.run();
+        return true;
     }
 
     private static boolean isCurrentGeneration(long generation) {

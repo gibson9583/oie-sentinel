@@ -26,6 +26,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
+import org.openintegrationengine.plugins.sentinel.server.engine.PendingConnectorObservations;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
 import org.openintegrationengine.plugins.sentinel.server.db.NodeLeaseRepository;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEvent;
@@ -213,6 +215,10 @@ public final class ConnectionStatusEvaluator {
                 continue;
             }
             String nodeId = normalizedNodeId(event.getNodeId());
+            if (nodeId.equals(SentinelLeadership.nodeId())
+                    && PendingConnectorObservations.isPending(channelId, event.getMetadataId())) {
+                continue; // persisted state is known to precede an uncommitted transition
+            }
             Instant deployment = connectorNodes.get(event.getMetadataId()).get(nodeId);
             Instant observedAt = event.getChangedTime();
             // The listener checked the original event timestamp against the
