@@ -256,8 +256,7 @@ final class AlertStormControl {
      *
      * <p><b>How the ceiling is computed.</b> The window is
      * {@code [now - rollupWindowSeconds, now]}. Its contents come from
-     * {@link #scan}: the most recent {@link #SCAN_EVENT_LIMIT} alert events,
-     * each one's dispatch log read back, every row for this action whose
+     * {@link #scan}: dispatch rows directly by their delivery time, every row for this action whose
      * {@code dispatch_time} falls inside the window counted, and every row
      * carrying {@link #ROLLUP_MARKER} counted separately as "a rollup already
      * went out". That is the same read {@code ActionDispatcher.onRepeatCheck}
@@ -545,12 +544,9 @@ final class AlertStormControl {
     /**
      * Reconstructs the window from the dispatch log.
      *
-     * <p>Walks the most recent {@link #SCAN_EVENT_LIMIT} alert events and
-     * reads the dispatch rows of the ones that could have produced traffic
-     * inside the window: those opened inside it (the fan-out case) and those
-     * still open (their repeats, escalations and eventual resolution land
-     * inside it however long ago they opened). Events that are both older than
-     * the window and already resolved are skipped without a query.</p>
+     * <p>Reads dispatch rows by delivery time, including recoveries and delayed
+     * replays of old incidents. The recent-event scan serves summary display
+     * only and never limits notification-budget accounting.</p>
      *
      * <p>The affected-channel list is built from the same pass: the distinct
      * channels whose latest dispatch-time suppression bit is clear and that
@@ -586,21 +582,23 @@ final class AlertStormControl {
             }
 
             scanned++;
-            for (ActionDispatchLog row : ActionDispatchLogRepository
-                    .listActionDispatchLogsForEvent(event.getId())) {
-                Integer actionId = row.getActionId();
-                Instant at = row.getDispatchTime();
-                if (actionId == null || at == null || at.isBefore(from)) {
-                    continue;
+        }
+
+        // Incident age/status and the recent-event display limit cannot bound
+        // delivery accounting: old incidents can recover or replay right now.
+        for (ActionDispatchLog row : ActionDispatchLogRepository.listActionDispatchLogsInRange(from, now)) {
+            Integer actionId = row.getActionId();
+            Instant at = row.getDispatchTime();
+            if (actionId == null || at == null || at.isBefore(from) || at.isAfter(now)) {
+                continue;
+            }
+            if (isRollupRow(row)) {
+                Instant newest = rollups.get(actionId);
+                if (newest == null || at.isAfter(newest)) {
+                    rollups.put(actionId, at);
                 }
-                if (isRollupRow(row)) {
-                    Instant newest = rollups.get(actionId);
-                    if (newest == null || at.isAfter(newest)) {
-                        rollups.put(actionId, at);
-                    }
-                } else {
-                    sends.computeIfAbsent(actionId, id -> new ArrayList<>()).add(at);
-                }
+            } else {
+                sends.computeIfAbsent(actionId, id -> new ArrayList<>()).add(at);
             }
         }
 

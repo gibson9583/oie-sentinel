@@ -100,6 +100,22 @@ public final class ActionDispatchLogRepository {
         }
     }
 
+    /** Reads the notification budget by delivery time, independent of incident age or status. */
+    public static List<ActionDispatchLog> listActionDispatchLogsInRange(Instant from, Instant to) {
+        try {
+            Map<String, Object> params = Map.of("from", toTimestamp(from), "to", toTimestamp(to));
+            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listActionDispatchLogsInRange"), params);
+            List<ActionDispatchLog> results = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                results.add(toActionDispatchLog(row));
+            }
+            return results;
+        } catch (Exception e) {
+            throw new RepositoryException("Failed to read notification budget", e);
+        }
+    }
+
     // ========== Map <-> DTO conversion ==========
 
     private static ActionDispatchLog toActionDispatchLog(Map<String, Object> row) {

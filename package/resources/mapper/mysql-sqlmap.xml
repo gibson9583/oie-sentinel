@@ -575,6 +575,13 @@
         ORDER BY dispatch_time
     </select>
 
+    <select id="listActionDispatchLogsInRange" parameterType="map" resultType="map">
+        SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
+        FROM sentinel_action_dispatch_log
+        WHERE dispatch_time &gt;= #{from} AND dispatch_time &lt;= #{to}
+        ORDER BY dispatch_time
+    </select>
+
     <!-- ========== MAINTENANCE_WINDOW (table sentinel_maintenance_window) ========== -->
 
     <select id="getMaintenanceWindow" parameterType="map" resultType="map">
