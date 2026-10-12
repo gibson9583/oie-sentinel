@@ -30,6 +30,7 @@ import java.util.regex.Pattern;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsCrypto;
+import org.openintegrationengine.plugins.sentinel.server.service.WebhookSecrets;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -105,19 +106,35 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
  *       its proxy settings, is the escape hatch for that deployment.</li>
  * </ol>
  *
- * <p>Header values named like credentials are stored encrypted and redacted
- * on read — see {@link #isSecretHeaderName(String)}, which is the single
- * definition shared by {@code ActionService}'s redaction path and the
- * just-in-time decrypt below, so the two can never disagree about which
- * headers are ciphertext.</p>
+ * <p>The URL, body template, and all header values are encrypted on write
+ * and redacted on read. {@link #isSecretHeaderName(String)} identifies only
+ * the legacy header encoding; other fields use versioned encryption while
+ * accepting existing plaintext rows until they are saved again.</p>
  *
  * <p>Neither the URL path nor a request header ever appears in a failure
  * message. Dispatch-log rows are readable at View Monitoring, the plugin's
  * most widely granted permission, and a Slack-style webhook URL <em>is</em>
  * the credential — its path segment is the bearer token. Failures name the
- * target as {@code scheme://host[:port]} only.</p>
+ * action and failure category only; a hostname can itself be a capability
+ * token and is not safe diagnostic text.</p>
  */
 public final class WebhookAlertSender implements AlertSender {
+
+    /** Only these reviewed messages may escape the transport boundary. */
+    private static final class DeliveryFailure extends Exception {
+        private DeliveryFailure(String message) { super(message); }
+    }
+
+    private final HttpClient client;
+
+    public WebhookAlertSender() {
+        this(null);
+    }
+
+    /** Package-local injection for transport tests; production uses the shared lazy client. */
+    WebhookAlertSender(HttpClient client) {
+        this.client = client;
+    }
 
     /** Lower bound for the configured wall clock; below this nothing completes. */
     static final int MIN_TIMEOUT_SECONDS = 1;
@@ -144,21 +161,11 @@ public final class WebhookAlertSender implements AlertSender {
 
     /**
      * How much response body is read before the exchange is cancelled. The
-     * body is wanted only as a diagnostic — Slack's "invalid_payload",
-     * PagerDuty's validation errors — so a few kilobytes is generous, and a
-     * hard cap is required rather than nice-to-have: without one, an endpoint
-     * that answers a 4xx with a multi-gigabyte body would be answered by this
-     * sender buffering all of it on a dispatch thread.
+     * body is never included in diagnostic errors, because an endpoint can
+     * echo submitted credentials. A hard read cap prevents an endpoint with
+     * a multi-gigabyte response from consuming a dispatch thread's memory.
      */
     private static final int MAX_RESPONSE_BYTES = 4096;
-
-    /**
-     * How much of that body reaches the dispatch-log failure reason. Much
-     * smaller than the read cap because the log row is readable at View
-     * Monitoring and is the one channel by which anything the remote endpoint
-     * says gets back to a human — see the class Javadoc.
-     */
-    private static final int MAX_RESPONSE_SNIPPET = 200;
 
     /** Body-carrying verbs only; see the class Javadoc for why GET is absent. */
     static final Set<String> ALLOWED_METHODS = Set.of("POST", "PUT", "PATCH");
@@ -177,25 +184,9 @@ public final class WebhookAlertSender implements AlertSender {
     private static final String DEFAULT_CONTENT_TYPE = "application/json; charset=utf-8";
 
     /**
-     * Which header <em>names</em> mark their value a secret — encrypted at
-     * rest and redacted on read. Matched with {@code find()}, so the anchored
-     * alternatives are exact names and the rest are substrings.
-     *
-     * <p>Deliberately over-inclusive. The cost of treating a non-secret
-     * header as a secret is that the operator re-types it if they ever need
-     * to change it and cannot read it back afterwards; the cost of missing a
-     * real one is a bearer token sitting in plaintext in the database and
-     * being handed to every View Monitoring user through the actions list.
-     * Those costs are not remotely symmetric, so anything that looks like a
-     * credential is treated as one. The names left out are the ones that
-     * genuinely never carry a secret and that operators do need to read —
-     * {@code Content-Type}, {@code Accept}, {@code User-Agent},
-     * {@code Idempotency-Key} and similar.</p>
-     *
-     * <p>{@code Authorization} is called out by name in the plan for this
-     * feature and is the first alternative here; {@code Cookie} and
-     * {@code Proxy-Authorization} join it because they are credential
-     * carriers whose names contain none of the giveaway substrings.</p>
+     * Header names whose values were already encrypted in older releases.
+     * Keep this pattern stable for legacy ciphertext decoding. It is not a
+     * secrecy policy: every header value is now encrypted and redacted.
      */
     private static final Pattern SECRET_HEADER_NAME = Pattern.compile(
             "^(authorization|proxy-authorization|cookie)$"
@@ -254,12 +245,28 @@ public final class WebhookAlertSender implements AlertSender {
      */
     @Override
     public void send(Action action, AlertEvent event, AlertPayload payload) throws Exception {
+        try {
+            sendConfigured(action, payload);
+        } catch (DeliveryFailure e) {
+            throw e;
+        } catch (Exception e) {
+            // Includes synchronous HTTP-client/request-builder failures. They
+            // can quote complete URLs, templates, or header values. Do not keep
+            // the cause either: the dispatcher logs the complete exception.
+            throw new DeliveryFailure("Webhook action '"
+                    + (action == null ? "(unknown)" : AlertSender.singleLine(action.getName()))
+                    + "' could not deliver; verify its configuration and network access ("
+                    + e.getClass().getSimpleName() + ")");
+        }
+    }
+
+    private void sendConfigured(Action action, AlertPayload payload) throws Exception {
         String name = action.getName();
         JsonNode config = readConfig(action);
 
         boolean allowInsecure = config.path("allowInsecure").asBoolean(false);
         boolean allowPrivateNetwork = config.path("allowPrivateNetwork").asBoolean(false);
-        URI uri = WebhookTargetGuard.validateUrl(name, text(config, "url"), allowInsecure);
+        URI uri = WebhookTargetGuard.validateUrl(name, secretText(config, "url"), allowInsecure);
 
         String method = method(name, text(config, "method"));
         int timeoutSeconds = timeoutSeconds(config);
@@ -269,17 +276,26 @@ public final class WebhookAlertSender implements AlertSender {
         // Last gate before the socket. See WebhookTargetGuard for why this
         // lives here and not at save time, and for the residual rebinding
         // window between this call and the client's own resolution.
-        WebhookTargetGuard.assertTargetAllowed(name, uri, allowPrivateNetwork);
+        try {
+            WebhookTargetGuard.assertTargetAllowed(name, uri, allowPrivateNetwork);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            // A capability token may be the hostname itself. Guard failures
+            // name the resolved target, so do not expose those details either.
+            throw new DeliveryFailure("Webhook action '" + name
+                    + "' target could not be resolved or is blocked by the network policy");
+        }
 
         HttpRequest request = buildRequest(name, uri, method, headers, body, timeoutSeconds);
-        HttpResponse<String> response = exchange(name, uri, request, timeoutSeconds);
+        HttpResponse<String> response = exchange(client != null ? client : ClientHolder.CLIENT,
+                name, request, timeoutSeconds);
 
         int status = response.statusCode();
         if (status < 200 || status > 299) {
-            throw new Exception("Webhook action '" + name + "' to " + target(uri) + " returned HTTP "
+            throw new DeliveryFailure("Webhook action '" + name + "' returned HTTP "
                     + status + (status >= 300 && status < 400
-                            ? " (redirects are not followed — configure the final URL directly)" : "")
-                    + snippet(response.body()));
+                            ? " (redirects are not followed — configure the final URL directly)" : ""));
         }
     }
 
@@ -314,7 +330,7 @@ public final class WebhookAlertSender implements AlertSender {
         boolean allowInsecure = config.path("allowInsecure").asBoolean(false);
         boolean allowPrivateNetwork = config.path("allowPrivateNetwork").asBoolean(false);
 
-        URI uri = WebhookTargetGuard.validateUrl(actionName, text(config, "url"), allowInsecure);
+        URI uri = WebhookTargetGuard.validateUrl(actionName, secretText(config, "url"), allowInsecure);
         WebhookTargetGuard.assertLiteralTargetAllowed(actionName, uri, allowPrivateNetwork);
 
         String method = text(config, "method");
@@ -333,6 +349,10 @@ public final class WebhookAlertSender implements AlertSender {
         }
 
         JsonNode headers = config.get("headers");
+        JsonNode template = config.get("bodyTemplate");
+        if (template != null && !template.isNull() && !template.isTextual()) {
+            throw new IllegalArgumentException("WEBHOOK bodyTemplate must be text");
+        }
         if (headers == null || headers.isNull()) {
             return;
         }
@@ -341,7 +361,12 @@ public final class WebhookAlertSender implements AlertSender {
         }
         Iterator<String> names = headers.fieldNames();
         while (names.hasNext()) {
-            String headerName = names.next().trim();
+            String rawName = names.next();
+            String headerName = rawName.trim();
+            JsonNode headerValue = headers.get(rawName);
+            if (headerValue != null && !headerValue.isNull() && !headerValue.isTextual()) {
+                throw new IllegalArgumentException("WEBHOOK header values must be text");
+            }
             if (headerName.isEmpty()) {
                 continue;
             }
@@ -357,14 +382,12 @@ public final class WebhookAlertSender implements AlertSender {
     }
 
     /**
-     * Whether a header name marks its value a secret — the single definition
-     * used both by {@code ActionService}, to decide what to encrypt at rest
-     * and mask on read, and by {@link #renderHeaders} here, to decide what to
-     * decrypt on the way out. See {@link #SECRET_HEADER_NAME} for the policy
-     * and why it errs wide.
+     * Whether a header uses the original unversioned encrypted storage.
+     * Other headers use versioned storage or legacy plaintext. Shared with
+     * {@code ActionService} so decoding and retained-marker writes agree.
      *
-     * @param headerName the configured header name; {@code null} is not secret
-     * @return {@code true} when the value must be encrypted and redacted
+     * @param headerName the configured header name
+     * @return {@code true} for legacy encrypted header names
      */
     public static boolean isSecretHeaderName(String headerName) {
         return headerName != null && SECRET_HEADER_NAME.matcher(headerName.trim()).find();
@@ -404,7 +427,7 @@ public final class WebhookAlertSender implements AlertSender {
                 // value, and this text becomes a dispatch-log row readable at
                 // View Monitoring, so the value is deliberately not echoed:
                 // the header could be the Authorization one.
-                throw new Exception("Webhook action '" + actionName + "' produced a value for header '"
+                throw new DeliveryFailure("Webhook action '" + actionName + "' produced a value for header '"
                         + headerName + "' that cannot be sent (HTTP header values are limited to "
                         + "Latin-1 text); check the template tokens it substitutes");
             }
@@ -426,29 +449,28 @@ public final class WebhookAlertSender implements AlertSender {
      * explicit {@code cancel(true)} on expiry is what makes that true rather
      * than merely abandoning the future while its exchange keeps running.</p>
      */
-    private static HttpResponse<String> exchange(String actionName, URI uri, HttpRequest request,
+    private static HttpResponse<String> exchange(HttpClient client, String actionName, HttpRequest request,
             int timeoutSeconds) throws Exception {
         CompletableFuture<HttpResponse<String>> future =
-                ClientHolder.CLIENT.sendAsync(request, info -> new BoundedBodySubscriber());
+                client.sendAsync(request, info -> new BoundedBodySubscriber());
         try {
             return future.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
-            throw new Exception("Webhook action '" + actionName + "' to " + target(uri)
+            throw new DeliveryFailure("Webhook action '" + actionName + "'"
                     + " did not complete within " + timeoutSeconds + "s");
         } catch (InterruptedException e) {
             future.cancel(true);
             Thread.currentThread().interrupt();
-            throw new Exception("Webhook action '" + actionName + "' to " + target(uri)
+            throw new DeliveryFailure("Webhook action '" + actionName + "'"
                     + " was interrupted (server shutting down?)");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
-            String detail = cause.getMessage();
-            if (detail == null || detail.isBlank()) {
-                detail = cause.getClass().getSimpleName();
-            }
-            throw new Exception("Webhook action '" + actionName + "' to " + target(uri) + " failed: "
-                    + AlertSender.singleLine(detail), cause);
+            // HTTP client exceptions can quote request URLs or header values.
+            // Remote bodies can echo them too. Neither belongs in a dispatch
+            // log readable by View Monitoring users, even as a short snippet.
+            throw new DeliveryFailure("Webhook action '" + actionName + "' failed: "
+                    + cause.getClass().getSimpleName());
         }
     }
 
@@ -456,7 +478,7 @@ public final class WebhookAlertSender implements AlertSender {
 
     /**
      * Resolves the configured headers into ready-to-send name/value pairs:
-     * decrypt if the name marks it a secret, substitute template tokens, then
+     * decrypt using its current or legacy encoding, substitute template tokens, then
      * flatten to one line.
      *
      * <p>The {@link AlertSender#singleLine} pass is not optional and is the
@@ -486,7 +508,7 @@ public final class WebhookAlertSender implements AlertSender {
             return rendered;
         }
         if (!headers.isObject()) {
-            throw new Exception("Webhook action '" + actionName
+            throw new DeliveryFailure("Webhook action '" + actionName
                     + "' has a 'headers' value that is not a JSON object");
         }
         Iterator<Map.Entry<String, JsonNode>> fields = headers.fields();
@@ -497,27 +519,26 @@ public final class WebhookAlertSender implements AlertSender {
                 continue;
             }
             JsonNode valueNode = field.getValue();
+            if (valueNode != null && !valueNode.isNull() && !valueNode.isTextual()) {
+                throw new DeliveryFailure("Webhook action '" + actionName
+                        + "' has a header value that is not text");
+            }
             String value = valueNode == null || valueNode.isNull() ? "" : valueNode.asText("");
             if (value.isEmpty()) {
                 continue;
             }
-            if (isSecretHeaderName(headerName)) {
-                // Stored ciphertext; the plaintext exists only inside this
-                // send, exactly as SnsAlertSender treats secretAccessKey —
-                // never in a field or a DTO that could be serialized.
-                try {
-                    value = SettingsCrypto.decrypt(value);
-                } catch (RuntimeException e) {
-                    // The stored value was written by something other than
-                    // ActionService (a hand-edited row) or under a different
-                    // keystore. Name the header, not the value: this message
-                    // becomes a dispatch-log row readable at View Monitoring.
-                    throw new Exception("Webhook action '" + actionName + "' could not decrypt the '"
-                            + headerName + "' header; re-enter it on the action to fix this", e);
-                }
-                if (value == null) {
-                    continue;
-                }
+            try {
+                value = isSecretHeaderName(headerName)
+                        ? SettingsCrypto.decrypt(value) : WebhookSecrets.read(value);
+            } catch (RuntimeException e) {
+                // The dispatcher logs exceptions; do not attach secret-bearing
+                // crypto causes or echo their messages.
+                throw new DeliveryFailure("Webhook action '" + actionName + "' could not decrypt the '"
+                        + headerName + "' header; re-enter it on the action to fix this");
+            }
+            if (value == null || value.isBlank()) {
+                throw new DeliveryFailure("Webhook action '" + actionName
+                        + "' has an empty decrypted header; re-enter it on the action");
             }
             rendered.add(new String[] { headerName, AlertSender.singleLine(render(value, payload, false)) });
         }
@@ -531,11 +552,11 @@ public final class WebhookAlertSender implements AlertSender {
      */
     static void assertHeaderNameUsable(String actionName, String headerName) throws Exception {
         if (!isValidHeaderName(headerName)) {
-            throw new Exception("Webhook action '" + actionName + "' has an invalid header name '"
+            throw new DeliveryFailure("Webhook action '" + actionName + "' has an invalid header name '"
                     + AlertSender.singleLine(headerName) + "'");
         }
         if (RESTRICTED_HEADERS.contains(headerName.toLowerCase(Locale.ROOT))) {
-            throw new Exception("Webhook action '" + actionName + "' cannot set the '" + headerName
+            throw new DeliveryFailure("Webhook action '" + actionName + "' cannot set the '" + headerName
                     + "' header; it is managed by the HTTP client");
         }
     }
@@ -565,7 +586,7 @@ public final class WebhookAlertSender implements AlertSender {
      * all.
      */
     private static String renderBody(JsonNode config, List<String[]> headers, AlertPayload payload) {
-        String template = text(config, "bodyTemplate");
+        String template = secretText(config, "bodyTemplate");
         if (template == null) {
             return Json.write(payload);
         }
@@ -659,7 +680,7 @@ public final class WebhookAlertSender implements AlertSender {
         }
         String method = raw.trim().toUpperCase(Locale.ROOT);
         if (!ALLOWED_METHODS.contains(method)) {
-            throw new Exception("Webhook action '" + actionName + "' has unsupported method '" + raw
+            throw new DeliveryFailure("Webhook action '" + actionName + "' has unsupported method '" + raw
                     + "' (expected POST, PUT or PATCH)");
         }
         return method;
@@ -679,34 +700,6 @@ public final class WebhookAlertSender implements AlertSender {
     }
 
     /**
-     * The target as it may safely appear in a failure message:
-     * {@code scheme://host[:port]}, never the path. See the class Javadoc —
-     * for a Slack-style webhook the path <em>is</em> the credential, and
-     * dispatch-log rows are readable at View Monitoring.
-     */
-    private static String target(URI uri) {
-        String port = uri.getPort() >= 0 ? ":" + uri.getPort() : "";
-        return uri.getScheme() + "://" + uri.getHost() + port;
-    }
-
-    /**
-     * A short, flattened excerpt of the response body for the failure reason
-     * — the difference between "HTTP 400" and "HTTP 400: invalid_payload",
-     * which is usually the whole diagnosis. Empty string when there is
-     * nothing to show, so the caller concatenates unconditionally.
-     */
-    private static String snippet(String body) {
-        if (body == null || body.isBlank()) {
-            return "";
-        }
-        String flat = AlertSender.singleLine(body).trim();
-        if (flat.length() > MAX_RESPONSE_SNIPPET) {
-            flat = flat.substring(0, MAX_RESPONSE_SNIPPET) + "…";
-        }
-        return ": " + flat;
-    }
-
-    /**
      * Parses the action's config JSON, failing with an operator-readable
      * message instead of a bare Jackson parse error when the stored JSON is
      * missing or malformed.
@@ -714,14 +707,29 @@ public final class WebhookAlertSender implements AlertSender {
     private static JsonNode readConfig(Action action) throws Exception {
         String configJson = action.getConfigJson();
         if (configJson == null || configJson.isBlank()) {
-            throw new Exception("Webhook action '" + action.getName() + "' has no configuration");
+            throw new DeliveryFailure("Webhook action '" + action.getName() + "' has no configuration");
         }
         try {
-            return Json.mapper().readTree(configJson);
+            JsonNode config = Json.mapper().readTree(configJson);
+            if (config == null || !config.isObject()) {
+                throw new IllegalArgumentException();
+            }
+            return config;
         } catch (Exception e) {
-            throw new Exception("Webhook action '" + action.getName() + "' has invalid config JSON: "
-                    + e.getMessage(), e);
+            throw new DeliveryFailure("Webhook action '" + action.getName() + "' has invalid config JSON");
         }
+    }
+
+    private static String secretText(JsonNode config, String field) {
+        JsonNode value = config.get(field);
+        if (value != null && !value.isNull() && !value.isTextual()) {
+            // In particular, a malformed template must not silently fall
+            // back to the full alert payload.
+            throw new IllegalArgumentException("WEBHOOK " + field + " must be text");
+        }
+        String stored = text(config, field);
+        String plaintext = WebhookSecrets.read(stored);
+        return plaintext == null || plaintext.isBlank() ? null : plaintext.trim();
     }
 
     /**

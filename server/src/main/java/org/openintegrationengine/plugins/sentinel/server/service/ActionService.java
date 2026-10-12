@@ -52,15 +52,11 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActionTestResult;
  *       has no reason to see. {@code region} and {@code topicArn} are
  *       deliberately <em>not</em> masked: they are not sensitive and the
  *       editor renders them directly.</li>
- *   <li><b>Credential-shaped WEBHOOK headers</b> — every entry of the config's
- *       {@code headers} object whose <em>name</em> matches
- *       {@link org.openintegrationengine.plugins.sentinel.server.alert.WebhookAlertSender#isSecretHeaderName(String)}
- *       ({@code Authorization} and friends). Unlike the SNS fields these are
- *       not a fixed key list — the operator names them — so the slot for a
- *       header is discovered from the document being processed. All of them
- *       are encrypted at rest: a webhook bearer token has no non-credential
- *       component to preserve, so there is no reason to store one in
- *       plaintext.</li>
+ *   <li><b>WEBHOOK URL, body template, and every header value.</b> Tokens
+ *       can appear in paths, queries, template JSON, or arbitrarily named
+ *       headers. All are encrypted on write and masked on read. Previously
+ *       plaintext fields use versioned storage so existing rows remain
+ *       deliverable and upgrade when saved.</li>
  * </ul>
  *
  * <p>Errors follow the plugin-wide convention: {@link IllegalArgumentException}
@@ -228,11 +224,16 @@ public final class ActionService {
         try {
             JsonNode config = Json.mapper().readTree(copy.getConfigJson());
             if (!config.isObject()) {
+                copy.setConfigJson("{}");
+                return copy;
+            }
+            if (config.hasNonNull(HEADERS) && !config.get(HEADERS).isObject()) {
+                copy.setConfigJson("{}");
                 return copy;
             }
             boolean masked = false;
             for (SecretSlot slot : secretSlots(config)) {
-                if (!slot.read(config).isBlank()) {
+                if (slot.hasValue(config)) {
                     slot.write(config, REDACTED);
                     masked = true;
                 }
@@ -241,8 +242,9 @@ public final class ActionService {
                 copy.setConfigJson(Json.write(config));
             }
         } catch (Exception e) {
-            // Unparsable stored config: nothing recognizable to leak, and
-            // validation prevents persisting one — return the copy as-is.
+            // A malformed legacy/corrupt row may still contain credential
+            // fragments. Never return unparseable raw config to readers.
+            copy.setConfigJson("{}");
         }
         return copy;
     }
@@ -259,18 +261,24 @@ public final class ActionService {
      * <p>{@code encrypted} says whether the value is stored as ciphertext.
      * It is false for the SNS identifiers (an access key id and a role ARN
      * are masked from readers but not credentials to protect at rest) and
-     * true for the SNS secret access key and every webhook secret header.</p>
+     * true for the SNS secret access key and every webhook secret field.</p>
      */
     private static final class SecretSlot {
 
         private final String owner;
         private final String field;
         private final boolean encrypted;
+        private final boolean versioned;
 
         private SecretSlot(String owner, String field, boolean encrypted) {
+            this(owner, field, encrypted, false);
+        }
+
+        private SecretSlot(String owner, String field, boolean encrypted, boolean versioned) {
             this.owner = owner;
             this.field = field;
             this.encrypted = encrypted;
+            this.versioned = versioned;
         }
 
         /** The object actually holding the field, or {@code null} if absent from this document. */
@@ -288,7 +296,27 @@ public final class ActionService {
             if (container == null || !container.hasNonNull(field)) {
                 return "";
             }
+            if (!container.get(field).isTextual()) {
+                throw new IllegalArgumentException("Action secret fields must be text");
+            }
             return container.get(field).asText("");
+        }
+
+        private boolean hasValue(JsonNode config) {
+            ObjectNode container = container(config);
+            JsonNode value = container == null ? null : container.get(field);
+            return value != null && !value.isNull()
+                    && (!value.isTextual() || !value.asText().isBlank());
+        }
+
+        private String encrypt(String plaintext) {
+            try {
+                return versioned ? WebhookSecrets.encrypt(plaintext) : SettingsCrypto.encrypt(plaintext);
+            } catch (RuntimeException e) {
+                // Engine crypto diagnostics can contain the input. Neither
+                // API errors nor their server-log causes may expose it.
+                throw new IllegalStateException("Action secret could not be encrypted; check the engine keystore");
+            }
         }
 
         /** Replaces the value in place; a no-op when the slot's container is absent. */
@@ -312,17 +340,22 @@ public final class ActionService {
      * their names are chosen by the operator, so there is no fixed list to
      * consult.</p>
      *
-     * <p>Header secrecy is decided by
+     * <p>Legacy header encoding is decided by
      * {@link org.openintegrationengine.plugins.sentinel.server.alert.WebhookAlertSender#isSecretHeaderName(String)}
-     * rather than by a copy of the pattern here, so the sender's just-in-time
-     * decrypt and this redaction can never disagree about which headers are
-     * ciphertext.</p>
+     * rather than by a copy of the pattern here, so the sender and persistence
+     * agree on legacy ciphertext versus versioned/legacy-plaintext storage.
+     * All header values are secret regardless of this legacy classification.</p>
      *
      * @param config a config document already known to be a JSON object
      * @return the slots present in this document; never {@code null}
      */
     private static List<SecretSlot> secretSlots(JsonNode config) {
         List<SecretSlot> slots = new ArrayList<>();
+        // A webhook URL (including its query/path) and a custom body template
+        // can themselves be bearer credentials. Protect the complete values;
+        // host- or template-specific token heuristics inevitably miss secrets.
+        slots.add(new SecretSlot(null, "url", true, true));
+        slots.add(new SecretSlot(null, "bodyTemplate", true, true));
         for (String field : SNS_SECRET_FIELDS) {
             slots.add(new SecretSlot(null, field, SECRET_ACCESS_KEY.equals(field)));
         }
@@ -331,9 +364,11 @@ public final class ActionService {
             Iterator<String> names = headers.fieldNames();
             while (names.hasNext()) {
                 String name = names.next();
-                if (WebhookAlertSender.isSecretHeaderName(name)) {
-                    slots.add(new SecretSlot(HEADERS, name, true));
-                }
+                // Preserve the encoding of headers that were already encrypted
+                // before this release. Every other header now uses versioned
+                // storage so legacy plaintext remains distinguishable.
+                slots.add(new SecretSlot(HEADERS, name, true,
+                        !WebhookAlertSender.isSecretHeaderName(name)));
             }
         }
         return slots;
@@ -391,10 +426,11 @@ public final class ActionService {
                     throw new IllegalArgumentException(slot.field
                             + " is the redaction marker but there is no stored value to keep");
                 }
-                slot.write(config, stored);
+                slot.write(config, slot.versioned && !WebhookSecrets.isEncrypted(stored)
+                        ? slot.encrypt(stored) : stored);
                 rewritten = true;
             } else if (slot.encrypted) {
-                slot.write(config, SettingsCrypto.encrypt(incoming));
+                slot.write(config, slot.encrypt(incoming));
                 rewritten = true;
             }
             // Any other newly supplied value is persisted verbatim.
@@ -486,7 +522,9 @@ public final class ActionService {
         try {
             config = Json.mapper().readTree(action.getConfigJson());
         } catch (Exception e) {
-            throw new IllegalArgumentException("Action config is not valid JSON", e);
+            // Jackson includes excerpts of the input, which may be a URL,
+            // authentication header, or secret-bearing body template.
+            throw new IllegalArgumentException("Action config is not valid JSON");
         }
         if (!config.isObject()) {
             throw new IllegalArgumentException("Action config must be a JSON object");

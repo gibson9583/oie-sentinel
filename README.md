@@ -65,6 +65,11 @@ immediately.
 **Actions (alert delivery)**
 - Email (engine SMTP), Channel (route the alert payload into an OIE channel via VM Router), AWS
   SNS, and Webhook (HTTPS POST to Slack, Teams, PagerDuty, Alertmanager…) senders.
+- Webhook URLs, body templates, and all header values are encrypted when saved and masked in
+  API responses and exports. Leave a masked value unchanged to retain it; replace it in full to
+  change it. Existing plaintext fields remain deliverable and are encrypted the next time the
+  action is saved. An import with unavailable masked secrets skips that action until the secrets
+  are supplied, preserving the intended payload and authentication.
 - Every transport call has the same 30-second hard wall-clock ceiling (a transport may use a
   shorter one); expiry cancels the call and releases the bounded dispatch worker.
 - Open and resolution notifications use ordered durable outbox flags and reconcile missing

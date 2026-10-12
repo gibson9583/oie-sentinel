@@ -99,16 +99,6 @@ function normalizeConfig(actionType, c) {
     return { ...c, headers };
 }
 
-/* Mirrors WebhookAlertSender.SECRET_HEADER_NAME. Cosmetic only — it decides
-   whether the value renders as a password field with the "kept unless you
-   retype it" hint. The server is authoritative about what actually gets
-   encrypted, so a disagreement here shows the wrong widget, never the wrong
-   storage. */
-const SECRET_HEADER_RE =
-    /^(authorization|proxy-authorization|cookie)$|token|secret|password|passwd|signature|credential|api[-_]?key/i;
-
-const isSecretHeader = (name) => SECRET_HEADER_RE.test((name || '').trim());
-
 /** "Severity >= WARNING AND Channel = abc…" — one line, truncated. */
 function conditionsSummary(action) {
     const rows = parseConditions(action);
@@ -406,8 +396,8 @@ function SnsConfigFields({ config, setConfig }) {
 
 /* Header name/value rows. Kept out of WebhookConfigFields so the row logic
    reads on its own; `rows` is the draft array, emit() replaces it wholesale
-   (React state, no in-place mutation). Values for credential-looking names
-   render as password fields carrying the same "unchanged marker = keep the
+   (React state, no in-place mutation). All values render as password fields
+   carrying the same "unchanged marker = keep the
    stored secret" contract as the SNS secret access key. */
 function HeaderRows({ rows, onChange }) {
     const list = Array.isArray(rows) ? rows : [];
@@ -415,15 +405,14 @@ function HeaderRows({ rows, onChange }) {
     return (
         <div className="sn-conds">
             {list.map((row, i) => {
-                const secret = isSecretHeader(row.name);
                 return (
                     <div key={i} className="sn-cond-row">
                         <input value={row.name || ''} placeholder="Header name"
                             autoComplete="off" style={{ flex: '0 0 220px' }}
                             onChange={(e) => setRow(i, { name: e.target.value })} />
-                        <input value={row.value || ''} placeholder={secret ? 'Bearer …' : 'Value'}
-                            type={secret ? 'password' : 'text'}
-                            autoComplete={secret ? 'new-password' : 'off'}
+                        <input value={row.value || ''} placeholder="Value"
+                            type="password"
+                            autoComplete="new-password"
                             style={{ flex: '1 1 240px' }}
                             onChange={(e) => setRow(i, { value: e.target.value })} />
                         <button type="button" className="btn btn-sm" title="Remove header"
@@ -441,6 +430,7 @@ function HeaderRows({ rows, onChange }) {
 
 function WebhookConfigFields({ config, setConfig }) {
     const bodyRef = React.useRef(null);
+    const bodyMasked = config.bodyTemplate === REDACTED;
     const insecure = !!config.allowInsecure;
     const privateNet = !!config.allowPrivateNetwork;
     return (
@@ -451,7 +441,8 @@ function WebhookConfigFields({ config, setConfig }) {
                     autoComplete="off"
                     onChange={(e) => setConfig({ url: e.target.value })} />
                 <div className="hint">
-                    Required. The path is treated as a credential and never echoed in errors.
+                    Required. Stored encrypted. Leave {REDACTED} unchanged to keep the URL;
+                    replace the entire value to change it.
                 </div>
             </div>
             <div className="field">
@@ -472,9 +463,9 @@ function WebhookConfigFields({ config, setConfig }) {
                 <label>Headers</label>
                 <HeaderRows rows={config.headers} onChange={(rows) => setConfig({ headers: rows })} />
                 <div className="hint">
-                    Values accept the same {'${…}'} tokens as the body. Credential-like headers
-                    are stored encrypted and shown as {REDACTED} — leave the marker unchanged to
-                    keep the stored value.
+                    All header values are stored encrypted and shown as {REDACTED}.
+                    Leave the marker unchanged to keep a value, or replace it in full.
+                    Values accept the same {'${…}'} tokens as the body.
                 </div>
             </div>
 
@@ -484,9 +475,10 @@ function WebhookConfigFields({ config, setConfig }) {
                     value={config.bodyTemplate || ''}
                     placeholder={'{"text": "[${severity}] ${monitorName} — ${channelName}: ${message}"}'}
                     onChange={(e) => setConfig({ bodyTemplate: e.target.value })}
-                    {...TOKEN_TARGET_PROPS} />
-                <TokenChips tokens={WEBHOOK_BODY_TOKENS} inputRef={bodyRef}
-                    note={'Empty = the full alert payload as JSON. Values are JSON-escaped; '
+                    {...(bodyMasked ? {} : TOKEN_TARGET_PROPS)} />
+                <TokenChips tokens={bodyMasked ? [] : WEBHOOK_BODY_TOKENS} inputRef={bodyRef}
+                    note={`Stored encrypted. Leave ${REDACTED} unchanged to keep the template; `
+                        + 'replace it in full to edit it or insert tokens. Empty = the full alert payload as JSON. Values are JSON-escaped; '
                         + '${valueJson} is inserted raw.'} />
             </div>
 
