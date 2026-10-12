@@ -5,6 +5,8 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import java.util.List;
+
+import com.fasterxml.jackson.databind.JsonNode;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
@@ -37,7 +39,8 @@ class ActionMetadataRoundTripTest {
                 MockedStatic<MonitorService> monitors = mockStatic(MonitorService.class);
                 MockedStatic<MaintenanceWindowService> windows = mockStatic(MaintenanceWindowService.class)) {
             repository.when(() -> ActionRepository.getAction(1)).thenAnswer(i -> stored.get());
-            repository.when(() -> ActionRepository.listActions(null)).thenAnswer(i -> List.of(stored.get()));
+            Action target = new Action(); target.setId(7); target.setName("Escalation pager");
+            repository.when(() -> ActionRepository.listActions(null)).thenAnswer(i -> List.of(stored.get(), target));
             repository.when(() -> ActionRepository.updateAction(any(Action.class))).thenAnswer(i -> {
                 stored.set(i.getArgument(0));
                 return null;
@@ -52,8 +55,12 @@ class ActionMetadataRoundTripTest {
             assertEquals("Only the description changed", stored.get().getDescription());
             assertTrue(stored.get().getConfigJson().contains("encrypted-key"));
 
-            Action exported = Json.mapper().convertValue(
-                    ExportImportService.export().path("actions").get(0), Action.class);
+            JsonNode node = ExportImportService.export().path("actions").get(0);
+            assertEquals("Escalation pager", node.path("escalateToActionName").asText());
+            assertFalse(node.has("escalateToActionId"));
+            Action exported = Json.mapper().convertValue(node, Action.class);
+            assertNull(exported.getEscalateToActionId());
+            exported.setEscalateToActionId(7); // the portable name carries the same policy
             assertPolicy(exported);
             assertTrue(exported.getConfigJson().contains(ActionService.REDACTED));
             assertFalse(exported.getConfigJson().contains("encrypted-key"));
