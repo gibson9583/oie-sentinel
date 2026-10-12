@@ -596,7 +596,10 @@ export function ChannelActivityPanel({
         () => (ready ? getChannelActivity(channelId, { from, to, granularity }) : Promise.resolve(null)),
         [ready, channelId, from, to, granularity],
     );
-    const activity = api.data;
+    // useApi keeps prior data while refreshing. Only retain it for the
+    // same channel: a slow or failed switch must never relabel A's traffic
+    // with B's title. The response carries the channel that owns the series.
+    const activity = api.data && api.data.channelId === channelId ? api.data : null;
     const points = activity && Array.isArray(activity.points) ? activity.points : [];
 
     return (
