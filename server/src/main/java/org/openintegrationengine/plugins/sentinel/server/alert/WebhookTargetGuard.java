@@ -86,11 +86,9 @@ import java.util.Locale;
  *       (positive lookups are cached, and OIE runs under a security-manager
  *       -less default of 30 seconds) works against a per-query flip.</li>
  *   <li>Even a successful rebind yields a request the attacker cannot read
- *       the response to: the response body never leaves the server. It is
- *       recorded — truncated — only in the dispatch log's failure reason on a
- *       non-2xx status, which is readable by monitoring users. That is a real
- *       (narrow) exfiltration channel, which is why {@link WebhookAlertSender}
- *       caps that snippet hard.</li>
+ *       the response to: response bodies are never exposed in dispatch logs
+ *       or test-send results, including on non-2xx statuses. This does not
+ *       prevent unauthorized request side effects.</li>
  * </ul>
  *
  * <p>Static utility (private constructor) per the plugin's house style.</p>

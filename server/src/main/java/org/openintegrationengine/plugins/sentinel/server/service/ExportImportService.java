@@ -611,6 +611,16 @@ public final class ExportImportService {
             return entry.skipped("Already matches this server");
         }
 
+        if (!secrets.required.isEmpty()) {
+            // Dropping an unavailable body template can replace a carefully
+            // limited payload with the full alert; dropping an auth header can
+            // send it unauthenticated. Preserve the whole action until every
+            // exported secret can be kept or supplied explicitly.
+            return entry.skipped("Required secrets are not stored on this server: "
+                    + String.join(", ", secrets.required)
+                    + "; supply them in the import document or configure the action on this server before retrying");
+        }
+
         List<String> unresolved = new ArrayList<>();
         UnaryOperator<String> toId = value -> {
             Integer id = monitors.idOf(value);
@@ -833,8 +843,8 @@ public final class ExportImportService {
                     .append(" from the action already stored on this server. ");
         }
         if (!required.isEmpty()) {
-            note.append("Enter ").append(String.join(", ", required))
-                    .append(" on this server; until then this action cannot deliver.");
+            note.append("Supply ").append(String.join(", ", required))
+                    .append(" in the import document or configure the action on this server before retrying.");
         }
         return note.toString().trim();
     }
