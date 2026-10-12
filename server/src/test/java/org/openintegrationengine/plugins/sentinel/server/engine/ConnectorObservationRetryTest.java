@@ -26,8 +26,20 @@ class ConnectorObservationRetryTest {
     private Channel channel;
     private SentinelConnectorStatusListener listener;
     private boolean fail;
+    private final Deque<Runnable> scheduledRetries = new ArrayDeque<>();
+    private Object originalRetryExecutor;
+    private boolean originalRetryInFlight;
 
-    @BeforeEach void setup() {
+    @BeforeEach void setup() throws Exception {
+        // Capture work on the test thread, where the engine/repository static
+        // mocks apply. The Derby worker regression exercises the actual thread.
+        var retryExecutor = PendingConnectorObservations.class.getDeclaredField("retryExecutor");
+        retryExecutor.setAccessible(true); originalRetryExecutor = retryExecutor.get(null);
+        var retryInFlight = PendingConnectorObservations.class.getDeclaredField("retryInFlight");
+        retryInFlight.setAccessible(true); originalRetryInFlight = retryInFlight.getBoolean(null);
+        var executor = mock(java.util.concurrent.ExecutorService.class);
+        doAnswer(call -> { scheduledRetries.add(call.getArgument(0)); return null; }).when(executor).execute(any());
+        retryExecutor.set(null, executor); retryInFlight.setBoolean(null, false);
         channel = mock(Channel.class); when(channel.getMetaDataIds()).thenReturn(List.of(0)); deploy(deployed);
         engine = mock(EngineController.class); when(engine.getDeployedChannel(ID)).thenReturn(channel);
         when(engine.getDeployedIds()).thenReturn(Set.of(ID));
@@ -41,10 +53,14 @@ class ConnectorObservationRetryTest {
         listener = mock(SentinelConnectorStatusListener.class, CALLS_REAL_METHODS);
         CollectorState.getInstance().forgetChannel(ID);
     }
-    @AfterEach void cleanup() {
+    @AfterEach void cleanup() throws Exception {
         when(engine.getDeployedChannel(ID)).thenReturn(null); PendingConnectorObservations.flush();
         assertFalse(PendingConnectorObservations.isPending(ID, 0));
         CollectorState.getInstance().forgetChannel(ID); repository.close(); controllers.close();
+        var retryExecutor = PendingConnectorObservations.class.getDeclaredField("retryExecutor");
+        retryExecutor.setAccessible(true); retryExecutor.set(null, originalRetryExecutor);
+        var retryInFlight = PendingConnectorObservations.class.getDeclaredField("retryInFlight");
+        retryInFlight.setAccessible(true); retryInFlight.setBoolean(null, originalRetryInFlight);
     }
     @Test void singleLostTransitionIsRetriedWithoutEngineRedeliveryAndDirtyStateIsUnknown() {
         emit(ConnectionStatusEventType.CONNECTED, 90); fail = true; emit(ConnectionStatusEventType.DISCONNECTED, 60);
@@ -133,11 +149,17 @@ class ConnectorObservationRetryTest {
                     any(), any(java.util.function.BooleanSupplier.class)));
             leases.verify(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), anyInt(),
                     any(java.util.function.BooleanSupplier.class)), never());
+            assertEquals(1, scheduledRetries.size()); scheduledRetries.remove().run();
+            assertTrue(saved.isEmpty(), "failed background retry retains pending state");
             fail = false;
             SentinelLeadership.heartbeat(998L); assertTrue(saved.isEmpty(), "stopped generation cannot retry");
-            SentinelLeadership.heartbeat(999L); assertEquals(1, saved.size());
+            assertTrue(scheduledRetries.isEmpty());
+            SentinelLeadership.heartbeat(999L); assertTrue(saved.isEmpty(), "heartbeat only schedules retry");
+            assertEquals(1, scheduledRetries.size()); scheduledRetries.remove().run();
+            assertEquals(1, saved.size());
+            SentinelLeadership.heartbeat(999L);
             leases.verify(() -> NodeLeaseRepository.refreshNodePresence(anyString(), anyString(), eq(90),
-                    any(), any(java.util.function.BooleanSupplier.class)), times(2));
+                    any(), any(java.util.function.BooleanSupplier.class)), times(3));
             leases.verify(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), eq(90),
                     any(java.util.function.BooleanSupplier.class)));
         } finally {
@@ -146,6 +168,22 @@ class ConnectorObservationRetryTest {
                 field.set(null, entry.getValue());
             }
         }
+    }
+
+    @Test void scheduledRetryCannotAdoptANewerLifecycleGeneration() throws Exception {
+        fail = true; emit(ConnectionStatusEventType.DISCONNECTED, 30); fail = false;
+        var generation = SentinelLeadership.class.getDeclaredField("lifecycleGeneration");
+        generation.setAccessible(true); long original = generation.getLong(null);
+        try {
+            PendingConnectorObservations.requestFlush(original);
+            assertEquals(1, scheduledRetries.size());
+            generation.setLong(null, original + 1);
+            scheduledRetries.remove().run();
+            assertTrue(saved.isEmpty()); assertTrue(PendingConnectorObservations.isPending(ID, 0));
+            PendingConnectorObservations.requestFlush(original + 1);
+            assertEquals(1, scheduledRetries.size()); scheduledRetries.remove().run();
+            assertEquals(1, saved.size()); assertFalse(PendingConnectorObservations.isPending(ID, 0));
+        } finally { generation.setLong(null, original); }
     }
 
     @org.junit.jupiter.params.ParameterizedTest

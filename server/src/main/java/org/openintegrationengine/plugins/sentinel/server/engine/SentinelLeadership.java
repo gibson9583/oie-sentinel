@@ -325,6 +325,7 @@ public final class SentinelLeadership {
     public static synchronized void stopHeartbeat() {
         standingDown = true;
         lifecycleGeneration++;
+        PendingConnectorObservations.stopRetryWorker();
 
         ScheduledExecutorService executor = heartbeatExecutor;
         heartbeatExecutor = null;
@@ -446,8 +447,8 @@ public final class SentinelLeadership {
             // and auto-resolve its incident after a presence lease expires.
             heartbeatNodePresence(databaseNow, generation);
             if (!isCurrentGeneration(generation)) return;
-            PendingConnectorObservations.flush();
             heartbeatObservationHealth(generation);
+            PendingConnectorObservations.requestFlush(generation);
             if (!isCurrentGeneration(generation)) {
                 return;
             }
@@ -697,6 +698,10 @@ public final class SentinelLeadership {
 
     static long connectorObservationGeneration() {
         return lifecycleGeneration;
+    }
+
+    static boolean isConnectorObservationGenerationCurrent(long generation) {
+        return isCurrentGeneration(generation);
     }
 
     /** Serializes a completed observation's local publication with stop/restart. */

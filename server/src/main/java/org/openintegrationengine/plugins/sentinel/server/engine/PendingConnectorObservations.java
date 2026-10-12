@@ -3,6 +3,11 @@ package org.openintegrationengine.plugins.sentinel.server.engine;
 
 import java.time.Instant;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import com.mirth.connect.donkey.model.event.ConnectionStatusEventType;
 import com.mirth.connect.donkey.server.channel.Channel;
@@ -12,12 +17,15 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ConnectorStatusEv
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Latest uncommitted state per deployed connector, retried by the existing node heartbeat. */
+/** Latest uncommitted state per deployed connector, retried without blocking node heartbeats. */
 public final class PendingConnectorObservations {
     private static final Logger log = LoggerFactory.getLogger(PendingConnectorObservations.class);
     private record Identity(String channelId, int metadataId) { }
     private static final ConcurrentHashMap<Identity, ConnectorStatusEvent> pending = new ConcurrentHashMap<>();
     private static final ReentrantLock writer = new ReentrantLock();
+    private static final Object retryWorkerLock = new Object();
+    private static ExecutorService retryExecutor;
+    private static boolean retryInFlight;
     private PendingConnectorObservations() { }
 
     static void observe(ConnectorStatusEvent row) {
@@ -55,6 +63,46 @@ public final class PendingConnectorObservations {
 
     static boolean hasPending() { return !pending.isEmpty(); }
 
+    /** One worker and no queued retries, including while an old lifecycle's JDBC call is stuck. */
+    static void requestFlush(long generation) {
+        synchronized (retryWorkerLock) {
+            if (!hasPending() || !SentinelLeadership.isConnectorObservationGenerationCurrent(generation)) return;
+            if (retryExecutor != null && retryExecutor.isShutdown() && !retryExecutor.isTerminated()) return;
+            if (retryInFlight) return;
+            if (retryExecutor == null || retryExecutor.isTerminated()) {
+                retryExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                        new SynchronousQueue<>(), runnable -> {
+                            Thread thread = new Thread(runnable, "sentinel-observation-retry");
+                            thread.setDaemon(true);
+                            return thread;
+                        });
+            }
+            retryInFlight = true;
+            try {
+                retryExecutor.execute(() -> {
+                    try {
+                        flush(null, generation);
+                    } finally {
+                        synchronized (retryWorkerLock) { retryInFlight = false; }
+                    }
+                });
+            } catch (RejectedExecutionException busyOrStopped) {
+                // A prior task may be leaving the executor after clearing its flag.
+                // The pending map retains the work for a later heartbeat.
+                retryInFlight = false;
+            }
+        }
+    }
+
+    static void stopRetryWorker() {
+        synchronized (retryWorkerLock) {
+            if (retryExecutor != null) retryExecutor.shutdownNow();
+            // Keep the executor until it terminates: interrupt-insensitive JDBC
+            // must not accumulate one blocked worker on each plugin restart.
+            // Never join here: publication acquires SentinelLeadership's monitor.
+        }
+    }
+
     /**
      * Coalescing bounds retention to one latest observation per deployed identity;
      * undeploy/redeploy removes obsolete entries on every heartbeat. Only one
@@ -64,14 +112,19 @@ public final class PendingConnectorObservations {
     static void flush() { flush(null); }
 
     private static void flush(Identity only) {
+        flush(only, SentinelLeadership.connectorObservationGeneration());
+    }
+
+    private static void flush(Identity only, long generation) {
+        if (!SentinelLeadership.isConnectorObservationGenerationCurrent(generation)) return;
         if (pending.isEmpty() || !writer.tryLock()) return;
         try {
-            long generation = SentinelLeadership.connectorObservationGeneration();
             ConnectorStatusEvent selected = only == null ? null : pending.get(only);
             if (only != null && selected == null) return;
             var entries = only == null ? pending.entrySet()
                     : java.util.Set.of(java.util.Map.entry(only, selected));
             for (var entry : entries) {
+                if (!SentinelLeadership.isConnectorObservationGenerationCurrent(generation)) return;
                 Identity key = entry.getKey();
                 ConnectorStatusEvent row = entry.getValue();
                 try {
