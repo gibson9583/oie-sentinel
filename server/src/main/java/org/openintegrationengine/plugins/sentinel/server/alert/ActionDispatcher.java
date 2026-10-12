@@ -13,6 +13,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -690,6 +691,10 @@ public final class ActionDispatcher {
     private static void maybeEscalate(Action source, Map<Integer, Action> byId,
             List<ActionDispatchLog> allRows, Set<Integer> notifiedThisPass,
             AlertEvent event, AlertPayload payload, Instant now) {
+        // A source can be edited/disabled while earlier fan-out transports run.
+        if (actionDecision(source, payload, false) != ActionDecision.ALLOW) {
+            return;
+        }
         if (source.getEscalateAfterSeconds() == null || source.getEscalateToActionId() == null) {
             return;
         }
@@ -708,6 +713,9 @@ public final class ActionDispatcher {
         long threshold = 0;
 
         for (int hop = 1; hop <= MAX_ESCALATION_HOPS; hop++) {
+            if (actionDecision(current, payload, false) != ActionDecision.ALLOW) {
+                return;
+            }
             Integer after = current.getEscalateAfterSeconds();
             Integer targetId = current.getEscalateToActionId();
             if (after == null || targetId == null) {
@@ -1293,6 +1301,10 @@ public final class ActionDispatcher {
      */
     private static boolean gatedAttempt(Action action, AlertEvent event, AlertPayload payload,
             boolean resolvedPhase) {
+        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
+        if (actionPolicy != ActionDecision.ALLOW) {
+            return actionPolicy == ActionDecision.INAPPLICABLE;
+        }
         // A fan-out or repeat/escalation decision can spend time on repository
         // reads before reaching this point. Re-read policy per actual attempt
         // so a window activated while the task was queued takes effect before
@@ -1488,8 +1500,62 @@ public final class ActionDispatcher {
         }
     }
 
+    private enum ActionDecision { ALLOW, INAPPLICABLE, RETRY }
+
+    /** A snapshot authorizes I/O only while the persisted delivery definition still agrees. */
+    private static ActionDecision actionDecision(Action expected, AlertPayload payload, boolean resolvedPhase) {
+        try {
+            Action current = expected == null || expected.getId() == null ? null
+                    : ActionRepository.getAction(expected.getId());
+            if (current == null || !current.isEnabled()
+                    || !firesOnPhase(current.getOperationMode(), resolvedPhase)
+                    || !ActionConditionMatcher.matches(current,
+                            withEventType(payload, resolvedPhase ? "RESOLVED" : "PROBLEM"))) {
+                return ActionDecision.INAPPLICABLE;
+            }
+            // Do not splice new credentials/routing into a decision whose
+            // ceiling, repeat budget, escalation, or rollup used old settings.
+            // The durable edge is retried from the fresh definition next tick.
+            return sameDeliveryDefinition(expected, current) ? ActionDecision.ALLOW : ActionDecision.RETRY;
+        } catch (Exception e) {
+            log.warn("Cannot verify current configuration for action {}; deferring delivery",
+                    expected != null ? expected.getId() : null, e);
+            return ActionDecision.RETRY;
+        }
+    }
+
+    static void verifyActionAtTransport(Action expected, AlertPayload payload, boolean resolvedPhase) {
+        ActionDecision decision = actionDecision(expected, payload, resolvedPhase);
+        if (decision == ActionDecision.INAPPLICABLE) {
+            throw new ActionDiscardedException();
+        }
+        if (decision != ActionDecision.ALLOW) {
+            throw new DispatchDeferredException("Action configuration changed or could not be read before delivery");
+        }
+    }
+
+    private static boolean sameDeliveryDefinition(Action left, Action right) {
+        return Objects.equals(left.getId(), right.getId())
+                && left.isEnabled() == right.isEnabled()
+                && Objects.equals(left.getName(), right.getName())
+                && left.getActionType() == right.getActionType()
+                && left.getOperationMode() == right.getOperationMode()
+                && Objects.equals(left.getConditionJson(), right.getConditionJson())
+                && Objects.equals(left.getConfigJson(), right.getConfigJson())
+                && Objects.equals(left.getRepeatIntervalSeconds(), right.getRepeatIntervalSeconds())
+                && Objects.equals(left.getMaxRepeats(), right.getMaxRepeats())
+                && Objects.equals(left.getMaxNotificationsPerWindow(), right.getMaxNotificationsPerWindow())
+                && Objects.equals(left.getRollupWindowSeconds(), right.getRollupWindowSeconds())
+                && Objects.equals(left.getEscalateAfterSeconds(), right.getEscalateAfterSeconds())
+                && Objects.equals(left.getEscalateToActionId(), right.getEscalateToActionId());
+    }
+
+    private static final class ActionDiscardedException extends DispatchDeferredException {
+        private ActionDiscardedException() { super("Action no longer subscribes to this notification"); }
+    }
+
     /** Local capacity/policy failure before any send; leave its durable edge pending. */
-    static final class DispatchDeferredException extends RuntimeException {
+    static class DispatchDeferredException extends RuntimeException {
         DispatchDeferredException(String message) {
             super(message);
         }
@@ -1617,6 +1683,10 @@ public final class ActionDispatcher {
      */
     private static boolean attempt(Action action, AlertEvent event, AlertPayload payload, String marker,
             boolean[] transportAttempted, boolean resolvedPhase) {
+        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
+        if (actionPolicy != ActionDecision.ALLOW) {
+            return actionPolicy == ActionDecision.INAPPLICABLE;
+        }
         // ceilingVerdict can perform an uncached history scan. Recheck after
         // that work, at the final transport boundary, so an intervening
         // window/dependency/lifecycle change cannot leak a stale send. The
@@ -1648,12 +1718,16 @@ public final class ActionDispatcher {
                                 throw new DispatchDeferredException(
                                         "Lifecycle, notification policy, or leadership changed before delivery");
                             }
+                            verifyActionAtTransport(action, payload, resolvedPhase);
                             transportAttempted[0] = true;
                         } finally {
                             dispatchFence.remove();
                         }
                     });
             success = true;
+        } catch (ActionDiscardedException discarded) {
+            transportAttempted[0] = false;
+            return true; // current configuration no longer subscribes to this edge
         } catch (DispatchDeferredException deferred) {
             transportAttempted[0] = false;
             log.debug("Delivery deferred for action {} on alert event {}: {}",
