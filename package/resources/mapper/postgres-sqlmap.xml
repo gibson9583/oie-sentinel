@@ -698,6 +698,12 @@
           AND expires_time &gt; (clock_timestamp() AT TIME ZONE 'UTC')
     </select>
 
+    <select id="listHealthyObservationNodeIds" resultType="string">
+        SELECT node_id FROM sentinel_node_lease
+        WHERE lease_name LIKE 'sentinel-observation-%'
+          AND expires_time &gt; (clock_timestamp() AT TIME ZONE 'UTC')
+    </select>
+
     <select id="lockNodeLeaseFence" parameterType="map" resultType="long" useCache="false" flushCache="true">
         SELECT lease_epoch FROM sentinel_node_lease
         WHERE lease_name = #{leaseName} AND node_id = #{nodeId}

@@ -22,6 +22,7 @@ class ConnectorObservationRetryTest {
     private MockedStatic<ControllerFactory> controllers;
     private MockedStatic<ConnectorStatusRepository> repository;
     private EngineController engine;
+    private ControllerFactory factory;
     private Channel channel;
     private SentinelConnectorStatusListener listener;
     private boolean fail;
@@ -29,7 +30,8 @@ class ConnectorObservationRetryTest {
     @BeforeEach void setup() {
         channel = mock(Channel.class); when(channel.getMetaDataIds()).thenReturn(List.of(0)); deploy(deployed);
         engine = mock(EngineController.class); when(engine.getDeployedChannel(ID)).thenReturn(channel);
-        ControllerFactory factory = mock(ControllerFactory.class); when(factory.createEngineController()).thenReturn(engine);
+        when(engine.getDeployedIds()).thenReturn(Set.of(ID));
+        factory = mock(ControllerFactory.class); when(factory.createEngineController()).thenReturn(engine);
         controllers = mockStatic(ControllerFactory.class); controllers.when(ControllerFactory::getFactory).thenReturn(factory);
         repository = mockStatic(ConnectorStatusRepository.class);
         repository.when(() -> ConnectorStatusRepository.insertConnectorStatusEvent(any())).thenAnswer(c -> {
@@ -49,6 +51,7 @@ class ConnectorObservationRetryTest {
         assertEquals(1, saved.size()); assertTrue(PendingConnectorObservations.isPending(ID, 0));
         repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(ID)).thenReturn(List.copyOf(saved));
         try (var leases = mockStatic(NodeLeaseRepository.class)) {
+            leases.when(NodeLeaseRepository::listHealthyObservationNodeIds).thenReturn(Set.of(SentinelLeadership.nodeId()));
             leases.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(ID))
                     .thenReturn(Map.of(0, Map.of(SentinelLeadership.nodeId(), deployed)));
             Monitor monitor = new Monitor(); monitor.setConfigJson("{\"alertOnStates\":[\"DISCONNECTED\"]}");
@@ -111,7 +114,7 @@ class ConnectorObservationRetryTest {
         assertEquals(ConnectionStatusEventType.CONNECTED, CollectorState.getInstance().getConnectorState(ID, 0).state);
     }
 
-    @Test void heartbeatRetriesPendingBeforeRenewingPresenceAndStoppedGenerationDoesNothing() throws Exception {
+    @Test void heartbeatKeepsDeploymentPresenceWhilePendingAndPublishesHealthAfterRetry() throws Exception {
         fail = true; emit(ConnectionStatusEventType.DISCONNECTED, 30);
         when(engine.getDeployedIds()).thenReturn(Set.of(ID));
         Map<String, Object> original = new LinkedHashMap<>();
@@ -127,12 +130,16 @@ class ConnectorObservationRetryTest {
             leases.when(() -> NodeLeaseRepository.getNodeLease("sentinel-engine")).thenReturn(leader);
             SentinelLeadership.heartbeat(999L);
             leases.verify(() -> NodeLeaseRepository.refreshNodePresence(anyString(), anyString(), anyInt(),
-                    any(), any(java.util.function.BooleanSupplier.class)), never());
+                    any(), any(java.util.function.BooleanSupplier.class)));
+            leases.verify(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), anyInt(),
+                    any(java.util.function.BooleanSupplier.class)), never());
             fail = false;
             SentinelLeadership.heartbeat(998L); assertTrue(saved.isEmpty(), "stopped generation cannot retry");
             SentinelLeadership.heartbeat(999L); assertEquals(1, saved.size());
             leases.verify(() -> NodeLeaseRepository.refreshNodePresence(anyString(), anyString(), eq(90),
-                    any(), any(java.util.function.BooleanSupplier.class)));
+                    any(), any(java.util.function.BooleanSupplier.class)), times(2));
+            leases.verify(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), eq(90),
+                    any(java.util.function.BooleanSupplier.class)));
         } finally {
             for (var entry : original.entrySet()) {
                 var field = SentinelLeadership.class.getDeclaredField(entry.getKey()); field.setAccessible(true);
@@ -163,7 +170,9 @@ class ConnectorObservationRetryTest {
                     SentinelLeadership.stopHeartbeat();
                     if (redeploy) deploy(now.minusSeconds(10));
                     Thread restart = new Thread(() -> {
-                        try (var workerLeases = mockStatic(NodeLeaseRepository.class)) {
+                        try (var workerLeases = mockStatic(NodeLeaseRepository.class);
+                                var workerControllers = mockStatic(ControllerFactory.class)) {
+                            workerControllers.when(ControllerFactory::getFactory).thenReturn(factory);
                             workerLeases.when(NodeLeaseRepository::getDatabaseTime).thenReturn(now);
                             var other = new org.openintegrationengine.plugins.sentinel.shared.model.NodeLease();
                             other.setNodeId("other-node"); other.setLeaseEpoch(5L); other.setExpiresTime(now.plusSeconds(90));

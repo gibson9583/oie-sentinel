@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import org.apache.ibatis.session.SqlSession;
 import org.slf4j.Logger;
@@ -116,6 +117,15 @@ public final class NodeLeaseRepository {
         }
     }
 
+    /**
+     * Nodes whose connector-observation stream has no known uncommitted
+     * transition. This is independent of deployment presence: stale telemetry
+     * makes a deployed connector unknown, never absent from the inventory.
+     */
+    public static Set<String> listHealthyObservationNodeIds() {
+        return activeDeploymentIds("listHealthyObservationNodeIds", Map.of());
+    }
+
     /** The cluster deployment union, published atomically with each node's presence lease. */
     public static Set<String> listActiveDeployedChannelIds() {
         return activeDeploymentIds("listActiveDeployedChannelIds", Map.of());
@@ -179,6 +189,27 @@ public final class NodeLeaseRepository {
     public static boolean refreshNodePresence(String leaseName, String nodeId, int leaseSeconds,
             Map<String, ChannelDeployment> deployedChannels, BooleanSupplier stillCurrent) {
         Map<String, ChannelDeployment> channels = Map.copyOf(deployedChannels);
+        return refreshOwnedLease(leaseName, nodeId, leaseSeconds, stillCurrent, session -> {
+            session.delete(stmt("deleteChannelPresenceByNode"), Map.of("nodeId", nodeId));
+            for (Map.Entry<String, ChannelDeployment> channel : channels.entrySet()) {
+                for (Integer metadataId : channel.getValue().metadataIds()) {
+                    session.insert(stmt("insertChannelPresence"), Map.of("channelId", channel.getKey(),
+                            "nodeId", nodeId, "metadataId", metadataId,
+                            "deployedTime", Timestamp.from(channel.getValue().deployedTime())));
+                }
+            }
+        });
+    }
+
+    /** Publishes observation health without mutating the node's deployment inventory. */
+    public static boolean refreshObservationHealth(String leaseName, String nodeId, int leaseSeconds,
+            BooleanSupplier stillCurrentAndHealthy) {
+        return refreshOwnedLease(leaseName, nodeId, leaseSeconds, stillCurrentAndHealthy, session -> { });
+    }
+
+    /** Renew/acquire a node-owned lease and atomically publish its associated state. */
+    private static boolean refreshOwnedLease(String leaseName, String nodeId, int leaseSeconds,
+            BooleanSupplier stillCurrent, Consumer<SqlSession> publication) {
         SqlSession session = SqlConfig.getInstance().getSqlSessionManager().openSession(false);
         try {
             Map<String, Object> key = Map.of("leaseName", leaseName);
@@ -191,7 +222,7 @@ public final class NodeLeaseRepository {
             } else {
                 NodeLease current = buildNodeLease(row);
                 if (!nodeId.equals(current.getNodeId()) || current.getLeaseEpoch() == null) {
-                    throw new IllegalStateException("Node-presence lease is owned by another node");
+                    throw new IllegalStateException("Node-owned lease is owned by another node");
                 }
                 epoch = current.getLeaseEpoch();
                 Map<String, Object> renew = Map.of("leaseName", leaseName, "nodeId", nodeId,
@@ -204,20 +235,13 @@ public final class NodeLeaseRepository {
                     int changed = session.update(stmt("stealExpiredNodeLease"), Map.of(
                             "leaseName", leaseName, "nodeId", nodeId,
                             "expectedLeaseEpoch", epoch, "leaseSeconds", leaseSeconds));
-                    if (changed != 1) throw new IllegalStateException("Node presence changed during publication");
+                    if (changed != 1) throw new IllegalStateException("Node-owned lease changed during publication");
                     epoch++;
                 }
             }
             LeaseFence fence = new LeaseFence(leaseName, nodeId, epoch);
             requireFence(session, fence);
-            session.delete(stmt("deleteChannelPresenceByNode"), Map.of("nodeId", nodeId));
-            for (Map.Entry<String, ChannelDeployment> channel : channels.entrySet()) {
-                for (Integer metadataId : channel.getValue().metadataIds()) {
-                    session.insert(stmt("insertChannelPresence"), Map.of("channelId", channel.getKey(),
-                            "nodeId", nodeId, "metadataId", metadataId,
-                            "deployedTime", Timestamp.from(channel.getValue().deployedTime())));
-                }
-            }
+            publication.accept(session);
             requireFence(session, fence);
             if (!stillCurrent.getAsBoolean()) {
                 session.rollback();
@@ -231,7 +255,7 @@ public final class NodeLeaseRepository {
             } catch (Exception rollback) {
                 error.addSuppressed(rollback);
             }
-            throw new RepositoryException("Failed to atomically publish node presence and channel inventory", error);
+            throw new RepositoryException("Failed to atomically publish node-owned lease " + leaseName, error);
         } finally {
             session.close();
         }

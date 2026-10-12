@@ -54,7 +54,11 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * on a node that happens not to host or observe the failing connector cannot
  * hide the failure. Rows written before node identities existed use the
  * reserved {@code legacy} identity. Rows without the current runtime
- * deployment marker remain unknown until a fresh state event arrives.</p>
+ * deployment marker remain unknown until a fresh state event arrives. A
+ * separate observation-health lease must also be live: an uncommitted
+ * transition invalidates telemetry without removing deployed identities.
+ * Nodes running an older plugin without this lease remain unknown until
+ * upgraded, rather than having their stale readings trusted.</p>
  *
  * <h2>Rollup</h2>
  *
@@ -207,6 +211,7 @@ public final class ConnectionStatusEvaluator {
         if (connectorNodes.isEmpty()) {
             return new ChannelEvaluation(evaluateStates(monitor, now, List.of()), connectorNodes.keySet());
         }
+        Set<String> healthyNodes = NodeLeaseRepository.listHealthyObservationNodeIds();
         List<ConnectorStatusEvent> persisted =
                 ConnectorStatusRepository.listLatestConnectorStatusEvents(channelId);
         List<ConnectorStatusEvent> current = new ArrayList<>();
@@ -215,6 +220,9 @@ public final class ConnectionStatusEvaluator {
                 continue;
             }
             String nodeId = normalizedNodeId(event.getNodeId());
+            if (!healthyNodes.contains(nodeId)) {
+                continue; // retain its deployment below, but do not trust stale telemetry
+            }
             if (nodeId.equals(SentinelLeadership.nodeId())
                     && PendingConnectorObservations.isPending(channelId, event.getMetadataId())) {
                 continue; // persisted state is known to precede an uncommitted transition
