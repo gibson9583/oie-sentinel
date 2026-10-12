@@ -138,6 +138,8 @@ class ConnectionStatusEvaluatorTest {
                     .thenReturn(new ArrayList<>(latestEvents));
             Map<Integer, Set<String>> runtime = new java.util.HashMap<>();
             connectorNames.keySet().forEach(id -> runtime.put(id, deployingNodes));
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(runtime, Instant.EPOCH));
             return ConnectionStatusEvaluator.evaluate(monitor(configJson), CHANNEL_ID, NOW);
         }
@@ -190,6 +192,8 @@ class ConnectionStatusEvaluatorTest {
         seedNode("node-a", 1, "CONNECTED", NOW.minusSeconds(60));
         try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
                 MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                     .thenReturn(deployments(Map.of(0, Set.of("node-a", "node-b"), 1, Set.of("node-a")), Instant.EPOCH));
             repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
@@ -209,6 +213,8 @@ class ConnectionStatusEvaluatorTest {
                 MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
                 MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
             channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                     .thenReturn(deployments(Map.of(0, Set.of("node-b"), 1, Set.of("node-b")), Instant.EPOCH));
             repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
@@ -227,6 +233,8 @@ class ConnectionStatusEvaluatorTest {
         latestEvents.get(0).setDeploymentTime(oldDeployment);
         try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
                 MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                     .thenReturn(Map.of(0, Map.of("node-a", newDeployment)));
             repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
@@ -248,6 +256,8 @@ class ConnectionStatusEvaluatorTest {
         latestEvents.get(0).setDeploymentTime(oldDeployment);
         try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
                 MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                     .thenReturn(Map.of(0, Map.of("node-a", backwardDeployment)));
             repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
@@ -273,6 +283,8 @@ class ConnectionStatusEvaluatorTest {
         latestEvents.get(0).setDeploymentTime(deployment);
         try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class);
                 MockedStatic<ConnectorStatusRepository> repository = Mockito.mockStatic(ConnectorStatusRepository.class)) {
+            nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
             nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                     .thenReturn(Map.of(0, Map.of("node-a", deployment)));
             repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
@@ -574,7 +586,9 @@ class ConnectionStatusEvaluatorTest {
                 channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
                 repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
                         .thenReturn(new ArrayList<>(latestEvents));
-                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
+                nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
 
                 List<ConnectorEvaluation> evaluations =
                         ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW);
@@ -598,7 +612,9 @@ class ConnectionStatusEvaluatorTest {
                 channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
                 repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
                         .thenReturn(new ArrayList<>(latestEvents));
-                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
+                nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-a")), Instant.EPOCH));
 
                 ConnectorEvaluation evaluation = ConnectionStatusEvaluator
                         .evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0);
@@ -623,7 +639,9 @@ class ConnectionStatusEvaluatorTest {
                 channelSingleton.when(ChannelController::getInstance).thenReturn(channels);
                 repository.when(() -> ConnectorStatusRepository.listLatestConnectorStatusEvents(CHANNEL_ID))
                         .thenReturn(new ArrayList<>(latestEvents));
-                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-b")), Instant.EPOCH));
+                nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID)).thenReturn(deployments(Map.of(0, Set.of("node-b")), Instant.EPOCH));
 
                 ConnectorEvaluation evaluation = ConnectionStatusEvaluator
                         .evaluate(monitor("{}"), CHANNEL_ID, NOW).get(0);
@@ -635,7 +653,9 @@ class ConnectionStatusEvaluatorTest {
         @DisplayName("an unresolved runtime inventory fails the channel instead of using stale rows")
         void unresolvedConnectorInventoryFailsClosed() {
             try (MockedStatic<NodeLeaseRepository> nodes = Mockito.mockStatic(NodeLeaseRepository.class)) {
-                nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
+                nodes.when(NodeLeaseRepository::listHealthyObservationNodeIds)
+                    .thenReturn(Set.of("node-a", "node-b", "legacy", "retired-node"));
+            nodes.when(() -> NodeLeaseRepository.listActiveConnectorDeployments(CHANNEL_ID))
                         .thenThrow(new IllegalStateException("inventory unavailable"));
                 assertThrows(IllegalStateException.class,
                         () -> ConnectionStatusEvaluator.evaluate(monitor("{}"), CHANNEL_ID, NOW));

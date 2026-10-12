@@ -865,6 +865,11 @@
         WHERE lease_name LIKE 'sentinel-presence-%' AND expires_time &gt; CURRENT_TIMESTAMP
     </select>
 
+    <select id="listHealthyObservationNodeIds" resultType="string">
+        SELECT node_id FROM sentinel_node_lease
+        WHERE lease_name LIKE 'sentinel-observation-%' AND expires_time &gt; CURRENT_TIMESTAMP
+    </select>
+
     <select id="lockNodeLeaseFence" parameterType="map" resultType="long" useCache="false" flushCache="true">
         SELECT lease_epoch FROM sentinel_node_lease
         WHERE lease_name = #{leaseName} AND node_id = #{nodeId}

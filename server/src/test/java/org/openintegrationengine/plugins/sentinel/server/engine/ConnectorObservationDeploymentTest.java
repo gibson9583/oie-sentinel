@@ -36,6 +36,7 @@ class ConnectorObservationDeploymentTest {
         // class's consumer thread; its queue/lifecycle is not involved here.
         listener = mock(SentinelConnectorStatusListener.class, CALLS_REAL_METHODS);
         channel = mock(Channel.class);
+        when(channel.getMetaDataIds()).thenReturn(java.util.List.of(0));
         deployAt(now.minusSeconds(60));
         EngineController engine = mock(EngineController.class);
         when(engine.getDeployedChannel(CHANNEL)).thenReturn(channel);

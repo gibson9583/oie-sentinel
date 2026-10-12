@@ -287,6 +287,8 @@ public final class CollectorState {
         public final ConnectionStatusEventType state;
         public final Instant since;
         public final Instant deploymentTime;
+        /** Latest same-state observation, separate from the transition's onset. */
+        final Instant observedThrough;
 
         public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since) {
             this(channelId, metadataId, state, since, null);
@@ -294,11 +296,17 @@ public final class CollectorState {
 
         public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
                 Instant deploymentTime) {
+            this(channelId, metadataId, state, since, deploymentTime, since);
+        }
+
+        ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+                Instant deploymentTime, Instant observedThrough) {
             this.channelId = channelId;
             this.metadataId = metadataId;
             this.state = state;
             this.since = since;
             this.deploymentTime = deploymentTime;
+            this.observedThrough = observedThrough;
         }
     }
 
@@ -347,8 +355,13 @@ public final class CollectorState {
 
     public void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
             Instant deploymentTime) {
+        putConnectorState(channelId, metadataId, state, since, deploymentTime, since);
+    }
+
+    void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+            Instant deploymentTime, Instant observedThrough) {
         connectorStates
                 .computeIfAbsent(channelId, id -> new ConcurrentHashMap<>())
-                .put(metadataId, new ConnectorState(channelId, metadataId, state, since, deploymentTime));
+                .put(metadataId, new ConnectorState(channelId, metadataId, state, since, deploymentTime, observedThrough));
     }
 }

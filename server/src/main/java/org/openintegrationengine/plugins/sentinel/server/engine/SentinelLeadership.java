@@ -100,6 +100,9 @@ public final class SentinelLeadership {
     /** Namespace for per-node liveness leases consumed by connector-state union evaluation. */
     private static final String PRESENCE_LEASE_PREFIX = "sentinel-presence-";
 
+    /** Separate confidence lease; expiry must never erase a deployed connector. */
+    private static final String OBSERVATION_LEASE_PREFIX = "sentinel-observation-";
+
     /** Lease duration; see class Javadoc for why 90 and not less. */
     private static final int LEASE_SECONDS = 90;
 
@@ -129,6 +132,7 @@ public final class SentinelLeadership {
 
     /** Stable bounded lease key for this node's liveness row. */
     private static final String PRESENCE_LEASE_NAME = presenceLeaseName(NODE_ID);
+    private static final String OBSERVATION_LEASE_NAME = OBSERVATION_LEASE_PREFIX + stableDigest(NODE_ID);
 
     /**
      * Set by {@link #startHeartbeat()} and never cleared — a one-way latch, not
@@ -321,6 +325,7 @@ public final class SentinelLeadership {
     public static synchronized void stopHeartbeat() {
         standingDown = true;
         lifecycleGeneration++;
+        PendingConnectorObservations.stopRetryWorker();
 
         ScheduledExecutorService executor = heartbeatExecutor;
         heartbeatExecutor = null;
@@ -342,6 +347,7 @@ public final class SentinelLeadership {
         }
 
         standDown();
+        releaseObservationHealth();
         releaseNodePresence();
     }
 
@@ -380,16 +386,24 @@ public final class SentinelLeadership {
 
     /** Expires this node's union-membership row on an orderly stop. */
     private static void releaseNodePresence() {
+        releaseOwnedLease(PRESENCE_LEASE_NAME, "deployment presence");
+    }
+
+    private static void releaseObservationHealth() {
+        releaseOwnedLease(OBSERVATION_LEASE_NAME, "connector observation health");
+    }
+
+    private static void releaseOwnedLease(String leaseName, String purpose) {
         try {
-            NodeLease presence = NodeLeaseRepository.getNodeLease(PRESENCE_LEASE_NAME);
+            NodeLease presence = NodeLeaseRepository.getNodeLease(leaseName);
             if (presence != null && NODE_ID.equals(presence.getNodeId())
                     && presence.getLeaseEpoch() != null) {
                 NodeLeaseRepository.releaseNodeLease(
-                        PRESENCE_LEASE_NAME, NODE_ID, presence.getLeaseEpoch());
+                        leaseName, NODE_ID, presence.getLeaseEpoch());
             }
         } catch (Throwable t) {
-            log.warn("Sentinel node {} could not release its connector-state presence; it expires within {}s",
-                    NODE_ID, LEASE_SECONDS, t);
+            log.warn("Sentinel node {} could not release its {}; it expires within {}s",
+                    NODE_ID, purpose, LEASE_SECONDS, t);
         }
     }
 
@@ -428,7 +442,13 @@ public final class SentinelLeadership {
             if (!isCurrentGeneration(generation)) {
                 return;
             }
+            // Runtime membership is independent of telemetry confidence. A
+            // missing observation must never look like an undeployed channel
+            // and auto-resolve its incident after a presence lease expires.
             heartbeatNodePresence(databaseNow, generation);
+            if (!isCurrentGeneration(generation)) return;
+            heartbeatObservationHealth(generation);
+            PendingConnectorObservations.requestFlush(generation);
             if (!isCurrentGeneration(generation)) {
                 return;
             }
@@ -508,8 +528,25 @@ public final class SentinelLeadership {
         }
     }
 
+    /** Publish health only after retry completion, without removing deployment presence. */
+    private static void heartbeatObservationHealth(long generation) {
+        if (!isCurrentGeneration(generation)) return;
+        if (PendingConnectorObservations.hasPending()) {
+            NodeLease health = NodeLeaseRepository.getNodeLease(OBSERVATION_LEASE_NAME);
+            if (!isCurrentGeneration(generation)) return;
+            if (health != null && NODE_ID.equals(health.getNodeId()) && health.getLeaseEpoch() != null) {
+                NodeLeaseRepository.releaseNodeLease(OBSERVATION_LEASE_NAME, NODE_ID, health.getLeaseEpoch());
+            }
+            return;
+        }
+        if (NodeLeaseRepository.refreshObservationHealth(OBSERVATION_LEASE_NAME, NODE_ID, LEASE_SECONDS,
+                () -> isCurrentGeneration(generation) && !PendingConnectorObservations.hasPending())) {
+            releasePresenceWrittenByStalePass(generation);
+        }
+    }
+
     /**
-     * Cleans up a presence write that completed after this lifecycle stopped.
+     * Cleans up a presence or health write that completed after this lifecycle stopped.
      * The class monitor serializes the decision with a possible restart: if a
      * newer lifecycle already began, it deliberately adopts the same stable
      * presence row; otherwise the stale pass expires it before returning.
@@ -520,6 +557,7 @@ public final class SentinelLeadership {
         }
         synchronized (SentinelLeadership.class) {
             if (!isCurrentGeneration(generation) && standingDown) {
+                releaseObservationHealth();
                 releaseNodePresence();
             }
         }
@@ -656,6 +694,21 @@ public final class SentinelLeadership {
     private static void clearLocalClaim() {
         leadershipEpoch = null;
         leadershipValidUntilNanos = 0L;
+    }
+
+    static long connectorObservationGeneration() {
+        return lifecycleGeneration;
+    }
+
+    static boolean isConnectorObservationGenerationCurrent(long generation) {
+        return isCurrentGeneration(generation);
+    }
+
+    /** Serializes a completed observation's local publication with stop/restart. */
+    static synchronized boolean publishConnectorObservation(long generation, Runnable publication) {
+        if (!isCurrentGeneration(generation)) return false;
+        publication.run();
+        return true;
     }
 
     private static boolean isCurrentGeneration(long generation) {

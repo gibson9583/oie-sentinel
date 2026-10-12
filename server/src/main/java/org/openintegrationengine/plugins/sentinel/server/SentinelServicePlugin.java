@@ -258,6 +258,13 @@ public class SentinelServicePlugin implements ServicePlugin {
         }
 
         if (connectorStatusListener != null) {
+            // Retire admission even if controller lookup or queue removal
+            // fails. A later start must not inherit an active old consumer.
+            try {
+                connectorStatusListener.shutdown();
+            } catch (Exception e) {
+                log.warn("Failed to shut down the Sentinel connector status listener", e);
+            }
             try {
                 EventController eventController = ControllerFactory.getFactory().createEventController();
                 eventController.removeListener(connectorStatusListener);

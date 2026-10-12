@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -223,6 +224,57 @@ class SentinelLeadershipLifecycleTest {
         leases.verify(() -> NodeLeaseRepository.releaseNodeLease(
                 argThat(name -> name != null && name.startsWith("sentinel-presence-")),
                 eq(SentinelLeadership.nodeId()), eq(1L)));
+    }
+
+    @Test
+    void observationHealthPublicationRechecksLifecycleBeforeCommit() throws Exception {
+        setClaim(450L, null, 0L);
+        leases.when(NodeLeaseRepository::getDatabaseTime).thenReturn(Instant.EPOCH);
+        leases.when(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), eq(90),
+                any(BooleanSupplier.class))).thenAnswer(call -> {
+                    BooleanSupplier current = call.getArgument(3);
+                    assertTrue(current.getAsBoolean());
+                    set("lifecycleGeneration", 451L);
+                    assertFalse(current.getAsBoolean(), "stopped generation must roll back health publication");
+                    return false;
+                });
+        SentinelLeadership.heartbeat(450L);
+        leases.verify(() -> NodeLeaseRepository.getNodeLease("sentinel-engine"), Mockito.never());
+    }
+
+    @Test
+    void observationHealthCommittedDuringShutdownIsReleased() throws Exception {
+        setClaim(460L, null, 0L);
+        leases.when(NodeLeaseRepository::getDatabaseTime).thenReturn(Instant.EPOCH);
+        NodeLease health = new NodeLease(); health.setNodeId(SentinelLeadership.nodeId()); health.setLeaseEpoch(13L);
+        leases.when(() -> NodeLeaseRepository.getNodeLease(argThat(
+                name -> name != null && name.startsWith("sentinel-observation-")))).thenReturn(health);
+        leases.when(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), eq(90),
+                any(BooleanSupplier.class))).thenAnswer(call -> {
+                    set("lifecycleGeneration", 461L); set("standingDown", true); return true;
+                });
+        SentinelLeadership.heartbeat(460L);
+        leases.verify(() -> NodeLeaseRepository.releaseNodeLease(argThat(
+                name -> name != null && name.startsWith("sentinel-observation-")), eq(SentinelLeadership.nodeId()), eq(13L)));
+        leases.verify(() -> NodeLeaseRepository.getNodeLease("sentinel-engine"), Mockito.never());
+    }
+
+    @Test
+    void observationHealthPublicationRechecksConcurrentPendingTransition() throws Exception {
+        setClaim(470L, null, 0L);
+        leases.when(NodeLeaseRepository::getDatabaseTime).thenReturn(Instant.EPOCH);
+        try (MockedStatic<PendingConnectorObservations> pending = Mockito.mockStatic(PendingConnectorObservations.class)) {
+            java.util.concurrent.atomic.AtomicBoolean dirty = new java.util.concurrent.atomic.AtomicBoolean();
+            pending.when(PendingConnectorObservations::hasPending).thenAnswer(call -> dirty.get());
+            leases.when(() -> NodeLeaseRepository.refreshObservationHealth(anyString(), anyString(), eq(90),
+                    any(BooleanSupplier.class))).thenAnswer(call -> {
+                        BooleanSupplier current = call.getArgument(3);
+                        assertTrue(current.getAsBoolean()); dirty.set(true);
+                        assertFalse(current.getAsBoolean(), "new pending event must roll back health publication");
+                        return false;
+                    });
+            SentinelLeadership.heartbeat(470L);
+        }
     }
 
     @Test
