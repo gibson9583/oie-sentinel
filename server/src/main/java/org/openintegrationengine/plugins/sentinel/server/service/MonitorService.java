@@ -206,6 +206,16 @@ public final class MonitorService {
      *                                  incomplete to evaluate
      */
     public static MonitorTestResult test(Monitor monitor) {
+        return test(monitor, null);
+    }
+
+    /**
+     * Dry-runs only channels the caller may read. A null set means an
+     * unrestricted internal caller; an empty set means no channels. Filter
+     * before evaluation so neither measurements nor per-channel errors from
+     * unauthorized channels can enter the response.
+     */
+    public static MonitorTestResult test(Monitor monitor, Set<String> authorizedChannelIds) {
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
         }
@@ -233,6 +243,15 @@ public final class MonitorService {
         List<ScopeResolver.ChannelTarget> targets = watchesState
                 ? ScopeResolver.resolveScopedChannels(monitor)
                 : ScopeResolver.resolveStartedChannels(monitor);
+        if (authorizedChannelIds != null) {
+            List<ScopeResolver.ChannelTarget> visible = new ArrayList<>();
+            for (ScopeResolver.ChannelTarget target : targets) {
+                if (authorizedChannelIds.contains(target.channelId)) {
+                    visible.add(target);
+                }
+            }
+            targets = visible;
+        }
         List<ChannelTestOutcome> outcomes = new ArrayList<>();
         boolean anyError = false;
 

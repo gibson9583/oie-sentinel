@@ -224,7 +224,8 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String testMonitor(String monitorJson) {
         try {
-            return Json.write(MonitorService.test(readBody(monitorJson, Monitor.class)));
+            return Json.write(MonitorService.test(readBody(monitorJson, Monitor.class),
+                    authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("testMonitor", e);
         }
