@@ -112,6 +112,28 @@ public final class MaintenanceWindowService {
     }
 
     /**
+     * Changes only the enabled flag. Validate the stored definition at action
+     * time when enabling; disabling an invalid legacy window must stay possible.
+     * The final read reports current policy and detects a concurrent deletion.
+     */
+    public static MaintenanceWindow setEnabled(int id, Boolean enabled, int userId) {
+        if (enabled == null) {
+            throw new IllegalArgumentException("enabled is required");
+        }
+        MaintenanceWindow existing = get(id);
+        if (enabled) {
+            validate(existing);
+        }
+        MaintenanceWindowRepository.setMaintenanceWindowEnabled(id, enabled);
+        MaintenanceWindow current = get(id);
+        // Audit the requested transition, even if another operator changed the
+        // flag again before the read-back. No definition from this read is saved.
+        existing.setEnabled(enabled);
+        SentinelAuditLog.windowEnabledChanged(userId, existing);
+        return current;
+    }
+
+    /**
      * Deletes a window. Existing alert rows are not bulk rewritten; each
      * still-open event refreshes its stored display bit on its next
      * dispatch-time decision, and a queued attempt rechecks before sending.

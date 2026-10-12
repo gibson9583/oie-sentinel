@@ -145,6 +145,10 @@ export const createMaintenanceWindow = (window_) => apiPost(`${BASE}/maintenance
 export const updateMaintenanceWindow = (id, window_) =>
     apiPut(`${BASE}/maintenanceWindows/${enc(id)}`, window_);
 
+/** POST /maintenanceWindows/{id}/_setEnabled?enabled= -> current MaintenanceWindow */
+export const setMaintenanceWindowEnabled = (id, enabled) =>
+    apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_setEnabled`, null, { enabled });
+
 /** DELETE /maintenanceWindows/{id} -> {} */
 export const deleteMaintenanceWindow = (id) => apiDel(`${BASE}/maintenanceWindows/${enc(id)}`);
 

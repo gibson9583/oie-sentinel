@@ -806,6 +806,10 @@
         WHERE id = #{id}
     </update>
 
+    <update id="setMaintenanceWindowEnabled" parameterType="map">
+        UPDATE sentinel_maintenance_window SET enabled = #{enabled} WHERE id = #{id}
+    </update>
+
     <delete id="deleteMaintenanceWindow" parameterType="map">
         DELETE FROM sentinel_maintenance_window WHERE id = #{id}
     </delete>

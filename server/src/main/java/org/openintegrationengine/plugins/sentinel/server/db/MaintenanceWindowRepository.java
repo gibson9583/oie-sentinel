@@ -158,6 +158,19 @@ public final class MaintenanceWindowRepository {
         }
     }
 
+    /** Atomically changes the requested flag without rewriting schedule policy. */
+    public static void setMaintenanceWindowEnabled(int id, boolean enabled) {
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("id", id);
+            params.put("enabled", enabled);
+            SqlConfig.getInstance().getSqlSessionManager().update(stmt("setMaintenanceWindowEnabled"), params);
+        } catch (Exception e) {
+            log.error("Failed to set enabled state for maintenance window {}", id, e);
+            throw new RepositoryException(e);
+        }
+    }
+
     /**
      * Deletes a maintenance window by id.
      *
