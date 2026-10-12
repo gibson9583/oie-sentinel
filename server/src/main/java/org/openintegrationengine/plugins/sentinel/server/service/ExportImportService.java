@@ -48,13 +48,15 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * dev is an unrelated monitor 7 on prod, and a document promoted between them
  * cannot mean anything by "7". Names, by contrast, are what operators write,
  * what the UI sorts on, and — for monitors and actions — what the schema
- * enforces as UNIQUE. So the export drops every id and every audit stamp, and
+ * enforces as UNIQUE. So the export drops entity ids and every audit stamp, and
  * the import matches each entry against the target's entities by name
  * (trimmed, case-insensitively — the same comparison
  * {@code MonitorService}/{@code ActionService} already use to reject duplicate
  * names, so import can never create a pair the editors would consider a
- * collision). A name that exists on the target is an update; a name that does
- * not is a create.</p>
+ * collision). A name that exists uniquely on the target is an update; a name
+ * that does not is a create. Legacy action rows can have distinct literal
+ * names that collide after normalization: export retains every row, and
+ * import rejects ambiguous matches instead of choosing one recipient.</p>
  *
  * <p>Dropping the ids also makes the document diffable: two exports of the
  * same configuration are byte-identical, so a commit shows the configuration
@@ -70,11 +72,17 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  *
  * <h2>Referential integrity</h2>
  *
- * <p>Two fields point at a Sentinel monitor by its serial id and so cannot
- * survive the trip unaltered. Both are translated to names on export and
- * resolved back to ids on import, and neither is ever silently dropped:</p>
+ * <p>References to Sentinel database ids are translated to names on export
+ * and resolved back to destination ids on import; they are never silently
+ * dropped:</p>
  *
  * <ul>
+ * <li>{@code Action.escalateToActionId} → {@code escalateToActionName}.
+ * Targets are imported before dependent actions, including document entries
+ * reached through destination-only links. Missing targets, rejected target
+ * entries, ambiguous names, duplicates, and cyclic chains leave dependents untouched.
+ * A deleted target has no name: its numeric reference is retained as an
+ * unresolved diagnostic and import rejects that entry until corrected.</li>
  * <li>{@code Monitor.suppressedByMonitorId} → {@code suppressedByMonitorName}.
  * Monitors are imported in dependency order (repeated passes, parents before
  * children), so a document that creates both a parent and its child lands them
@@ -161,7 +169,11 @@ public final class ExportImportService {
      * Format version of the export document, stamped on export and required
      * on import.
      *
-     * <p>Version 1 is defined by this class: ids and audit stamps removed,
+     * <p>Version 2 adds {@code escalateToActionName}; older servers must reject
+     * it rather than silently discard an escalation reference they do not know.
+     * Version 1 remains accepted, but populated numeric escalation ids are
+     * rejected per action because they cannot identify a destination safely.
+     * The original format has ids and audit stamps removed,
      * monitor suppression carried as {@code suppressedByMonitorName}, action
      * {@code MONITOR} condition values carried as monitor names, secrets
      * carried as the redaction marker. Import accepts anything at or below
@@ -169,7 +181,7 @@ public final class ExportImportService {
      * Sentinel may encode a reference this server does not know how to
      * resolve, and applying it half-understood is worse than refusing it.</p>
      */
-    public static final int SCHEMA_VERSION = 1;
+    public static final int SCHEMA_VERSION = 2;
 
     /** Entity type of an {@link ImportEntry} sourced from {@code monitors}. */
     public static final String TYPE_MONITOR = "MONITOR";
@@ -208,6 +220,11 @@ public final class ExportImportService {
     /** The {@code Monitor} column {@link #KEY_SUPPRESSED_BY_NAME} replaces. */
     private static final String FIELD_SUPPRESSED_BY_ID = "suppressedByMonitorId";
 
+    /** Portable escalation reference; numeric action ids belong to the source database. */
+    private static final String KEY_ESCALATE_TO_NAME = "escalateToActionName";
+    private static final String FIELD_ESCALATE_TO_ID = "escalateToActionId";
+    private static final String REASON_UNCHANGED = "Already matches this server";
+
     /** The one {@code ActionConditionMatcher} field whose values are Sentinel ids. */
     private static final String CONDITION_FIELD_MONITOR = "MONITOR";
 
@@ -243,7 +260,7 @@ public final class ExportImportService {
      * <p>Shape:</p>
      * <pre>
      * {
-     *   "schemaVersion": 1,
+     *   "schemaVersion": 2,
      *   "exportedAt": "2026-08-06T09:15:22.481Z",
      *   "monitors":           [ { ...definition, "suppressedByMonitorName": "Upstream down"|null } ],
      *   "actions":            [ { ...definition, secrets as the redaction marker } ],
@@ -275,9 +292,10 @@ public final class ExportImportService {
             monitorNodes.add(monitorNode(monitor, monitors.nameOf(monitor.getSuppressedByMonitorId())));
         }
 
+        ActionIndex actions = ActionIndex.of(ActionService.list());
         ArrayNode actionNodes = root.putArray(KEY_ACTIONS);
-        for (Action action : ActionService.list()) {
-            actionNodes.add(actionNode(action, monitors));
+        for (Action action : actions.all()) {
+            actionNodes.add(actionNode(action, monitors, actions));
         }
 
         ArrayNode windowNodes = root.putArray(KEY_WINDOWS);
@@ -309,15 +327,31 @@ public final class ExportImportService {
 
     /**
      * Renders one already-redacted action in portable form, rewriting the
-     * monitor ids inside its {@code MONITOR} condition rows to monitor names.
+     * monitor ids inside its {@code MONITOR} condition rows to monitor names
+     * and its escalation target to an action name.
      * A stale id matching no monitor is left exactly as it is: rewriting it to
      * nothing would silently widen the action's condition, and leaving it
      * makes import report it by value so the operator can clean it up.
      */
-    private static ObjectNode actionNode(Action action, MonitorIndex monitors) {
-        ObjectNode node = portable(action);
+    private static ObjectNode actionNode(Action action, MonitorIndex monitors, ActionIndex actions) {
+        Action target = actions.byId(action.getEscalateToActionId());
+        String targetName = target == null ? null : target.getName();
+        ObjectNode node = actionPolicyNode(action, targetName);
+        if (action.getEscalateToActionId() != null && targetName == null) {
+            // A deleted target has no portable name. Keep its unresolved source
+            // reference so import rejects this entry instead of clearing it or
+            // accidentally binding it to an unrelated destination action.
+            node.put(FIELD_ESCALATE_TO_ID, action.getEscalateToActionId());
+        }
         node.set("conditionJson", TextNode.valueOf(
                 mapMonitorConditionValues(action.getConditionJson(), monitors::nameOf)));
+        return node;
+    }
+
+    private static ObjectNode actionPolicyNode(Action action, String targetName) {
+        ObjectNode node = portable(action);
+        node.remove(FIELD_ESCALATE_TO_ID);
+        node.set(KEY_ESCALATE_TO_NAME, targetName == null ? NullNode.getInstance() : TextNode.valueOf(targetName));
         return node;
     }
 
@@ -519,7 +553,7 @@ public final class ExportImportService {
         Monitor existing = index.byName(name);
         if (existing != null && sameDefinition(monitorNode(incoming, parentName),
                 monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())))) {
-            return entry.skipped("Already matches this server");
+            return entry.skipped(REASON_UNCHANGED);
         }
 
         Monitor parent = isBlank(parentName) ? null : index.byName(parentName);
@@ -545,23 +579,110 @@ public final class ExportImportService {
     // ========== Import: actions ==========
 
     /**
-     * Imports the action list. Actions have no dependencies on each other, so
-     * this is a straight pass — their one cross-entity reference (the
-     * {@code MONITOR} condition rows) is satisfied by the monitor index the
-     * previous pass returned.
+     * Resolve escalation targets before their dependents, independent of array
+     * order. A target defined in this document must land successfully (or be
+     * unchanged); a rejected replacement must not silently reuse its old row.
+     * Cycles and self references are reported without partially writing them.
      */
     private static void importActions(ArrayNode nodes, MonitorIndex monitors, int userId,
             List<ImportEntry> entries) {
         if (nodes == null) {
             return;
         }
-        Map<String, Action> byName = new LinkedHashMap<>();
-        for (Action action : ActionService.list()) {
-            byName.put(nameKey(action.getName()), action);
-        }
+        ActionIndex actions = ActionIndex.of(ActionService.list());
+        Map<String, Integer> nameCounts = new LinkedHashMap<>();
         for (JsonNode node : nodes) {
-            entries.add(applyAction(node, byName, monitors, userId));
+            nameCounts.merge(nameKey(textOrNull(node, "name")), 1, Integer::sum);
         }
+        List<JsonNode> pending = new ArrayList<>();
+        for (JsonNode node : nodes) {
+            String name = textOrNull(node, "name");
+            String problem = escalationReferenceProblem(node);
+            if (nameCounts.get(nameKey(name)) > 1) {
+                problem = "Duplicate action name in this document; rename or remove the duplicate entries";
+            }
+            if (problem == null && actions.isAmbiguous(name)) {
+                problem = ambiguousActionName("Action", name);
+            }
+            String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
+            if (problem == null && actions.isAmbiguous(targetName)) {
+                problem = ambiguousActionName("Escalation target", targetName);
+            }
+            if (problem != null) {
+                entries.add(new ImportEntry(TYPE_ACTION, name).skipped(problem));
+            } else {
+                pending.add(node);
+            }
+        }
+        Set<String> resolvedNames = new LinkedHashSet<>();
+        while (!pending.isEmpty()) {
+            List<JsonNode> deferred = new ArrayList<>();
+            for (JsonNode node : pending) {
+                if (hasUnresolvedActionDependency(node, actions, nameCounts.keySet(), resolvedNames)) {
+                    deferred.add(node);
+                    continue;
+                }
+                ImportEntry entry = applyAction(node, actions, monitors, userId);
+                entries.add(entry);
+                if (!OUTCOME_SKIPPED.equals(entry.getOutcome()) || REASON_UNCHANGED.equals(entry.getReason())) {
+                    resolvedNames.add(nameKey(entry.getName()));
+                }
+            }
+            if (deferred.size() == pending.size()) {
+                for (JsonNode node : deferred) {
+                    entries.add(new ImportEntry(TYPE_ACTION, textOrNull(node, "name")).skipped(
+                            "Escalation chain starting at '" + textOrNull(node, KEY_ESCALATE_TO_NAME)
+                            + "' could not be resolved (a referenced entry was skipped, or the chain is circular);"
+                            + " this action was left untouched"));
+                }
+                break;
+            }
+            pending = deferred;
+        }
+    }
+
+    private static String ambiguousActionName(String kind, String name) {
+        return kind + " '" + name + "' matches multiple actions on this server after trimming and ignoring case;"
+                + " rename those actions before importing; this action was left untouched";
+    }
+
+    /**
+     * A destination-only action can lead back into this document. Wait for every
+     * such replacement, not just the named first hop: evaluating the old chain
+     * could reject a valid rewire as circular, or silently reuse a failed update.
+     * Existing links are followed by id so ambiguous names never select a row.
+     */
+    private static boolean hasUnresolvedActionDependency(JsonNode node, ActionIndex actions,
+            Set<String> documentNames, Set<String> resolvedNames) {
+        String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
+        if (targetName == null) {
+            return false;
+        }
+        if (documentNames.contains(nameKey(targetName)) && !resolvedNames.contains(nameKey(targetName))) {
+            return true;
+        }
+        Set<Integer> visited = new LinkedHashSet<>();
+        Action target = actions.byName(targetName);
+        while (target != null && visited.add(target.getId())) {
+            String key = nameKey(target.getName());
+            if (documentNames.contains(key) && !resolvedNames.contains(key)) {
+                return true;
+            }
+            target = actions.byId(target.getEscalateToActionId());
+        }
+        return false;
+    }
+
+    private static String escalationReferenceProblem(JsonNode node) {
+        if (node != null && node.hasNonNull(FIELD_ESCALATE_TO_ID)) {
+            return "Numeric escalateToActionId belongs to the source server and cannot be resolved safely;"
+                    + " replace it with escalateToActionName before importing";
+        }
+        JsonNode target = node == null ? null : node.get(KEY_ESCALATE_TO_NAME);
+        if (target != null && !target.isNull() && (!target.isTextual() || target.asText().isBlank())) {
+            return "escalateToActionName must be a non-blank action name or null";
+        }
+        return null;
     }
 
     /**
@@ -576,7 +697,7 @@ public final class ExportImportService {
      * against. Secrets are re-entered on the target, never diffed from a
      * file.</p>
      */
-    private static ImportEntry applyAction(JsonNode node, Map<String, Action> byName, MonitorIndex monitors,
+    private static ImportEntry applyAction(JsonNode node, ActionIndex actions, MonitorIndex monitors,
             int userId) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_ACTION, name);
@@ -592,11 +713,22 @@ public final class ExportImportService {
         }
         incoming.setId(null);
 
-        Action existing = byName.get(nameKey(name));
+        Action existing = actions.byName(name);
+        String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
+        Action target = actions.byName(targetName);
+        if (targetName != null && target == null) {
+            return entry.skipped("Escalation target '" + targetName
+                    + "' does not exist on this server; this action was left untouched");
+        }
+        if (hasEscalationCycle(existing, target, actions)) {
+            return entry.skipped("Escalation target chain is circular; this action was left untouched");
+        }
+        incoming.setEscalateToActionId(target == null ? null : target.getId());
         // Computed against the UNTOUCHED incoming config, so both sides are
         // redacted the same way and compare like with like.
         boolean unchanged = existing != null
-                && sameDefinition(portable(incoming), actionNode(existing, monitors));
+                && sameDefinition(actionPolicyNode(incoming, target == null ? null : target.getName()),
+                        actionNode(existing, monitors, actions));
 
         // Secret classification runs even for an unchanged or about-to-be-
         // skipped action: "this action is already here and its key is already
@@ -608,7 +740,7 @@ public final class ExportImportService {
         entry.setSecretsNote(secretsNote(secrets.kept, secrets.required));
 
         if (unchanged) {
-            return entry.skipped("Already matches this server");
+            return entry.skipped(REASON_UNCHANGED);
         }
 
         if (!secrets.required.isEmpty()) {
@@ -641,14 +773,29 @@ public final class ExportImportService {
 
         try {
             if (existing == null) {
-                byName.put(nameKey(name), ActionService.create(incoming, userId));
+                actions.put(ActionService.create(incoming, userId));
                 return entry.created();
             }
-            byName.put(nameKey(name), ActionService.update(existing.getId(), incoming, userId));
+            actions.put(ActionService.update(existing.getId(), incoming, userId));
             return entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
         }
+    }
+
+    /** Include destination-only links when checking a newly resolved chain. */
+    private static boolean hasEscalationCycle(Action existing, Action target, ActionIndex actions) {
+        Set<Integer> visited = new LinkedHashSet<>();
+        if (existing != null) {
+            visited.add(existing.getId());
+        }
+        while (target != null) {
+            if (!visited.add(target.getId())) {
+                return true;
+            }
+            target = actions.byId(target.getEscalateToActionId());
+        }
+        return false;
     }
 
     // ========== Import: maintenance windows ==========
@@ -701,7 +848,7 @@ public final class ExportImportService {
         }
         MaintenanceWindow existing = matches.isEmpty() ? null : matches.get(0);
         if (existing != null && sameDefinition(portable(incoming), portable(existing))) {
-            return entry.skipped("Already matches this server");
+            return entry.skipped(REASON_UNCHANGED);
         }
 
         try {
@@ -960,6 +1107,51 @@ public final class ExportImportService {
     }
 
     // ========== Plumbing ==========
+
+    /**
+     * Retain every persisted row by id, including legacy names that collide
+     * after trimming/case folding. A name lookup is safe only when unique;
+     * export and existing chain traversal must never discard the other rows.
+     */
+    private static final class ActionIndex {
+
+        private final Map<Integer, Action> byId = new LinkedHashMap<>();
+        private final Map<String, Action> byName = new HashMap<>();
+        private final Set<String> ambiguousNames = new LinkedHashSet<>();
+
+        static ActionIndex of(List<Action> actions) {
+            ActionIndex index = new ActionIndex();
+            for (Action action : actions) {
+                index.put(action);
+            }
+            return index;
+        }
+
+        void put(Action action) {
+            byId.put(action.getId(), action);
+            String key = nameKey(action.getName());
+            Action previous = byName.put(key, action);
+            if (previous != null && !previous.getId().equals(action.getId())) {
+                ambiguousNames.add(key);
+            }
+        }
+
+        List<Action> all() {
+            return new ArrayList<>(byId.values());
+        }
+
+        boolean isAmbiguous(String name) {
+            return name != null && ambiguousNames.contains(nameKey(name));
+        }
+
+        Action byName(String name) {
+            return name == null || isAmbiguous(name) ? null : byName.get(nameKey(name));
+        }
+
+        Action byId(Integer id) {
+            return id == null ? null : byId.get(id);
+        }
+    }
 
     /**
      * The monitor name index shared by the monitor and action passes: name →

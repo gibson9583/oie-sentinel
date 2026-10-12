@@ -614,7 +614,7 @@ public final class ActionService {
 
     /**
      * Field-by-field copy. Written out longhand (no reflection/serialization
-     * tricks) because the DTO is a plain bean with fourteen fields and the
+     * tricks) because the DTO is a plain bean and the
      * copy must stay correct if a field is added — a compile break here on a
      * getter rename is a feature.
      */
@@ -629,6 +629,10 @@ public final class ActionService {
         copy.setOperationMode(action.getOperationMode());
         copy.setRepeatIntervalSeconds(action.getRepeatIntervalSeconds());
         copy.setMaxRepeats(action.getMaxRepeats());
+        copy.setMaxNotificationsPerWindow(action.getMaxNotificationsPerWindow());
+        copy.setRollupWindowSeconds(action.getRollupWindowSeconds());
+        copy.setEscalateAfterSeconds(action.getEscalateAfterSeconds());
+        copy.setEscalateToActionId(action.getEscalateToActionId());
         copy.setConfigJson(action.getConfigJson());
         copy.setCreatedBy(action.getCreatedBy());
         copy.setCreatedTime(action.getCreatedTime());
