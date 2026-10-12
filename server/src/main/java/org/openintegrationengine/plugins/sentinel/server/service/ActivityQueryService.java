@@ -71,6 +71,10 @@ public final class ActivityQueryService {
     private static final int DEFAULT_WINDOW_SECONDS = 3600;
     private static final int DEFAULT_BUCKETS = 20;
 
+    /** Summary reads raw samples; bound both its time span and aggregate work. */
+    private static final int MAX_SUMMARY_WINDOW_SECONDS = 86_400;
+    private static final int MAX_SUMMARY_CHANNELS = 250;
+
     /**
      * Ceiling on sparkline buckets: beyond a few hundred points a sparkline
      * is indistinguishable, and the bucket array is allocated per channel.
@@ -237,12 +241,31 @@ public final class ActivityQueryService {
      * @param buckets       sparkline resolution (non-positive →
      *                      {@value #DEFAULT_BUCKETS}, capped at
      *                      {@value #MAX_BUCKETS})
-     * @return one summary per channel, in input order; never {@code null}
+     * @return one summary per distinct channel, in first-occurrence order; never {@code null}
+     * @throws IllegalArgumentException before reading activity when the window exceeds
+     *         one day, the channel count exceeds 250, or the estimated raw samples
+     *         across all channels exceed 100,000 (even with only one sparkline bucket)
      */
     public static List<ChannelActivitySummary> getActivitySummary(List<String> channelIds,
             int windowSeconds, int buckets) {
-        List<String> targets = channelIds != null ? channelIds : watchedChannelIds();
         int window = windowSeconds > 0 ? windowSeconds : DEFAULT_WINDOW_SECONDS;
+        if (window > MAX_SUMMARY_WINDOW_SECONDS) {
+            throw new IllegalArgumentException("activity summary window must be at most "
+                    + MAX_SUMMARY_WINDOW_SECONDS + " seconds; use channel activity for longer ranges");
+        }
+        Set<String> targets = new LinkedHashSet<>();
+        for (String channelId : channelIds != null ? channelIds : watchedChannelIds()) {
+            if (channelId != null && !channelId.isBlank()) targets.add(channelId.trim());
+            if (targets.size() > MAX_SUMMARY_CHANNELS) {
+                throw new IllegalArgumentException("activity summary supports at most "
+                        + MAX_SUMMARY_CHANNELS + " channels per request");
+            }
+        }
+        long estimatedRows = ((long) window / MIN_COLLECTOR_INTERVAL_SECONDS + 1) * targets.size();
+        if (estimatedRows > MAX_SOURCE_POINTS) {
+            throw new IllegalArgumentException("activity summary exceeds the " + MAX_SOURCE_POINTS
+                    + " source-sample budget; request fewer channels or a shorter window");
+        }
         int bucketCount = buckets > 0 ? Math.min(buckets, MAX_BUCKETS) : DEFAULT_BUCKETS;
 
         Instant to = Instant.now();
@@ -250,10 +273,7 @@ public final class ActivityQueryService {
 
         List<ChannelActivitySummary> summaries = new ArrayList<>(targets.size());
         for (String channelId : targets) {
-            if (channelId == null || channelId.isBlank()) {
-                continue;
-            }
-            summaries.add(summarizeChannel(channelId.trim(), from, to, bucketCount));
+            summaries.add(summarizeChannel(channelId, from, to, bucketCount));
         }
         return summaries;
     }
