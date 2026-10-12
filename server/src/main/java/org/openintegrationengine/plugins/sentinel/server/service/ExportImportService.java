@@ -53,8 +53,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * (trimmed, case-insensitively — the same comparison
  * {@code MonitorService}/{@code ActionService} already use to reject duplicate
  * names, so import can never create a pair the editors would consider a
- * collision). A name that exists on the target is an update; a name that does
- * not is a create.</p>
+ * collision). A name that exists uniquely on the target is an update; a name
+ * that does not is a create. Legacy action rows can have distinct literal
+ * names that collide after normalization: export retains every row, and
+ * import rejects ambiguous matches instead of choosing one recipient.</p>
  *
  * <p>Dropping the ids also makes the document diffable: two exports of the
  * same configuration are byte-identical, so a commit shows the configuration
@@ -76,8 +78,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  *
  * <ul>
  * <li>{@code Action.escalateToActionId} → {@code escalateToActionName}.
- * Targets are imported before dependent actions. Missing targets, rejected
- * target entries, duplicates, and cyclic chains leave dependents untouched.
+ * Targets are imported before dependent actions, including document entries
+ * reached through destination-only links. Missing targets, rejected target
+ * entries, ambiguous names, duplicates, and cyclic chains leave dependents untouched.
  * A deleted target has no name: its numeric reference is retained as an
  * unresolved diagnostic and import rejects that entry until corrected.</li>
  * <li>{@code Monitor.suppressedByMonitorId} → {@code suppressedByMonitorName}.
@@ -289,12 +292,9 @@ public final class ExportImportService {
             monitorNodes.add(monitorNode(monitor, monitors.nameOf(monitor.getSuppressedByMonitorId())));
         }
 
-        Map<String, Action> actions = new LinkedHashMap<>();
-        for (Action action : ActionService.list()) {
-            actions.put(nameKey(action.getName()), action);
-        }
+        ActionIndex actions = ActionIndex.of(ActionService.list());
         ArrayNode actionNodes = root.putArray(KEY_ACTIONS);
-        for (Action action : actions.values()) {
+        for (Action action : actions.all()) {
             actionNodes.add(actionNode(action, monitors, actions));
         }
 
@@ -333,14 +333,9 @@ public final class ExportImportService {
      * nothing would silently widen the action's condition, and leaving it
      * makes import report it by value so the operator can clean it up.
      */
-    private static ObjectNode actionNode(Action action, MonitorIndex monitors, Map<String, Action> actions) {
-        String targetName = null;
-        for (Action target : actions.values()) {
-            if (target.getId() != null && target.getId().equals(action.getEscalateToActionId())) {
-                targetName = target.getName();
-                break;
-            }
-        }
+    private static ObjectNode actionNode(Action action, MonitorIndex monitors, ActionIndex actions) {
+        Action target = actions.byId(action.getEscalateToActionId());
+        String targetName = target == null ? null : target.getName();
         ObjectNode node = actionPolicyNode(action, targetName);
         if (action.getEscalateToActionId() != null && targetName == null) {
             // A deleted target has no portable name. Keep its unresolved source
@@ -594,10 +589,7 @@ public final class ExportImportService {
         if (nodes == null) {
             return;
         }
-        Map<String, Action> byName = new LinkedHashMap<>();
-        for (Action action : ActionService.list()) {
-            byName.put(nameKey(action.getName()), action);
-        }
+        ActionIndex actions = ActionIndex.of(ActionService.list());
         Map<String, Integer> nameCounts = new LinkedHashMap<>();
         for (JsonNode node : nodes) {
             nameCounts.merge(nameKey(textOrNull(node, "name")), 1, Integer::sum);
@@ -609,6 +601,13 @@ public final class ExportImportService {
             if (nameCounts.get(nameKey(name)) > 1) {
                 problem = "Duplicate action name in this document; rename or remove the duplicate entries";
             }
+            if (problem == null && actions.isAmbiguous(name)) {
+                problem = ambiguousActionName("Action", name);
+            }
+            String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
+            if (problem == null && actions.isAmbiguous(targetName)) {
+                problem = ambiguousActionName("Escalation target", targetName);
+            }
             if (problem != null) {
                 entries.add(new ImportEntry(TYPE_ACTION, name).skipped(problem));
             } else {
@@ -619,13 +618,11 @@ public final class ExportImportService {
         while (!pending.isEmpty()) {
             List<JsonNode> deferred = new ArrayList<>();
             for (JsonNode node : pending) {
-                String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
-                if (targetName != null && nameCounts.containsKey(nameKey(targetName))
-                        && !resolvedNames.contains(nameKey(targetName))) {
+                if (hasUnresolvedActionDependency(node, actions, nameCounts.keySet(), resolvedNames)) {
                     deferred.add(node);
                     continue;
                 }
-                ImportEntry entry = applyAction(node, byName, monitors, userId);
+                ImportEntry entry = applyAction(node, actions, monitors, userId);
                 entries.add(entry);
                 if (!OUTCOME_SKIPPED.equals(entry.getOutcome()) || REASON_UNCHANGED.equals(entry.getReason())) {
                     resolvedNames.add(nameKey(entry.getName()));
@@ -634,14 +631,46 @@ public final class ExportImportService {
             if (deferred.size() == pending.size()) {
                 for (JsonNode node : deferred) {
                     entries.add(new ImportEntry(TYPE_ACTION, textOrNull(node, "name")).skipped(
-                            "Escalation target '" + textOrNull(node, KEY_ESCALATE_TO_NAME)
-                            + "' could not be imported (its entry was skipped, or the escalation chain is circular);"
+                            "Escalation chain starting at '" + textOrNull(node, KEY_ESCALATE_TO_NAME)
+                            + "' could not be resolved (a referenced entry was skipped, or the chain is circular);"
                             + " this action was left untouched"));
                 }
                 break;
             }
             pending = deferred;
         }
+    }
+
+    private static String ambiguousActionName(String kind, String name) {
+        return kind + " '" + name + "' matches multiple actions on this server after trimming and ignoring case;"
+                + " rename those actions before importing; this action was left untouched";
+    }
+
+    /**
+     * A destination-only action can lead back into this document. Wait for every
+     * such replacement, not just the named first hop: evaluating the old chain
+     * could reject a valid rewire as circular, or silently reuse a failed update.
+     * Existing links are followed by id so ambiguous names never select a row.
+     */
+    private static boolean hasUnresolvedActionDependency(JsonNode node, ActionIndex actions,
+            Set<String> documentNames, Set<String> resolvedNames) {
+        String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
+        if (targetName == null) {
+            return false;
+        }
+        if (documentNames.contains(nameKey(targetName)) && !resolvedNames.contains(nameKey(targetName))) {
+            return true;
+        }
+        Set<Integer> visited = new LinkedHashSet<>();
+        Action target = actions.byName(targetName);
+        while (target != null && visited.add(target.getId())) {
+            String key = nameKey(target.getName());
+            if (documentNames.contains(key) && !resolvedNames.contains(key)) {
+                return true;
+            }
+            target = actions.byId(target.getEscalateToActionId());
+        }
+        return false;
     }
 
     private static String escalationReferenceProblem(JsonNode node) {
@@ -668,7 +697,7 @@ public final class ExportImportService {
      * against. Secrets are re-entered on the target, never diffed from a
      * file.</p>
      */
-    private static ImportEntry applyAction(JsonNode node, Map<String, Action> byName, MonitorIndex monitors,
+    private static ImportEntry applyAction(JsonNode node, ActionIndex actions, MonitorIndex monitors,
             int userId) {
         String name = textOrNull(node, "name");
         ImportEntry entry = new ImportEntry(TYPE_ACTION, name);
@@ -684,14 +713,14 @@ public final class ExportImportService {
         }
         incoming.setId(null);
 
-        Action existing = byName.get(nameKey(name));
+        Action existing = actions.byName(name);
         String targetName = textOrNull(node, KEY_ESCALATE_TO_NAME);
-        Action target = targetName == null ? null : byName.get(nameKey(targetName));
+        Action target = actions.byName(targetName);
         if (targetName != null && target == null) {
             return entry.skipped("Escalation target '" + targetName
                     + "' does not exist on this server; this action was left untouched");
         }
-        if (hasEscalationCycle(existing, target, byName)) {
+        if (hasEscalationCycle(existing, target, actions)) {
             return entry.skipped("Escalation target chain is circular; this action was left untouched");
         }
         incoming.setEscalateToActionId(target == null ? null : target.getId());
@@ -699,7 +728,7 @@ public final class ExportImportService {
         // redacted the same way and compare like with like.
         boolean unchanged = existing != null
                 && sameDefinition(actionPolicyNode(incoming, target == null ? null : target.getName()),
-                        actionNode(existing, monitors, byName));
+                        actionNode(existing, monitors, actions));
 
         // Secret classification runs even for an unchanged or about-to-be-
         // skipped action: "this action is already here and its key is already
@@ -734,10 +763,10 @@ public final class ExportImportService {
 
         try {
             if (existing == null) {
-                byName.put(nameKey(name), ActionService.create(incoming, userId));
+                actions.put(ActionService.create(incoming, userId));
                 return entry.created();
             }
-            byName.put(nameKey(name), ActionService.update(existing.getId(), incoming, userId));
+            actions.put(ActionService.update(existing.getId(), incoming, userId));
             return entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
@@ -745,11 +774,7 @@ public final class ExportImportService {
     }
 
     /** Include destination-only links when checking a newly resolved chain. */
-    private static boolean hasEscalationCycle(Action existing, Action target, Map<String, Action> actions) {
-        Map<Integer, Action> byId = new HashMap<>();
-        for (Action action : actions.values()) {
-            byId.put(action.getId(), action);
-        }
+    private static boolean hasEscalationCycle(Action existing, Action target, ActionIndex actions) {
         Set<Integer> visited = new LinkedHashSet<>();
         if (existing != null) {
             visited.add(existing.getId());
@@ -758,7 +783,7 @@ public final class ExportImportService {
             if (!visited.add(target.getId())) {
                 return true;
             }
-            target = byId.get(target.getEscalateToActionId());
+            target = actions.byId(target.getEscalateToActionId());
         }
         return false;
     }
@@ -1072,6 +1097,51 @@ public final class ExportImportService {
     }
 
     // ========== Plumbing ==========
+
+    /**
+     * Retain every persisted row by id, including legacy names that collide
+     * after trimming/case folding. A name lookup is safe only when unique;
+     * export and existing chain traversal must never discard the other rows.
+     */
+    private static final class ActionIndex {
+
+        private final Map<Integer, Action> byId = new LinkedHashMap<>();
+        private final Map<String, Action> byName = new HashMap<>();
+        private final Set<String> ambiguousNames = new LinkedHashSet<>();
+
+        static ActionIndex of(List<Action> actions) {
+            ActionIndex index = new ActionIndex();
+            for (Action action : actions) {
+                index.put(action);
+            }
+            return index;
+        }
+
+        void put(Action action) {
+            byId.put(action.getId(), action);
+            String key = nameKey(action.getName());
+            Action previous = byName.put(key, action);
+            if (previous != null && !previous.getId().equals(action.getId())) {
+                ambiguousNames.add(key);
+            }
+        }
+
+        List<Action> all() {
+            return new ArrayList<>(byId.values());
+        }
+
+        boolean isAmbiguous(String name) {
+            return name != null && ambiguousNames.contains(nameKey(name));
+        }
+
+        Action byName(String name) {
+            return name == null || isAmbiguous(name) ? null : byName.get(nameKey(name));
+        }
+
+        Action byId(Integer id) {
+            return id == null ? null : byId.get(id);
+        }
+    }
 
     /**
      * The monitor name index shared by the monitor and action passes: name →

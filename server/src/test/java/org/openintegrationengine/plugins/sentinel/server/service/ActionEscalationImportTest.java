@@ -272,6 +272,236 @@ class ActionEscalationImportTest {
         }
     }
 
+    @Test
+    void ambiguousDestinationNamesSkipUpdatesAndDependentsWithoutDroppingExportRows() {
+        try (Store db = new Store()) {
+            db.put(action(10, " Pager", null));
+            db.put(action(20, "Pager", null));
+            db.put(action(30, "Primary", 10));
+            ObjectNode exported = ExportImportService.export();
+            assertEquals(3, exported.path("actions").size());
+            assertEquals(" Pager", exported.path("actions").get(2).path("escalateToActionName").asText());
+
+            for (String name : List.of(" Pager", "Pager", "PAGER")) {
+                ObjectNode target = entry(name, null);
+                target.put("description", "must not overwrite either existing row");
+                var result = ExportImportService.importDocument(document(target, entry("Primary", name)), 99);
+                assertEquals(2, result.getSkipped());
+                assertTrue(result.getEntries().stream().allMatch(e -> e.getReason().contains("multiple actions")));
+                assertEquals(10, db.named("Primary").getEscalateToActionId());
+                assertNull(db.rows.get(10).getDescription());
+                assertNull(db.rows.get(20).getDescription());
+            }
+            assertEquals(0, db.writes);
+        }
+    }
+
+    @Test
+    void cycleChecksKeepEveryIdEvenWhenDownstreamNamesAreAmbiguous() {
+        try (Store db = new Store()) {
+            db.put(action(10, "Primary", null));
+            db.put(action(20, " Pager", 10));
+            db.put(action(21, "Pager", null));
+            db.put(action(30, "Bridge", 20));
+            var result = ExportImportService.importDocument(document(entry("Primary", "Bridge")), 99);
+            assertEquals(1, result.getSkipped());
+            assertEquals(0, db.writes);
+            assertNull(db.named("Primary").getEscalateToActionId());
+        }
+    }
+
+    @Test
+    void destinationOnlyBridgeWaitsForPendingClearInEitherOrder() {
+        for (boolean reverse : List.of(false, true)) {
+            try (Store db = new Store()) {
+                db.put(action(10, "Primary", null));
+                db.put(action(20, "Bridge", 30));
+                db.put(action(30, "Pager", 10));
+                ObjectNode document = document(entry("Primary", "Bridge"), entry("Pager", null));
+                if (reverse) reverseActions(document);
+                assertEquals(2, ExportImportService.importDocument(document, 99).getUpdated());
+                assertEquals(20, db.named("Primary").getEscalateToActionId());
+                assertNull(db.named("Pager").getEscalateToActionId());
+                var retry = ExportImportService.importDocument(document, 99);
+                assertEquals(2, retry.getSkipped());
+                assertTrue(retry.getEntries().stream().allMatch(e -> "Already matches this server".equals(e.getReason())));
+                assertEquals(2, db.writes);
+            }
+        }
+    }
+
+    @Test
+    void failedReplacementBehindDestinationOnlyBridgeBlocksSourceUntilCorrected() {
+        for (boolean reverse : List.of(false, true)) {
+            try (Store db = new Store()) {
+                db.put(action(10, "Primary", null));
+                db.put(action(20, "Bridge", 30));
+                db.put(action(30, "Pager", null));
+                ObjectNode target = entry("Pager", null);
+                target.put("configJson", "{}");
+                ObjectNode document = document(entry("Primary", "Bridge"), target, entry("Independent", null));
+                if (reverse) reverseActions(document);
+                var result = ExportImportService.importDocument(document, 99);
+                assertEquals(2, result.getSkipped());
+                assertEquals(1, result.getCreated());
+                assertNull(db.named("Primary").getEscalateToActionId());
+                target.put("configJson", "{\"to\":\"replacement@example.test\"}");
+                assertEquals(2, ExportImportService.importDocument(document, 99).getUpdated());
+                assertEquals(20, db.named("Primary").getEscalateToActionId());
+            }
+        }
+    }
+
+    @Test
+    void interdependentUpdatesThroughDestinationOnlyBridgeCannotWriteACycle() {
+        try (Store db = new Store()) {
+            db.put(action(10, "Primary", null));
+            db.put(action(20, "Bridge", 30));
+            db.put(action(30, "Pager", null));
+            var result = ExportImportService.importDocument(document(entry("Primary", "Bridge"), entry("Pager", "Primary")), 99);
+            assertEquals(2, result.getSkipped());
+            assertEquals(0, db.writes);
+            assertNull(db.named("Primary").getEscalateToActionId());
+            assertNull(db.named("Pager").getEscalateToActionId());
+        }
+    }
+
+    @Test
+    void pendingClearCanRepairAnExistingCycleBeforeUnchangedAndNewDependentsResolve() {
+        for (boolean reverse : List.of(false, true)) {
+            try (Store db = new Store()) {
+                db.put(action(10, "Primary", 20));
+                db.put(action(20, "Bridge", 30));
+                db.put(action(30, "Pager", 10));
+                ObjectNode document = document(entry("New", "Primary"), entry("Primary", "Bridge"), entry("Pager", null));
+                if (reverse) reverseActions(document);
+                var result = ExportImportService.importDocument(document, 99);
+                assertEquals(1, result.getCreated());
+                assertEquals(1, result.getUpdated());
+                assertEquals(1, result.getSkipped());
+                assertNull(db.named("Pager").getEscalateToActionId());
+                assertEquals(10, db.named("New").getEscalateToActionId());
+            }
+        }
+    }
+
+    @Test
+    void ambiguousPendingReplacementBlocksIndirectDependentsWithoutGuessingTheReferencedId() {
+        try (Store db = new Store()) {
+            db.put(action(10, "Primary", null));
+            db.put(action(20, " Pager", null));
+            db.put(action(21, "Pager", null));
+            db.put(action(30, "Bridge", 20));
+            var result = ExportImportService.importDocument(document(entry("Primary", "Bridge"), entry("Pager", null)), 99);
+            assertEquals(2, result.getSkipped());
+            assertEquals(0, db.writes);
+            assertNull(db.named("Primary").getEscalateToActionId());
+        }
+    }
+
+    @Test
+    void missingSecretsBehindDestinationOnlyBridgeCannotFallBackToOldTarget() {
+        try (Store db = new Store()) {
+            db.put(action(10, "Primary", null));
+            db.put(action(20, "Bridge", 30));
+            db.put(action(30, "Pager", null));
+            ObjectNode target = Json.mapper().valueToTree(ActionService.redact(sns(30, "Pager")));
+            target.remove("id");
+            target.remove("escalateToActionId");
+            var result = ExportImportService.importDocument(document(entry("Primary", "Bridge"), target), 99);
+            assertEquals(2, result.getSkipped());
+            assertTrue(result.getEntries().stream().anyMatch(e -> !e.getSecretsRequired().isEmpty()));
+            assertEquals(0, db.writes);
+        }
+    }
+
+    @Test
+    void everyAcyclicThreeActionRewireIsOrderIndependentAndNeverWritesATemporaryCycle() {
+        List<int[]> graphs = new ArrayList<>();
+        for (int a = -1; a < 3; a++) {
+            for (int b = -1; b < 3; b++) {
+                for (int c = -1; c < 3; c++) {
+                    int[] graph = {a, b, c};
+                    if (acyclic(graph)) graphs.add(graph);
+                }
+            }
+        }
+        assertEquals(16, graphs.size());
+        int cases = 0;
+        try (Store db = new Store()) {
+            db.repository.when(() -> ActionRepository.updateAction(any(Action.class))).thenAnswer(i -> {
+                db.put(i.getArgument(0));
+                db.writes++;
+                int[] graph = new int[3];
+                for (int n = 0; n < 3; n++) {
+                    Integer target = db.rows.get(n + 1).getEscalateToActionId();
+                    graph[n] = target == null ? -1 : target - 1;
+                }
+                assertTrue(acyclic(graph), "No intermediate write may introduce a cycle");
+                return null;
+            });
+            for (int[] before : graphs) {
+                for (int[] after : graphs) {
+                    List<Integer> changed = new ArrayList<>();
+                    for (int n = 0; n < 3; n++) if (before[n] != after[n]) changed.add(n);
+                    for (List<Integer> order : permutations(changed)) {
+                        cases++;
+                        db.rows.clear();
+                        db.writes = 0;
+                        for (int n = 0; n < 3; n++) {
+                            db.put(action(n + 1, "Action " + n, before[n] < 0 ? null : before[n] + 1));
+                        }
+                        ObjectNode document = document();
+                        for (int n : order) {
+                            ((ArrayNode) document.get("actions")).add(entry("Action " + n,
+                                    after[n] < 0 ? null : "Action " + after[n]));
+                        }
+                        String scenario = "before=" + java.util.Arrays.toString(before)
+                                + " after=" + java.util.Arrays.toString(after) + " order=" + order;
+                        var result = ExportImportService.importDocument(document, 99);
+                        assertEquals(changed.size(), result.getUpdated(), scenario);
+                        assertEquals(0, result.getSkipped(), scenario);
+                        for (int n = 0; n < 3; n++) {
+                            assertEquals(after[n] < 0 ? null : Integer.valueOf(after[n] + 1),
+                                    db.rows.get(n + 1).getEscalateToActionId(), scenario);
+                        }
+                        var retry = ExportImportService.importDocument(document, 99);
+                        assertEquals(changed.size(), retry.getSkipped(), scenario);
+                        assertTrue(retry.getEntries().stream().allMatch(e -> "Already matches this server".equals(e.getReason())), scenario);
+                        assertEquals(changed.size(), db.writes, scenario);
+                    }
+                }
+            }
+        }
+        System.out.println("Verified " + cases + " acyclic three-action graph/order combinations and their idempotent retries");
+    }
+
+    private static boolean acyclic(int[] graph) {
+        for (int start = 0; start < graph.length; start++) {
+            java.util.Set<Integer> visited = new java.util.HashSet<>();
+            for (int node = start; node >= 0; node = graph[node]) {
+                if (!visited.add(node)) return false;
+            }
+        }
+        return true;
+    }
+
+    private static List<List<Integer>> permutations(List<Integer> values) {
+        if (values.isEmpty()) return List.of(List.of());
+        List<List<Integer>> permutations = new ArrayList<>();
+        for (int i = 0; i < values.size(); i++) {
+            List<Integer> remaining = new ArrayList<>(values);
+            Integer first = remaining.remove(i);
+            for (List<Integer> rest : permutations(remaining)) {
+                List<Integer> permutation = new ArrayList<>();
+                permutation.add(first);
+                permutation.addAll(rest);
+                permutations.add(permutation);
+            }
+        }
+        return permutations;
+    }
+
     private static ObjectNode entry(String name, String target) {
         ObjectNode node = Json.mapper().valueToTree(action(null, name, null));
         node.remove("id"); node.remove("escalateToActionId");
