@@ -9,6 +9,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.mirth.connect.server.util.SqlConfig;
+import org.apache.ibatis.session.SqlSessionManager;
 
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
@@ -41,6 +43,10 @@ public final class AlertEventRepository {
 
     private static final String NAMESPACE = "Sentinel";
     private static final Logger log = LoggerFactory.getLogger(AlertEventRepository.class);
+
+    // Stay within Oracle's 1,000-expression IN limit and SQL Server's
+    // per-statement parameter budget. Channel values always remain bound.
+    private static final int ACKNOWLEDGER_CHANNEL_BATCH_SIZE = 1000;
 
     /**
      * The character the free-text search uses to escape LIKE wildcards.
@@ -267,12 +273,31 @@ public final class AlertEventRepository {
         }
     }
 
+    /**
+     * Returns distinct authors across a snapshot of the authorized channels.
+     * Each batch is a separate statement so splitting an IN list also bounds
+     * SQL Server's total parameter count. A failed batch fails the whole read;
+     * callers never receive a partial directory or an unrestricted retry.
+     */
     public static List<Integer> listAcknowledgingUserIds(List<String> channelIdIn) {
         try {
-            Map<String, Object> params = new HashMap<>();
-            params.put("channelIdIn", channelIdIn == null ? null : new ArrayList<>(channelIdIn));
-            return SqlConfig.getInstance().getSqlSessionManager()
-                    .selectList(stmt("listAcknowledgingUserIds"), params);
+            if (channelIdIn != null && channelIdIn.isEmpty()) return List.of();
+            List<String> channels = channelIdIn == null ? null : new ArrayList<>(channelIdIn);
+            SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
+            if (channels == null) {
+                Map<String, Object> params = new HashMap<>();
+                params.put("channelIdIn", null);
+                return sessions.selectList(stmt("listAcknowledgingUserIds"), params);
+            }
+            LinkedHashSet<Integer> authors = new LinkedHashSet<>();
+            for (int start = 0; start < channels.size();) {
+                int end = start + Math.min(ACKNOWLEDGER_CHANNEL_BATCH_SIZE, channels.size() - start);
+                Map<String, Object> params = new HashMap<>();
+                params.put("channelIdIn", new ArrayList<>(channels.subList(start, end)));
+                authors.addAll(sessions.<Integer>selectList(stmt("listAcknowledgingUserIds"), params));
+                start = end;
+            }
+            return new ArrayList<>(authors);
         } catch (Exception e) {
             log.error("Failed to list acknowledging users", e);
             throw new RepositoryException(e);

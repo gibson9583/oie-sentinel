@@ -302,6 +302,30 @@ class ScopedMonitoringReadPersistenceTest {
     }
 
     @Test
+    void largeUserFallbackUnionsRealAuthorRowsAcrossChannelBatches() throws Exception {
+        List<String> authorized = new ArrayList<>();
+        for (int i = 0; i < 3101; i++) {
+            String id = String.format("00000000-0000-0000-0000-%012d", i + 3);
+            authorized.add(id);
+            inventory.add(channel(id));
+        }
+        reader.allowed = new HashSet<>(authorized);
+        insertEvent(monitor.getId(), authorized.get(0), 9);
+        insertEvent(monitor.getId(), authorized.get(1000), 9);
+        insertEvent(monitor.getId(), authorized.get(2000), 99);
+        insertEvent(monitor.getId(), authorized.get(3100), 9);
+        insertEvent(monitor.getId(), RESTRICTED, 77);
+        assertEquals(Set.of(9, 99), new HashSet<>(AlertEventRepository.listAcknowledgingUserIds(authorized)));
+        assertEquals(2, AlertEventRepository.listAcknowledgingUserIds(authorized).size());
+        try (DirectoryFixture directory = new DirectoryFixture()) {
+            assertEquals(Set.of(42, 9, 99), userIds(tree(reader.getCoreUsers())));
+            assertSame(directory.original, reader.currentOperation());
+            reader.allowed = Set.of(authorized.get(0));
+            assertEquals(Set.of(42, 9), userIds(tree(reader.getCoreUsers())));
+        }
+    }
+
+    @Test
     void largeMonitorAllowListPreservesGlobalPagesCountsAndOtherFilters() throws Exception {
         Monitor second = duplicateMonitor("Second authorized monitor", ALLOWED);
         Monitor hidden = duplicateMonitor("Hidden monitor", RESTRICTED);
