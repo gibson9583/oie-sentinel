@@ -429,7 +429,6 @@ export function ProblemsPage() {
         <div className="sn-problems">
             {detailId != null ? (
                 <ProblemDetailPane id={detailId}
-                    monitors={monitorsApi.data}
                     onBack={() => setDetailId(null)}
                     onChanged={() => load(true)} />
             ) : null}
@@ -540,7 +539,7 @@ function RunbookLink({ url }) {
     );
 }
 
-function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
+function ProblemDetailPane({ id, onBack, onChanged }) {
     const userNameOf = useUsernames();
     const [detail, setDetail] = React.useState(null);
     const [error, setError] = React.useState(null);
@@ -654,15 +653,7 @@ function ProblemDetailPane({ id, monitors, onBack, onChanged }) {
     const parsed = detail ? parseDetails(ev.detailsJson) : null;
     const dispatches = (detail && detail.dispatches) || [];
     const typeMeta = detail && MONITOR_TYPE_META[detail.monitorType];
-    /* The runbook lives on the monitor, not on ProblemDetail, so it comes from
-       the monitor list the page already loaded for its Monitor column — no
-       extra round trip, and it degrades to no row (never an error) while that
-       list is loading, if it failed, or if the monitor has since been deleted. */
-    const runbookUrl = React.useMemo(() => {
-        const owner = (monitors || []).find((m) => m.id === ev.monitorId);
-        const url = owner && owner.runbookUrl ? String(owner.runbookUrl).trim() : '';
-        return url || null;
-    }, [monitors, ev.monitorId]);
+    const runbookUrl = (detail && detail.runbookUrl ? String(detail.runbookUrl).trim() : '') || null;
 
     return (
         <div className="sn-problem-detail">

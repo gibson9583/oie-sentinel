@@ -15,7 +15,7 @@ import {
 } from 'recharts';
 import {
     errText, getChannelActivity, getCoreChannels, getCoreChannelGroups, getCoreTags,
-    getCoreUsers, listMonitors,
+    getCoreUsers, getDashboardCoverage, listMonitors,
 } from './api.js';
 
 const React = platform.React;
@@ -662,6 +662,13 @@ function multiValue(e) {
     return Array.from(e.target.selectedOptions, (o) => o.value);
 }
 
+function unlistedOptions(value, multiple, listed, label) {
+    const values = multiple ? (Array.isArray(value) ? value : []) : [value];
+    return [...new Set(values.filter((v) => v != null && v !== '').map(String))]
+        .filter((v) => !listed.has(v))
+        .map((v) => <option key={`unlisted:${v}`} value={v}>{label(v)}</option>);
+}
+
 function PickerShell({ loading, error, reload, children }) {
     if (error) {
         return (
@@ -681,10 +688,8 @@ function PickerShell({ loading, error, reload, children }) {
  * unmonitored channel is the one case where the chart is guaranteed to have
  * nothing interesting to say.
  *
- * <p>Coverage is resolved exactly rather than guessed: CHANNEL scope names
- * its channel, and GROUP/TAG scopes are expanded through the membership the
- * {@code /core/channelGroups} and {@code /core/tags} payloads already carry,
- * so this agrees with what the evaluator will actually do. A single enabled
+ * <p>Coverage comes from GET /dashboard/coverage, which counts every enabled
+ * monitor, including monitors the user cannot read. A single enabled
  * ALL-scoped monitor covers everything, in which case no filtering happens
  * at all.</p>
  *
@@ -698,14 +703,12 @@ function PickerShell({ loading, error, reload, children }) {
  *          was passed through untouched, so callers can say so in the UI
  */
 export function useMonitoredChannels(channels) {
-    const monitors = useApi(listMonitors, []);
-    const groups = useApi(getCoreChannelGroups, []);
-    const tags = useApi(getCoreTags, []);
+    const coverageApi = useApi(getDashboardCoverage, []);
 
     return React.useMemo(() => {
         const list = Array.isArray(channels) ? channels : [];
         const all = { channels: list, filtered: false, total: list.length };
-        const coverage = resolveCoverage(monitors.data, groups.data, tags.data);
+        const coverage = coverageFrom(coverageApi.data);
         // Still loading, failed, or nothing to narrow by: show everything.
         if (!coverage.known || coverage.coversAll || !list.length) return all;
 
@@ -713,57 +716,25 @@ export function useMonitoredChannels(channels) {
         return narrowed.length
             ? { channels: narrowed, filtered: narrowed.length < list.length, total: list.length }
             : all;
-    }, [channels, monitors.data, groups.data, tags.data]);
+    }, [channels, coverageApi.data]);
 }
 
 /**
- * Resolves which channels at least one ENABLED monitor actually covers, from
- * already-fetched monitor / group / tag lists.
+ * Reads GET /dashboard/coverage for {@link useMonitoredChannels} and the host
+ * Dashboard column, so both apply the server's single coverage rule.
  *
- * <p>Extracted from {@link useMonitoredChannels} so the host Dashboard column
- * (which is not a hook context and runs off a shared poll rather than three
- * {@code useApi} calls) applies the identical rule. Two places deciding
- * separately what "monitored" means is exactly how a coverage indicator ends
- * up disagreeing with the picker that claims to show the same thing.</p>
- *
- * @param monitors GET /monitors
- * @param groups   GET /core/channelGroups
- * @param tags     GET /core/tags
- * @returns { known, coversAll, covered } — `known` is false while the monitor
- *          list has not loaded or failed, and callers MUST NOT report anything
+ * @param coverage GET /dashboard/coverage
+ * @returns { known, coversAll, covered } — `known` is false while coverage
+ *          has not loaded or failed, and callers MUST NOT report anything
  *          as unmonitored in that state; `coversAll` short-circuits the set
  *          because a single enabled ALL-scoped monitor covers every channel
  *          that exists, including ones created later
  */
-export function resolveCoverage(monitors, groups, tags) {
-    const empty = { known: false, coversAll: false, covered: new Set() };
-    const defined = Array.isArray(monitors) ? monitors.filter((m) => m && m.enabled) : null;
-    if (!defined) return empty;
-    if (defined.some((m) => m.scopeType === 'ALL')) {
-        return { known: true, coversAll: true, covered: new Set() };
+export function coverageFrom(coverage) {
+    if (!coverage || typeof coverage !== 'object' || !Array.isArray(coverage.channelIds)) {
+        return { known: false, coversAll: false, covered: new Set() };
     }
-
-    const members = (rows, key) => {
-        const map = {};
-        (Array.isArray(rows) ? rows : []).forEach((r) => {
-            if (r && r[key]) map[r[key]] = Array.isArray(r.channelIds) ? r.channelIds : [];
-        });
-        return map;
-    };
-    const groupMembers = members(groups, 'id');
-    const tagMembers = members(tags, 'id');
-
-    const covered = new Set();
-    defined.forEach((m) => {
-        if (m.scopeType === 'CHANNEL') {
-            if (m.scopeId) covered.add(m.scopeId);
-        } else if (m.scopeType === 'GROUP') {
-            (groupMembers[m.scopeId] || []).forEach((id) => covered.add(id));
-        } else if (m.scopeType === 'TAG') {
-            (tagMembers[m.scopeId] || []).forEach((id) => covered.add(id));
-        }
-    });
-    return { known: true, coversAll: false, covered };
+    return { known: true, coversAll: coverage.coversAll === true, covered: new Set(coverage.channelIds) };
 }
 
 /**
@@ -785,6 +756,8 @@ export function ChannelPicker({ value, onChange, channels, multiple, emptyLabel 
                         {c.name || c.channelId}{c.started === false ? ' (stopped)' : ''}
                     </option>
                 ))}
+                {unlistedOptions(value, multiple, new Set(list.map((c) => String(c.channelId))),
+                    (id) => `${id} (unavailable)`)}
             </select>
         </PickerShell>
     );
@@ -804,6 +777,8 @@ export function ChannelGroupPicker({ value, onChange, groups, multiple, emptyLab
                 {list.map((g) => (
                     <option key={g.id} value={g.id}>{g.name || g.id}</option>
                 ))}
+                {unlistedOptions(value, multiple, new Set(list.map((g) => String(g.id))),
+                    (id) => `${id} (unavailable)`)}
             </select>
         </PickerShell>
     );
@@ -824,6 +799,8 @@ export function MonitorPicker({ value, onChange, monitors, multiple, emptyLabel 
                 {list.map((m) => (
                     <option key={m.id} value={String(m.id)}>{m.name || `#${m.id}`}</option>
                 ))}
+                {unlistedOptions(value, multiple, new Set(list.map((m) => String(m.id))),
+                    (id) => `#${id} (unavailable)`)}
             </select>
         </PickerShell>
     );
@@ -846,6 +823,8 @@ export function TagPicker({ value, onChange, tags, multiple, emptyLabel = 'All t
                         {t.name || t.id}
                     </option>
                 ))}
+                {unlistedOptions(value, multiple, new Set(list.map((t) => String(t.id))),
+                    (id) => `${id} (unavailable)`)}
             </select>
         </PickerShell>
     );

@@ -7,10 +7,13 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.function.Predicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +22,6 @@ import com.mirth.connect.server.controllers.ChannelController;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -110,6 +112,36 @@ public final class ProblemService {
                 acknowledged, fromEpochMillis, toEpochMillis, q, sortColumn, sortDir, page, pageSize));
     }
 
+    public static Set<Integer> acknowledgingUserIds(Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds != null && authorizedChannelIds.isEmpty()) {
+            return new HashSet<>();
+        }
+        return new HashSet<>(AlertEventRepository.listAcknowledgingUserIds(
+                authorizedChannelIds == null ? null : new ArrayList<>(authorizedChannelIds)));
+    }
+
+    public static PagedResult<AlertEvent> list(String status, String severityCsv, String channelIdCsv,
+            Integer monitorId, String monitorTypeName, Boolean acknowledged, Long fromEpochMillis,
+            Long toEpochMillis, String q, String sortColumn, String sortDir, int page, int pageSize,
+            Set<String> authorizedChannelIds) {
+        AlertEventFilter filter = buildFilter(status, severityCsv, channelIdCsv, monitorId, monitorTypeName,
+                acknowledged, fromEpochMillis, toEpochMillis, q, sortColumn, sortDir, page, pageSize);
+        if (authorizedChannelIds != null && filter.getMonitorType() != null) {
+            List<Integer> readable = new ArrayList<>();
+            for (Monitor monitor : MonitorService.list(authorizedChannelIds)) {
+                if (monitor.getMonitorType() == filter.getMonitorType()
+                        && (monitorId == null || monitorId.equals(monitor.getId()))) {
+                    readable.add(monitor.getId());
+                }
+            }
+            if (readable.isEmpty()) {
+                return new PagedResult<>(List.of(), 0L, filter.getPage(), filter.getPageSize());
+            }
+            filter.setMonitorIdIn(readable);
+        }
+        return list(filter);
+    }
+
     /**
      * Translates the raw {@code GET /problems} query parameters into an
      * {@link AlertEventFilter}: CSV values are split, enum names parsed
@@ -181,7 +213,31 @@ public final class ProblemService {
      * @throws NoSuchElementException if no event has that id
      */
     public static ProblemDetail getDetail(long id) {
+        return getDetail(id, null);
+    }
+
+    /**
+     * Reads only an authorized event and current monitor metadata the caller
+     * may see. A historical event can remain on an allowed channel after its
+     * monitor has been retargeted to a restricted scope.
+     */
+    public static ProblemDetail getDetail(long id, Set<String> authorizedChannelIds) {
+        return getDetail(id, authorizedChannelIds,
+                channelId -> authorizedChannelIds == null || authorizedChannelIds.contains(channelId));
+    }
+
+    /**
+     * Authorizes the fetched event by its stored channel identity, separately
+     * from the current channel inventory used to authorize monitor metadata.
+     * This keeps retained events readable after channel deletion without
+     * broadening access to their monitor's current definition.
+     */
+    public static ProblemDetail getDetail(long id, Set<String> authorizedMonitorChannelIds,
+            Predicate<String> canReadEventChannel) {
         AlertEvent event = requireEvent(id);
+        if (!canReadEventChannel.test(event.getChannelId())) {
+            throw new NoSuchElementException("No problem with id " + id);
+        }
 
         ProblemDetail detail = new ProblemDetail();
         detail.setEvent(event);
@@ -189,9 +245,16 @@ public final class ProblemService {
         // The monitor FK cascades on delete (deleting a monitor deletes its
         // events), so a missing monitor is rare — but a row read mid-delete
         // must degrade to a placeholder, not a 500.
-        Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
-        detail.setMonitorName(monitor != null ? monitor.getName() : DELETED_MONITOR);
+        Monitor monitor = null;
+        try {
+            monitor = MonitorService.get(event.getMonitorId(), authorizedMonitorChannelIds);
+        } catch (NoSuchElementException e) {
+            // A readable event does not grant access to a hidden current definition.
+        }
+        detail.setMonitorName(monitor != null ? monitor.getName()
+                : authorizedMonitorChannelIds == null ? DELETED_MONITOR : "(unavailable monitor)");
         detail.setMonitorType(monitor != null ? monitor.getMonitorType() : null);
+        detail.setRunbookUrl(monitor != null ? monitor.getRunbookUrl() : null);
 
         detail.setChannelName(ScopeResolver.channelName(event.getChannelId()));
         detail.setConnectorName(resolveConnectorName(event));

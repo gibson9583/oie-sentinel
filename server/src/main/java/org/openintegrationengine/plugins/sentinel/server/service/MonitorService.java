@@ -9,11 +9,14 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.function.Function;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -72,6 +75,25 @@ public final class MonitorService {
         return MonitorRepository.listMonitors(null, null, null, null);
     }
 
+    /** Lists only definitions whose complete scope is authorized for this request. */
+    public static List<Monitor> list(Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds == null) return list();
+        if (authorizedChannelIds.isEmpty()) return List.of();
+        List<Monitor> monitors = list();
+        Map<Integer, Monitor> byId = new HashMap<>();
+        for (Monitor monitor : monitors) {
+            if (monitor.getId() != null) byId.put(monitor.getId(), monitor);
+        }
+        Map<Integer, Boolean> visibility = new HashMap<>();
+        List<Monitor> visible = new ArrayList<>();
+        for (Monitor monitor : monitors) {
+            if (definitionVisible(monitor, authorizedChannelIds, byId::get, visibility)) {
+                visible.add(monitor);
+            }
+        }
+        return visible;
+    }
+
     /**
      * Fetches one monitor.
      *
@@ -85,6 +107,47 @@ public final class MonitorService {
             throw new NoSuchElementException("No monitor with id " + id);
         }
         return monitor;
+    }
+
+    /** Hidden and missing definitions use the same not-found response. */
+    public static Monitor get(int id, Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds == null) return get(id);
+        if (authorizedChannelIds.isEmpty()) throw new NoSuchElementException("No monitor with id " + id);
+        Monitor monitor = get(id);
+        if (!definitionVisible(monitor, authorizedChannelIds, MonitorRepository::getMonitor, new HashMap<>())) {
+            throw new NoSuchElementException("No monitor with id " + id);
+        }
+        return monitor;
+    }
+
+    /**
+     * A definition includes its suppression dependency. Hide the whole row
+     * when that chain is not readable: returning a redacted null parent
+     * would let an editor accidentally erase the stored dependency. Resolve
+     * iteratively so a corrupt long chain or cycle cannot overflow the stack.
+     */
+    private static boolean definitionVisible(Monitor monitor, Set<String> authorizedChannelIds,
+            Function<Integer, Monitor> lookup, Map<Integer, Boolean> known) {
+        Set<Integer> visited = new HashSet<>();
+        boolean visible = false;
+        while (monitor != null) {
+            Integer id = monitor.getId();
+            if (id == null || !visited.add(id)) break;
+            if (known.containsKey(id)) {
+                visible = known.get(id);
+                break;
+            }
+            if (!MonitorVisibility.isVisible(monitor, authorizedChannelIds)) break;
+            Integer parentId = monitor.getSuppressedByMonitorId();
+            if (parentId == null) {
+                visible = true;
+                break;
+            }
+            if (visited.contains(parentId)) break;
+            monitor = lookup.apply(parentId);
+        }
+        for (Integer id : visited) known.put(id, visible);
+        return visible;
     }
 
     /**

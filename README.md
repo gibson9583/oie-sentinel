@@ -289,7 +289,7 @@ operational roles:
 
 | Permission | Grants |
 | --- | --- |
-| View Monitoring | All reads: dashboard, problems, monitors, actions, windows, activity |
+| View Monitoring | Monitoring reads: dashboard, problems, authorized monitors, actions, windows, activity |
 | Acknowledge Problems | Acknowledge, bulk acknowledge, manual resolve |
 | Manage Schedules | Schedule create/update/delete and "activate now" (on-call tier) |
 | Manage Monitoring | Monitor and action authoring, including delivery credentials and test sends |
@@ -298,6 +298,24 @@ operational roles:
 Delivery credentials — SNS access keys and role ARNs — and recipient lists are part of an action's
 configuration, so they belong to Manage Monitoring. Manage Settings covers only the five
 scheduler-interval and retention values on the Settings page.
+
+Channel-restricted viewers see monitor definitions only when their complete, nonempty scope is
+within the user's authorized channels, including stopped and undeployed members. This applies to
+CHANNEL, GROUP, TAG and ALL scopes, suppression ancestors, monitor details and history, and dashboard
+monitor totals. Mixed, empty, missing and unresolved scopes are hidden; hidden monitor IDs
+return 404. Group and tag pickers use the same complete-membership rule. Scope membership and
+permissions are checked for each request. Authorized channel events remain readable even if their
+monitor's current definition is hidden or the channel has been deleted; problem details omit a
+hidden definition's current name, type and runbook URL. Coverage includes authorized channels watched
+by any enabled monitor, even when the definition itself is hidden. Restricted coverage responses
+contain explicit authorized channel IDs and never identify global ALL-scope monitoring.
+
+The full user-name directory additionally requires the engine's **Manage Users** permission. Without
+it, the lookup returns only the caller and acknowledgement authors on their visible channels; the UI
+uses user IDs for any remaining attribution. Action and schedule definitions remain
+global configuration reads. **Manage Monitoring** grants global configuration authoring and export;
+**Manage Schedules** grants global schedule authoring. These management grants are broader than a
+channel-scoped monitoring view and should be assigned accordingly.
 
 Without an authorization plugin installed, the engine permits everything.
 

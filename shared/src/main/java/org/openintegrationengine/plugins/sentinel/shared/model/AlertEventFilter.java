@@ -25,10 +25,11 @@ import java.util.Set;
  * #validateSortDir(String)} so a field on this object can never hold
  * anything other than an allow-listed value, however it was constructed.</p>
  *
- * <h2>The two list setters copy, and must keep copying</h2>
+ * <h2>The list setters copy, and must keep copying</h2>
  *
- * <p>{@link #setSeverityIn(List)} and {@link #setChannelIdIn(List)} store an
- * {@link ArrayList} copy rather than the caller's list. That looks like
+ * <p>{@link #setSeverityIn(List)}, {@link #setChannelIdIn(List)} and
+ * {@link #setMonitorIdIn(List)} store an {@link ArrayList} copy rather than
+ * the caller's list. That looks like
  * pointless defensiveness and is not: it is load-bearing, and removing it
  * silently breaks features rather than failing a build.</p>
  *
@@ -73,6 +74,7 @@ public class AlertEventFilter {
     private List<Severity> severityIn;
     private List<String> channelIdIn;
     private Integer monitorId;
+    private List<Integer> monitorIdIn;
     private MonitorType monitorType;
     private Boolean acknowledged;
     private Instant from;
@@ -152,6 +154,14 @@ public class AlertEventFilter {
      */
     public void setMonitorId(Integer monitorId) {
         this.monitorId = monitorId;
+    }
+
+    public List<Integer> getMonitorIdIn() {
+        return monitorIdIn;
+    }
+
+    public void setMonitorIdIn(List<Integer> monitorIdIn) {
+        this.monitorIdIn = monitorIdIn == null ? null : new ArrayList<>(monitorIdIn);
     }
 
     /**

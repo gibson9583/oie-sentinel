@@ -19,9 +19,9 @@
 import { platform } from '@oie/web-shell';
 import { errorModal } from '@oie/web-ui';
 import {
-    getProblems, listMonitors, getCoreChannelGroups, getCoreTags, errText,
+    getProblems, getDashboardCoverage, errText,
 } from './api.js';
-import { SEVERITY_META, resolveCoverage } from './ui.jsx';
+import { SEVERITY_META, coverageFrom } from './ui.jsx';
 
 const React = platform.React;
 
@@ -254,9 +254,9 @@ const MAX_PROBLEMS = 500;
 
 /* How often coverage (which channels any enabled monitor watches) is re-read,
    as a multiple of POLL_MS. Problems change minute to minute; coverage changes
-   only when somebody edits a monitor, so re-reading three lists every 30s to
-   catch that would be three quarters of this feature's request volume spent on
-   the part that almost never moves. */
+   only when somebody edits a monitor, so re-reading it every 30s to catch
+   that would be half of this feature's request volume spent on the part that
+   almost never moves. */
 const COVERAGE_EVERY_N_POLLS = 10;   // 5 minutes at POLL_MS = 30s
 const PROBLEM_STALE_MS = POLL_MS * 3;
 const COVERAGE_STALE_MS = POLL_MS * (COVERAGE_EVERY_N_POLLS + 2);
@@ -312,10 +312,7 @@ function pollGate() {
  */
 async function refreshCoverage() {
     try {
-        const [monitors, groups, tags] = await Promise.all([
-            listMonitors(), getCoreChannelGroups(), getCoreTags(),
-        ]);
-        snapshot.coverage = resolveCoverage(monitors, groups, tags);
+        snapshot.coverage = coverageFrom(await getDashboardCoverage());
         snapshot.coverageUpdatedAt = Date.now();
         snapshot.coverageFailed = false;
     } catch (e) {

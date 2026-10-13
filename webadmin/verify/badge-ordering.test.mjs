@@ -38,7 +38,7 @@ const nodes = (node) => node == null || typeof node === 'boolean' ? []
 
 
 mod.platform.store.getState = () => ({ id: 1 });
-const coverage = p => p.endsWith('/monitors') ? [{ enabled: true, scopeType: 'ALL' }] : [];
+const coverage = p => p.endsWith('/dashboard/coverage') ? { coversAll: true, channelIds: [] } : [];
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 async function settle() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
 test('timer and remount refreshes join a pending poll instead of racing responses', async () => {
@@ -63,14 +63,14 @@ test('the serialized refresh includes slow coverage reads', async () => {
     mod.platform.api.get = async p => p.endsWith('/problems') ? { items: [], total: 0 } : coverage(p);
     for (let i = 2; i < 10; i++) await mod.refresh();
     const pending = deferred();
-    let monitorCalls = 0, problemCalls = 0;
-    mod.platform.api.get = async p => p.endsWith('/monitors') ? (++monitorCalls, pending.promise)
+    let coverageCalls = 0, problemCalls = 0;
+    mod.platform.api.get = async p => p.endsWith('/dashboard/coverage') ? (++coverageCalls, pending.promise)
         : p.endsWith('/problems') ? (++problemCalls, { items: [], total: 0 }) : [];
     const first = mod.refresh();
     assert.equal(mod.refresh(), first);
-    assert.equal(monitorCalls, 1);
+    assert.equal(coverageCalls, 1);
     assert.equal(problemCalls, 0);
-    pending.resolve([{ enabled: true, scopeType: 'ALL' }]);
+    pending.resolve({ coversAll: true, channelIds: [] });
     await first;
     assert.equal(problemCalls, 1);
 });

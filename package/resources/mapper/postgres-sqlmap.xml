@@ -180,6 +180,10 @@
                 <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
             </if>
             <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <!-- Repository-generated predicate contains only validated integer IDs.
+                 Literal IDs avoid SQL Server's bind limit; IN groups respect Oracle's limit.
+                 Never populate this parameter from request text. -->
+            <if test="monitorIdPredicate != null">AND ${monitorIdPredicate}</if>
             <if test="monitorType != null">
                 AND monitor_id IN (SELECT id FROM sentinel_monitor WHERE monitor_type = #{monitorType})
             </if>
@@ -223,6 +227,10 @@
                 <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
             </if>
             <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <!-- Repository-generated predicate contains only validated integer IDs.
+                 Literal IDs avoid SQL Server's bind limit; IN groups respect Oracle's limit.
+                 Never populate this parameter from request text. -->
+            <if test="monitorIdPredicate != null">AND ${monitorIdPredicate}</if>
             <if test="monitorType != null">
                 AND monitor_id IN (SELECT id FROM sentinel_monitor WHERE monitor_type = #{monitorType})
             </if>
@@ -245,6 +253,21 @@
                      OR UPPER(channel_id) LIKE UPPER(CONCAT('%', #{q}, '%')) ESCAPE '!')
             </if>
         </where>
+    </select>
+
+    <select id="listAcknowledgingUserIds" parameterType="map" resultType="Integer">
+        SELECT DISTINCT acknowledged_by
+        FROM sentinel_alert_event
+        WHERE acknowledged_by IS NOT NULL
+        <if test="channelIdIn != null">
+            <choose>
+                <when test="channelIdIn.isEmpty()">AND 1 = 0</when>
+                <otherwise>
+                    AND channel_id IN
+                    <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+                </otherwise>
+            </choose>
+        </if>
     </select>
 
     <select id="listRecentAlertEvents" parameterType="map" resultType="map">

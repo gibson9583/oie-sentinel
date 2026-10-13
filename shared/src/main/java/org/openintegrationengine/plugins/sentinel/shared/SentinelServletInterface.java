@@ -134,19 +134,22 @@ public interface SentinelServletInterface extends BaseServletInterface {
     // ========== Monitors ==========
 
     /**
-     * Lists every monitor definition.
+     * Lists monitor definitions visible to the caller. Restricted readers
+     * need access to every member of a nonempty scope and every suppression
+     * ancestor. Mixed, empty, missing or incomplete scopes are hidden.
+     * Scope membership is checked regardless of deployment state.
      *
      * @return JSON array of Monitor
      * @throws ClientException if the underlying persistence call fails
      */
     @GET
     @Path("/monitors")
-    @Operation(summary = "Returns all monitor definitions")
+    @Operation(summary = "Returns authorized monitor definitions")
     @MirthOperation(name = "sentinelGetMonitors", display = "Get Sentinel monitors", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
     String getMonitors() throws ClientException;
 
     /**
-     * Fetches a single monitor by id.
+     * Fetches a visible monitor by id; hidden and missing IDs both return 404.
      *
      * @param id database id of the monitor
      * @return JSON Monitor
@@ -261,8 +264,8 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * channels aggregates across channels a restricted caller may not see. Their
      * series is therefore computed only over channels they are authorized for,
      * the same rule {@code /dashboard/summary} applies to its own
-     * channel-attributed numbers. The monitor's existence is not hidden —
-     * monitor definitions are not channel-filtered anywhere in this contract.</p>
+     * channel-attributed numbers. Hidden and missing monitor definitions
+     * return 404 before any history is queried.</p>
      *
      * <p>Read-only and polled by an open editor, so {@code auditable = false}
      * like the other reads, and gated at {@link #PERMISSION_VIEW}: this is alert
@@ -603,7 +606,9 @@ public interface SentinelServletInterface extends BaseServletInterface {
     /**
      * Returns the dashboard's entire top fold (severity counts, top problem
      * channels, monitor health, recent problems, collector heartbeats) in one
-     * payload so the landing page renders with a single request.
+     * payload so the landing page renders with a single request. Monitor
+     * totals include only visible definitions. Coverage counts the authorized
+     * channels that any enabled monitor watches.
      *
      * @return JSON DashboardSummary
      * @throws ClientException on persistence failure
@@ -613,6 +618,21 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @Operation(summary = "Returns the aggregated dashboard summary")
     @MirthOperation(name = "sentinelGetDashboardSummary", display = "Get Sentinel dashboard summary", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
     String getDashboardSummary() throws ClientException;
+
+    /**
+     * Returns the authorized channels that at least one enabled monitor
+     * covers, whatever their deployed state. Restricted readers receive
+     * explicit authorized channel IDs with {@code coversAll=false}; only
+     * unrestricted readers can receive the global ALL-scope flag.
+     *
+     * @return JSON {@code {coversAll, channelIds}}
+     * @throws ClientException on persistence or engine controller failure
+     */
+    @GET
+    @Path("/dashboard/coverage")
+    @Operation(summary = "Returns the channels covered by enabled monitors")
+    @MirthOperation(name = "sentinelGetDashboardCoverage", display = "Get Sentinel monitor coverage", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getDashboardCoverage() throws ClientException;
 
     /**
      * Returns one channel's message-activity time series for charting.
@@ -710,7 +730,8 @@ public interface SentinelServletInterface extends BaseServletInterface {
 
     /**
      * Returns the engine's channel groups (id, name, member channel ids) as
-     * clean JSON for Sentinel's group-scope pickers.
+     * clean JSON for Sentinel's group-scope pickers. Restricted readers see
+     * only nonempty groups whose complete membership is authorized.
      *
      * @return JSON array of ChannelGroupInfo
      * @throws ClientException on engine controller failure
@@ -724,7 +745,8 @@ public interface SentinelServletInterface extends BaseServletInterface {
     /**
      * Returns the engine's channel tags (id, name, member channel ids,
      * background color as hex) for Sentinel's tag-scope pickers and
-     * condition editors.
+     * condition editors. Restricted readers see only nonempty tags whose
+     * complete membership is authorized.
      *
      * @return JSON array of TagInfo
      * @throws ClientException on engine controller failure
@@ -736,12 +758,11 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String getCoreTags() throws ClientException;
 
     /**
-     * Returns the engine's users as id/username pairs so the UI can render
-     * "acknowledged by {name}" instead of a bare user id. Intentionally
-     * carries nothing beyond id and username — see {@code UserInfo} — and is
-     * view-gated like the other core passthroughs, because the engine's own
-     * {@code /users} endpoint needs user-management permission a Sentinel
-     * viewer may not hold.
+     * Returns id/username pairs for display. In addition to
+     * {@link #PERMISSION_VIEW}, the full directory requires the core
+     * getAllUsers operation (Manage Users). Other readers receive only
+     * themselves and acknowledgement authors on authorized channels.
+     * The UI falls back to user IDs for names unavailable through this lookup.
      *
      * @return JSON array of UserInfo
      * @throws ClientException on engine controller failure
@@ -797,13 +818,12 @@ public interface SentinelServletInterface extends BaseServletInterface {
      * (see {@link #importConfiguration}).</p>
      *
      * <p><b>Gated at {@link #PERMISSION_MANAGE}, not {@link #PERMISSION_VIEW},
-     * unlike every other read.</b> The document is the full action
+     * as a global configuration-management capability.</b> The document is the full action
      * configuration surface in one file that leaves the server: SNS topic ARNs
      * and regions, mail recipient lists, target channel ids, every condition
-     * row. Each of those is individually readable at View Monitoring, but
-     * handing a viewer one downloadable copy of the entire alerting
-     * configuration is a different act, and the permission that authors that
-     * configuration is the right one to gate re-materializing it elsewhere.
+     * row. Unlike channel-scoped monitor reads, export intentionally includes
+     * global definitions and requires the permission that authors that
+     * configuration.
      * Secrets are excluded regardless — they leave as the redaction marker,
      * because export reads actions through the same redacting service path the
      * other reads use.</p>
