@@ -129,7 +129,8 @@ public final class ProblemService {
         if (authorizedChannelIds != null && filter.getMonitorType() != null) {
             List<Integer> readable = new ArrayList<>();
             for (Monitor monitor : MonitorService.list(authorizedChannelIds)) {
-                if (monitor.getMonitorType() == filter.getMonitorType()) {
+                if (monitor.getMonitorType() == filter.getMonitorType()
+                        && (monitorId == null || monitorId.equals(monitor.getId()))) {
                     readable.add(monitor.getId());
                 }
             }

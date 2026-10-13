@@ -867,7 +867,7 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     /**
      * Maps a service-layer failure onto the HTTP status contract:
      * {@link IllegalArgumentException} (validation / bad input) → 400,
-     * {@link NoSuchElementException} (missing entity) → 404, an already-built
+     * {@link NoSuchElementException} (missing entity) → 404, a non-server-error
      * {@link MirthApiException} passes through untouched (e.g. the 403 from
      * channel redaction), and anything unexpected → an opaque 500. Returned
      * rather than thrown so call sites read {@code throw translate(...)} and
@@ -888,8 +888,10 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * internals by construction.</p>
      */
     private RuntimeException translate(String operationName, Exception e) {
-        if (e instanceof MirthApiException) {
-            return (MirthApiException) e;
+        if (e instanceof MirthApiException apiException
+                && apiException.getResponse() != null
+                && apiException.getResponse().getStatus() < 500) {
+            return apiException;
         }
         if (e instanceof IllegalArgumentException) {
             return apiError(Status.BAD_REQUEST, e.getMessage());
@@ -900,7 +902,15 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         // Operation name + ref id + full stack on one record: everything
         // support needs to answer "what was ref 4f3c...?" from the log alone.
         String ref = UUID.randomUUID().toString();
-        log.error("Sentinel operation '{}' failed unexpectedly (ref: {})", operationName, ref, e);
+        // The engine puts ControllerException in the response entity rather
+        // than the cause chain. Log that cause locally, never serialize it.
+        Throwable cause = e;
+        if (e instanceof MirthApiException apiException
+                && apiException.getResponse() != null
+                && apiException.getResponse().getEntity() instanceof Throwable entityCause) {
+            cause = entityCause;
+        }
+        log.error("Sentinel operation '{}' failed unexpectedly (ref: {})", operationName, ref, cause);
         return apiError(Status.INTERNAL_SERVER_ERROR, "Sentinel operation failed (ref: " + ref + ")");
     }
 

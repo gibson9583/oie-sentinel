@@ -26,19 +26,19 @@ class ScopedReadMapperContractTest {
         params.put("limit", 25); params.put("offset", 0);
         for (String statement : List.of("listAlertEvents", "countAlertEvents")) {
             var mapped = mapping.getMappedStatement("Sentinel." + statement);
-            params.put("monitorIdIn", null);
+            params.put("monitorIdPredicate", null);
             assertFalse(normalized(mapped.getBoundSql(params).getSql()).contains("1 = 0"));
-            params.put("monitorIdIn", new ArrayList<>());
+            params.put("monitorIdPredicate", "1 = 0");
             assertTrue(normalized(mapped.getBoundSql(params).getSql()).contains("1 = 0"));
-            params.put("monitorIdIn", new ArrayList<>(List.of(3, 9)));
+            params.put("monitorIdPredicate", "(monitor_id IN (3,9))");
             params.put("monitorId", 3); params.put("monitorType", "QUEUE_DEPTH");
             var bound = mapped.getBoundSql(params);
             String sql = normalized(bound.getSql());
             assertFalse(sql.contains("1 = 0"));
-            assertTrue(sql.replace(" ", "").contains("monitor_idIN(?,?)"), sql);
+            assertTrue(sql.replace(" ", "").contains("monitor_idIN(3,9)"), sql);
             assertTrue(sql.contains("monitor_id = ?"), sql);
             assertTrue(sql.contains("monitor_type = ?"), sql);
-            assertEquals(2, bound.getParameterMappings().stream().filter(p -> p.getProperty().startsWith("__frch_mid_")).count());
+            assertEquals(0, bound.getParameterMappings().stream().filter(p -> p.getProperty().startsWith("__frch_mid_")).count());
         }
         var actors = mapping.getMappedStatement("Sentinel.listAcknowledgingUserIds");
         params.put("channelIdIn", null);

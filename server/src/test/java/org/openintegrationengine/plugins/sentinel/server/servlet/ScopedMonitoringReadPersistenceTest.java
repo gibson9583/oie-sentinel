@@ -302,6 +302,71 @@ class ScopedMonitoringReadPersistenceTest {
     }
 
     @Test
+    void largeMonitorAllowListPreservesGlobalPagesCountsAndOtherFilters() throws Exception {
+        Monitor second = duplicateMonitor("Second authorized monitor", ALLOWED);
+        Monitor hidden = duplicateMonitor("Hidden monitor", RESTRICTED);
+        Monitor differentType = duplicateMonitor("Different type", ALLOWED);
+        differentType.setMonitorType(MonitorType.ERROR_RATE);
+        MonitorRepository.updateMonitor(differentType);
+        Instant start = Instant.parse("2026-10-02T00:00:00Z");
+        List<AlertEvent> expected = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            expected.add(pagingEvent(i % 2 == 0 ? monitor.getId() : second.getId(), ALLOWED,
+                    Severity.WARNING, AlertStatus.PROBLEM, "keep", start.plusSeconds(i), null));
+        }
+        // These rows would escape if OR groups were not enclosed as a whole.
+        pagingEvent(second.getId(), RESTRICTED, Severity.WARNING, AlertStatus.PROBLEM, "keep", start, null);
+        pagingEvent(second.getId(), ALLOWED, Severity.DISASTER, AlertStatus.PROBLEM, "keep", start, null);
+        pagingEvent(second.getId(), ALLOWED, Severity.WARNING, AlertStatus.RESOLVED, "keep", start, null);
+        pagingEvent(second.getId(), ALLOWED, Severity.WARNING, AlertStatus.PROBLEM, "keep", start, 42);
+        pagingEvent(monitor.getId(), ALLOWED, Severity.WARNING, AlertStatus.PROBLEM, "omit", start, null);
+        pagingEvent(monitor.getId(), ALLOWED, Severity.WARNING, AlertStatus.PROBLEM, "keep", start.minusSeconds(1), null);
+        pagingEvent(differentType.getId(), ALLOWED, Severity.WARNING, AlertStatus.PROBLEM, "keep", start, null);
+        pagingEvent(hidden.getId(), ALLOWED, Severity.WARNING, AlertStatus.PROBLEM, "keep", start, null);
+
+        List<Integer> readable = new ArrayList<>();
+        readable.add(monitor.getId());
+        for (int id = 100; id < 1099; id++) readable.add(id);
+        readable.add(second.getId()); // First ID of the second IN group.
+        readable.add(differentType.getId());
+        for (int id = 2000; id < 3100; id++) readable.add(id);
+        readable.add(monitor.getId()); // Duplicate across groups must not duplicate rows/counts.
+
+        for (String direction : List.of("ASC", "DESC")) {
+            List<Long> ordered = new ArrayList<>(expected.stream().map(AlertEvent::getId).toList());
+            if (direction.equals("DESC")) Collections.reverse(ordered);
+            for (int page = 0; page < 4; page++) {
+                AlertEventFilter filter = org.openintegrationengine.plugins.sentinel.server.service.ProblemService
+                        .buildFilter("PROBLEM", "WARNING", ALLOWED, null, "QUEUE_DEPTH", false,
+                                start.toEpochMilli(), start.plusSeconds(60).toEpochMilli(), "keep",
+                                "opened_time", direction, page, 2);
+                filter.setMonitorIdIn(readable);
+                PagedResult<AlertEvent> result = AlertEventRepository.listAlertEvents(filter);
+                int first = Math.min(page * 2, ordered.size());
+                assertEquals(ordered.subList(first, Math.min(first + 2, ordered.size())),
+                        result.items().stream().map(AlertEvent::getId).toList());
+                assertEquals(5, result.total());
+                assertEquals(page, result.page());
+                assertEquals(2, result.pageSize());
+                System.out.println("SCOPED_READ_PAGINATION direction=" + direction + " page=" + page
+                        + " result=" + Json.write(result));
+            }
+        }
+        AlertEventFilter all = new AlertEventFilter(); all.setPageSize(100);
+        System.out.println("SCOPED_READ_FINAL_PAGINATION_EVENTS "
+                + Json.write(AlertEventRepository.listAlertEvents(all)));
+    }
+
+    private AlertEvent pagingEvent(int monitorId, String channelId, Severity severity, AlertStatus status,
+            String message, Instant opened, Integer actor) {
+        AlertEvent row = new AlertEvent(); row.setMonitorId(monitorId); row.setChannelId(channelId);
+        row.setSeverity(severity); row.setStatus(status); row.setMessage(message); row.setOpenedTime(opened);
+        row.setAcknowledgedBy(actor);
+        if (actor != null) row.setAcknowledgedTime(opened);
+        return AlertEventRepository.insertAlertEvent(row);
+    }
+
+    @Test
     void userAuthorizationFailureRestoresTheOperationAndDoesNotFetchTheDirectory() throws Exception {
         try (DirectoryFixture directory = new DirectoryFixture()) {
             reader.directoryFailure = new IllegalStateException("synthetic backend failure");

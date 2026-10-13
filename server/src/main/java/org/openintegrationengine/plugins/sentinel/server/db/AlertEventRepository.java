@@ -198,7 +198,9 @@ public final class AlertEventRepository {
      * parameter map that feeds the mapped statement's raw {@code
      * ${sortColumn} ${sortDir}} substitution — belt-and-suspenders at the one
      * point in this class where an unvalidated string would become a SQL
-     * injection hole.</p>
+     * injection hole. The monitor authorization predicate is also generated
+     * here, exclusively from validated Integer values; see
+     * {@link #monitorIdPredicate(List)}.</p>
      *
      * @param filter the filter, sort, and page selection to apply
      * @return the requested page of events plus the total matching row count
@@ -222,7 +224,9 @@ public final class AlertEventRepository {
                 items.add(buildAlertEvent(row));
             }
 
-            Map<String, Object> countParams = toFilterParams(filter);
+            // Use the same authorization snapshot for both queries even if
+            // a caller changes its mutable filter while the list is read.
+            Map<String, Object> countParams = new HashMap<>(listParams);
             Integer total = SqlConfig.getInstance().getSqlSessionManager()
                     .selectOne(stmt("countAlertEvents"), countParams);
 
@@ -422,15 +426,45 @@ public final class AlertEventRepository {
             params.put("severityIn", null);
         }
 
-        params.put("channelIdIn", filter.getChannelIdIn());
+        params.put("channelIdIn", filter.getChannelIdIn() != null
+                ? new ArrayList<>(filter.getChannelIdIn()) : null);
         params.put("monitorId", filter.getMonitorId());
-        params.put("monitorIdIn", filter.getMonitorIdIn());
-        params.put("monitorType",filter.getMonitorType() != null ? filter.getMonitorType().name() : null);
+        params.put("monitorIdPredicate", monitorIdPredicate(filter.getMonitorIdIn()));
+        params.put("monitorType", filter.getMonitorType() != null ? filter.getMonitorType().name() : null);
         params.put("acknowledged", filter.getAcknowledged());
         params.put("from", toTimestamp(filter.getFrom()));
         params.put("to", toTimestamp(filter.getTo()));
         params.put("q", escapeLikeWildcards(filter.getQ()));
         return params;
+    }
+
+    /**
+     * Builds a literal integer allow-list, with at most 1,000 values in each
+     * IN clause (Oracle 19c's limit). Binding one parameter per monitor would
+     * exhaust SQL Server's 2,100-parameter budget; splitting those bindings
+     * across OR clauses would still exceed the per-statement limit.
+     *
+     * Only runtime-checked Integer values are rendered, never request text.
+     * Reject nulls and raw-list type violations before any SQL is executed.
+     * Grouping the entire predicate keeps other filters outside the OR, and
+     * leaving pagination/counting in SQL preserves global ordering and totals.
+     */
+    private static String monitorIdPredicate(List<Integer> monitorIds) {
+        if (monitorIds == null) return null;
+        if (monitorIds.isEmpty()) return "1 = 0";
+        StringBuilder predicate = new StringBuilder("(monitor_id IN (");
+        int index = 0;
+        for (Object value : monitorIds) {
+            if (!(value instanceof Integer id)) {
+                throw new IllegalArgumentException("Monitor authorization IDs must be non-null integers");
+            }
+            if (index > 0) {
+                predicate.append(index % 1000 == 0 ? ") OR monitor_id IN (" : ",");
+            }
+            predicate.append(id.intValue());
+            index++;
+        }
+        return predicate.append("))").toString();
     }
 
     /**
