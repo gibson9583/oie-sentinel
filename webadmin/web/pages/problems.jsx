@@ -255,7 +255,9 @@ export function ProblemsPage() {
                 setError(errText(e));
             }
         } finally {
-            if (seq === seqRef.current && !background) setLoading(false);
+            // A background request can supersede a foreground load. The
+            // winning request owns the indicator even if it did not set it.
+            if (seq === seqRef.current) setLoading(false);
         }
     }, []);
 
