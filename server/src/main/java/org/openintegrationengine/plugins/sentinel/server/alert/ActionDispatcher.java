@@ -592,8 +592,10 @@ public final class ActionDispatcher {
                             problemPending || notifyOnWindowEntry)) {
                         entryPassComplete = false;
                     }
-                    maybeEscalate(action, byId, allRows, notifiedThisPass,
-                            event, effectivePayload, now);
+                    if (!maybeEscalate(action, byId, allRows, notifiedThisPass,
+                            event, effectivePayload, now)) {
+                        entryPassComplete = false;
+                    }
                 } catch (Throwable t) {
                     entryPassComplete = false;
                     log.error("Repeat check failed for action {} ('{}') on alert event {}",
@@ -688,53 +690,54 @@ public final class ActionDispatcher {
      * than throwing: a broken escalation must cost the escalation, never the
      * remaining actions on this event.</p>
      */
-    private static void maybeEscalate(Action source, Map<Integer, Action> byId,
+    private static boolean maybeEscalate(Action source, Map<Integer, Action> byId,
             List<ActionDispatchLog> allRows, Set<Integer> notifiedThisPass,
             AlertEvent event, AlertPayload payload, Instant now) {
         // A source can be edited/disabled while earlier fan-out transports run.
         if (actionDecision(source, payload, false) != ActionDecision.ALLOW) {
-            return;
+            return true;
         }
         if (source.getEscalateAfterSeconds() == null || source.getEscalateToActionId() == null) {
-            return;
+            return true;
         }
         Instant opened = event.getOpenedTime();
         if (opened == null) {
-            return;
+            return true;
         }
         long ageSeconds = Duration.between(opened, now).getSeconds();
         if (ageSeconds < 0) {
-            return; // clock skew; nothing is "still open past" a future instant
+            return true; // clock skew; nothing is "still open past" a future instant
         }
 
         Set<Integer> visited = new LinkedHashSet<>();
         visited.add(source.getId());
         Action current = source;
+        List<Action> authorizingSources = new ArrayList<>();
         long threshold = 0;
 
         for (int hop = 1; hop <= MAX_ESCALATION_HOPS; hop++) {
             if (actionDecision(current, payload, false) != ActionDecision.ALLOW) {
-                return;
+                return true;
             }
             Integer after = current.getEscalateAfterSeconds();
             Integer targetId = current.getEscalateToActionId();
             if (after == null || targetId == null) {
-                return; // chain ends here
+                return true; // chain ends here
             }
             threshold += Math.max(0, after);
             if (ageSeconds < threshold) {
-                return; // this link is not due yet
+                return true; // this link is not due yet
             }
             if (targetId.equals(current.getId())) {
                 log.warn("Action {} ('{}') escalates to itself; ignoring the escalation",
                         current.getId(), current.getName());
-                return;
+                return true;
             }
             if (!visited.add(targetId)) {
                 log.warn("Escalation cycle from action {} ('{}') back to action {}; "
                                 + "ignoring the rest of the chain (visited {})",
                         source.getId(), source.getName(), targetId, visited);
-                return;
+                return true;
             }
             Action target = byId.get(targetId);
             if (target == null) {
@@ -743,16 +746,23 @@ public final class ActionDispatcher {
                 log.warn("Action {} ('{}') escalates to action id {}, which is not an enabled action "
                                 + "(deleted or disabled); ending the chain for alert event {}",
                         current.getId(), current.getName(), targetId, event.getId());
-                return;
+                return true;
             }
+            authorizingSources.add(current);
             if (!hasRowsForAction(allRows, targetId) && !notifiedThisPass.contains(targetId)) {
                 log.info("Escalating alert event {} to action {} ('{}') after {}s open "
                                 + "(hop {} from action {} '{}')",
                         event.getId(), target.getId(), target.getName(), ageSeconds,
                         hop, source.getId(), source.getName());
-                notifiedThisPass.add(targetId);
-                attemptPaced(target, event, escalationPayload(payload, ageSeconds, source));
-                return; // one new target per tick
+                AttemptReceipt receipt = new AttemptReceipt();
+                boolean accounted = attemptPaced(target, event, escalationPayload(payload, ageSeconds, source),
+                        List.copyOf(authorizingSources), receipt);
+                // A revoked source cancels this route, not the target's own
+                // pending initial notification or another eligible route.
+                if (receipt.transportAttempted || receipt.recorded) {
+                    notifiedThisPass.add(targetId);
+                }
+                return accounted; // one new target per tick
             }
             current = target; // already told; see whether ITS escalation is due
         }
@@ -760,6 +770,7 @@ public final class ActionDispatcher {
         log.warn("Escalation chain from action {} ('{}') exceeded {} hops on alert event {}; "
                         + "stopping. Check escalateToActionId for a loop or an over-long chain.",
                 source.getId(), source.getName(), MAX_ESCALATION_HOPS, event.getId());
+        return true;
     }
 
     /**
@@ -1301,6 +1312,11 @@ public final class ActionDispatcher {
      */
     private static boolean gatedAttempt(Action action, AlertEvent event, AlertPayload payload,
             boolean resolvedPhase) {
+        return gatedAttempt(action, event, payload, resolvedPhase, List.of(), new AttemptReceipt());
+    }
+
+    private static boolean gatedAttempt(Action action, AlertEvent event, AlertPayload payload,
+            boolean resolvedPhase, List<Action> authorizingSources, AttemptReceipt receipt) {
         ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
         if (actionPolicy != ActionDecision.ALLOW) {
             return actionPolicy == ActionDecision.INAPPLICABLE;
@@ -1319,17 +1335,16 @@ public final class ActionDispatcher {
         }
         AlertStormControl.CeilingVerdict verdict =
                 AlertStormControl.ceilingVerdict(action, Instant.now());
-        boolean[] transportAttempted = {false};
         boolean accounted;
         switch (verdict.outcome()) {
             case SEND:
                 accounted = attempt(action, event, payload,
                         resolvedPhase ? RESOLUTION_MARKER : null,
-                        transportAttempted, resolvedPhase);
+                        receipt, resolvedPhase, authorizingSources);
                 break;
             case ROLLUP:
                 accounted = attemptRollup(action, event, payload, verdict,
-                        transportAttempted, resolvedPhase);
+                        receipt, resolvedPhase, authorizingSources);
                 break;
             case SILENT:
             default:
@@ -1339,7 +1354,7 @@ public final class ActionDispatcher {
                         event.getId());
                 return false;
         }
-        if (!transportAttempted[0]) {
+        if (!receipt.transportAttempted) {
             AlertStormControl.releaseReservation(verdict);
         }
         return accounted;
@@ -1367,8 +1382,8 @@ public final class ActionDispatcher {
      * clears rather than losing the notification.</p>
      */
     private static boolean attemptRollup(Action action, AlertEvent event, AlertPayload payload,
-            AlertStormControl.CeilingVerdict verdict, boolean[] transportAttempted,
-            boolean resolvedPhase) {
+            AlertStormControl.CeilingVerdict verdict, AttemptReceipt receipt,
+            boolean resolvedPhase, List<Action> authorizingSources) {
         log.warn("Action {} ('{}') reached its ceiling of {} notification(s) per {}s; sending one "
                         + "rollup for {} affected channel(s) instead of individual notifications",
                 action.getId(), action.getName(), verdict.sent(), verdict.windowSeconds(),
@@ -1382,7 +1397,7 @@ public final class ActionDispatcher {
         String marker = resolvedPhase
                 ? AlertStormControl.ROLLUP_MARKER + " " + RESOLUTION_MARKER
                 : AlertStormControl.ROLLUP_MARKER;
-        return attempt(action, event, rollup, marker, transportAttempted, resolvedPhase);
+        return attempt(action, event, rollup, marker, receipt, resolvedPhase, authorizingSources);
     }
 
     /**
@@ -1420,6 +1435,11 @@ public final class ActionDispatcher {
      * reading the log back, so they have no such window.</p>
      */
     private static boolean attemptPaced(Action action, AlertEvent event, AlertPayload payload) {
+        return attemptPaced(action, event, payload, List.of(), new AttemptReceipt());
+    }
+
+    private static boolean attemptPaced(Action action, AlertEvent event, AlertPayload payload,
+            List<Action> authorizingSources, AttemptReceipt receipt) {
         String key = event.getId() + ":" + action.getId();
         Object claim = new Object();
         if (inFlightPacedSends.putIfAbsent(key, claim) != null) {
@@ -1428,7 +1448,7 @@ public final class ActionDispatcher {
             return false;
         }
         try {
-            return gatedAttempt(action, event, payload, false);
+            return gatedAttempt(action, event, payload, false, authorizingSources, receipt);
         } finally {
             inFlightPacedSends.remove(key, claim);
         }
@@ -1498,6 +1518,12 @@ public final class ActionDispatcher {
         } else {
             mutation.run();
         }
+    }
+
+    /** Separate a cancelled route from an actual attempt when deduplicating a pass. */
+    private static final class AttemptReceipt {
+        boolean transportAttempted;
+        boolean recorded;
     }
 
     private enum ActionDecision { ALLOW, INAPPLICABLE, RETRY }
@@ -1682,7 +1708,7 @@ public final class ActionDispatcher {
      * <em>fails</em> still carries its real failure reason.</p>
      */
     private static boolean attempt(Action action, AlertEvent event, AlertPayload payload, String marker,
-            boolean[] transportAttempted, boolean resolvedPhase) {
+            AttemptReceipt receipt, boolean resolvedPhase, List<Action> authorizingSources) {
         ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
         if (actionPolicy != ActionDecision.ALLOW) {
             return actionPolicy == ActionDecision.INAPPLICABLE;
@@ -1718,18 +1744,25 @@ public final class ActionDispatcher {
                                 throw new DispatchDeferredException(
                                         "Lifecycle, notification policy, or leadership changed before delivery");
                             }
+                            // The target alone cannot authorize an escalation: any
+                            // upstream link can be disabled, retargeted, or cease
+                            // matching while pacing/rollup/transport work is queued.
+                            // Keep the whole decision path through the I/O handoff.
+                            for (Action source : authorizingSources) {
+                                verifyActionAtTransport(source, payload, false);
+                            }
                             verifyActionAtTransport(action, payload, resolvedPhase);
-                            transportAttempted[0] = true;
+                            receipt.transportAttempted = true;
                         } finally {
                             dispatchFence.remove();
                         }
                     });
             success = true;
         } catch (ActionDiscardedException discarded) {
-            transportAttempted[0] = false;
+            receipt.transportAttempted = false;
             return true; // current configuration no longer subscribes to this edge
         } catch (DispatchDeferredException deferred) {
-            transportAttempted[0] = false;
+            receipt.transportAttempted = false;
             log.debug("Delivery deferred for action {} on alert event {}: {}",
                     action.getId(), event.getId(), deferred.getMessage());
             return false;
@@ -1748,6 +1781,7 @@ public final class ActionDispatcher {
             row.setSuccess(success);
             row.setErrorMessage(truncate(mark(marker, errorMessage)));
             ActionDispatchLogRepository.insertActionDispatchLog(row);
+            receipt.recorded = true;
             return true;
         } catch (Throwable t) {
             log.error("Failed to record dispatch log for action {} on alert event {}",
