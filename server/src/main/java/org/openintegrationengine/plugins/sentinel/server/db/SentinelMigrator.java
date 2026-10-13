@@ -167,7 +167,9 @@ public class SentinelMigrator extends Migrator {
         if (current < 1 && targetVersion >= 1) {
             applyV1();
         }
-        if (current < 2 && targetVersion >= 2) {
+        // Older releases inferred v2 completion from its first ALTER. Repair
+        // every v2 prerequisite even when a later version was recorded.
+        if (targetVersion >= 2) {
             applyV2();
         }
         if (current < 3 && targetVersion >= 3) {
@@ -269,8 +271,8 @@ public class SentinelMigrator extends Migrator {
             // ALTER, timezone is v3's only one, and runbook_url is v4's first, so each
             // column's presence means that version's script at least started. A partial v2
             // or v4 (the first ALTER landed, later ones did not) would mis-detect as
-            // complete — acceptable because every ALTER in those scripts is idempotent to
-            // re-run manually and the failed migrate() already surfaced loudly at startup.
+            // complete. v2 is therefore reconciled operation-by-operation on
+            // every startup, including schemas already detected at a later version.
             // v3 cannot be partial: it is a single statement.
             //
             // Note v4 is probed on sentinel_monitor rather than on its own new table
@@ -463,8 +465,59 @@ public class SentinelMigrator extends Migrator {
 
     /** Adds the maintenance-window mode/recurrence columns (see class Javadoc). */
     private void applyV2() throws MigrationException {
-        log.info("Applying Sentinel schema v2 (maintenance-window modes and recurrence)");
-        executeScript("/" + getDatabaseType() + "-sentinel-v2.sql");
+        // DDL can auto-commit. Each step must resume independently after an
+        // interruption; replaying the complete historical script would fail
+        // on the first column already present and never repair the rest.
+        String table = "sentinel_maintenance_window";
+        String varchar = "oracle".equalsIgnoreCase(getDatabaseType()) ? "VARCHAR2" : "VARCHAR";
+        addColumnIfAbsent(table, "window_mode", varchar + "(16) DEFAULT 'SUPPRESS' NOT NULL");
+        addColumnIfAbsent(table, "repeat_type", varchar + "(16) DEFAULT 'NONE' NOT NULL");
+        addColumnIfAbsent(table, "days_of_week", varchar + "(64)");
+        addColumnIfAbsent(table, "days_of_month", varchar + "(128)");
+        addColumnIfAbsent(table, "start_time", varchar + "(5)");
+        addColumnIfAbsent(table, "end_time", varchar + "(5)");
+        makeWindowBoundNullable("active_from");
+        makeWindowBoundNullable("active_until");
+    }
+
+    private void makeWindowBoundNullable(String column) throws MigrationException {
+        try {
+            boolean found = false;
+            for (String table : namingCandidates("sentinel_maintenance_window")) {
+                for (String name : namingCandidates(column)) {
+                    try (ResultSet columns = getConnection().getMetaData().getColumns(
+                            getConnection().getCatalog(), null, table, name)) {
+                        if (columns.next()) {
+                            int nullable = columns.getInt("NULLABLE");
+                            if (nullable == DatabaseMetaData.columnNullable) return;
+                            if (nullable != DatabaseMetaData.columnNoNulls) {
+                                throw new MigrationException("Unknown nullability for Sentinel window " + column);
+                            }
+                            found = true;
+                        }
+                    }
+                    if (found) break;
+                }
+                if (found) break;
+            }
+            if (!found) throw new MigrationException("Missing Sentinel window column " + column);
+            String change = switch (getDatabaseType().toLowerCase(Locale.ROOT)) {
+                case "derby" -> "ALTER COLUMN " + column + " NULL";
+                case "postgres" -> "ALTER COLUMN " + column + " DROP NOT NULL";
+                case "mysql" -> "MODIFY " + column + " DATETIME NULL";
+                case "sqlserver" -> "ALTER COLUMN " + column + " DATETIME NULL";
+                case "oracle" -> "MODIFY (" + column + " NULL)";
+                default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
+            };
+            try (PreparedStatement statement = getConnection().prepareStatement(
+                    "ALTER TABLE sentinel_maintenance_window " + change)) {
+                statement.executeUpdate();
+            }
+        } catch (MigrationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new MigrationException("Failed to repair Sentinel window bound " + column, e);
+        }
     }
 
     /** Adds the nullable maintenance-window {@code timezone} column (see class Javadoc). */
