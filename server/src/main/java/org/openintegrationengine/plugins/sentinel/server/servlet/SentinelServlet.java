@@ -28,6 +28,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.mirth.connect.client.core.ExtensionOperation;
 import com.mirth.connect.client.core.Operation;
 import com.mirth.connect.client.core.api.MirthApiException;
+import com.mirth.connect.client.core.api.servlets.UserServletInterface;
 import com.mirth.connect.client.core.api.util.OperationUtil;
 import com.mirth.connect.model.User;
 import com.mirth.connect.server.api.MirthServlet;
@@ -139,12 +140,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Delegates to {@code MonitorService.list()}.</p>
+     * <p>Lists definitions visible to the current request's authorized channels.</p>
      */
     @Override
     public String getMonitors() {
         try {
-            return Json.write(MonitorService.list());
+            return Json.write(MonitorService.list(authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getMonitors", e);
         }
@@ -152,12 +153,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Delegates to {@code MonitorService.get(int)}.</p>
+     * <p>Hidden and missing definitions both return 404.</p>
      */
     @Override
     public String getMonitor(int id) {
         try {
-            return Json.write(MonitorService.get(id));
+            return Json.write(MonitorService.get(id, authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getMonitor", e);
         }
@@ -246,10 +247,8 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * an unconstrained series would report daily alert volume and resolve times
      * for exactly what {@code /problems} and the activity endpoints redact.</p>
      *
-     * <p>Not a 403 or a 404 like the per-channel and per-problem endpoints: the
-     * monitor itself is legitimately readable (monitor definitions are not
-     * channel-filtered), so the narrowing belongs to the data rather than to the
-     * lookup.</p>
+     * <p>The service also applies the definition visibility rule used by
+     * monitor list/detail: a hidden monitor returns 404 before history is read.</p>
      */
     @Override
     public String getMonitorHistory(int id, Long from, Long to) {
@@ -477,17 +476,14 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Rejects redacted channels' problems (see
-     * {@link #assertProblemVisible}) before delegating to
-     * {@code ProblemService.getDetail(long)} — without this check, the
-     * sequential alert-event ids would let a channel-restricted caller
-     * enumerate every problem the {@code /problems} redaction hides.</p>
+     * <p>The service checks the fetched event against current channel
+     * authorization before enrichment, and omits current monitor metadata
+     * when that definition is hidden.</p>
      */
     @Override
     public String getProblem(long id) {
         try {
-            assertProblemVisible(id);
-            return Json.write(ProblemService.getDetail(id));
+            return Json.write(ProblemService.getDetail(id, authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getProblem", e);
         }
@@ -687,15 +683,13 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Delegates to {@link ScopeResolver#listGroups()}. Groups are not
-     * channel-filtered: the contract scopes redaction to the channel-data
-     * endpoints, and group membership is needed intact for
-     * group-scope pickers to make sense.</p>
+     * <p>Only complete, nonempty groups whose members are all authorized
+     * are returned to channel-restricted callers.</p>
      */
     @Override
     public String getCoreChannelGroups() {
         try {
-            return Json.write(ScopeResolver.listGroups());
+            return Json.write(ScopeResolver.listGroups(authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getCoreChannelGroups", e);
         }
@@ -703,15 +697,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Delegates to {@link ScopeResolver#listTags()}. Like groups, tags
-     * are not channel-filtered: the redaction contract covers the
-     * channel-data endpoints, and tag membership is needed intact for
-     * tag-scope pickers to make sense.</p>
+     * <p>Applies the same complete-membership visibility rule as groups.</p>
      */
     @Override
     public String getCoreTags() {
         try {
-            return Json.write(ScopeResolver.listTags());
+            return Json.write(ScopeResolver.listTags(authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getCoreTags", e);
         }
@@ -719,13 +710,14 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Maps the engine's user list down to id/username pairs. Not
-     * channel-filtered — usernames are display metadata, and the redaction
-     * contract covers channel data only.</p>
+     * <p>Maps the engine's user list down to id/username pairs, after checking
+     * the core user-directory permission as well as the normal Sentinel view
+     * permission. A monitoring grant must not expose the global user list.</p>
      */
     @Override
     public String getCoreUsers() {
         try {
+            requireUserDirectoryPermission();
             List<UserInfo> users = new ArrayList<>();
             for (User user : ControllerFactory.getFactory().createUserController().getAllUsers()) {
                 UserInfo info = new UserInfo();
@@ -774,14 +766,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     /**
      * {@inheritDoc}
-     * <p>Delegates to {@link ExportImportService#export()}. No channel
-     * filtering: the document is the union of {@code /monitors},
-     * {@code /actions}, and {@code /maintenanceWindows}, none of which is
-     * channel-filtered (the redaction contract covers per-channel <i>data</i>,
-     * not the definitions that reference channels), and this endpoint sits at
-     * {@code PERMISSION_MANAGE} while those three sit at {@code
-     * PERMISSION_VIEW} — so it exposes nothing a caller reaching it cannot
-     * already read one list at a time.</p>
+     * <p>Exports global configuration under {@code PERMISSION_MANAGE}.
+     * This is a configuration-management capability, broader than the
+     * channel-scoped monitor reads available with {@code PERMISSION_VIEW}.</p>
      */
     @Override
     public String exportConfiguration() {
@@ -817,6 +804,18 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     }
 
     // ========== Boundary helpers ==========
+
+    private void requireUserDirectoryPermission() {
+        Operation sentinelOperation = operation;
+        try {
+            // Assign the core operation directly. setOperation would wrap it
+            // in the Sentinel extension and bypass the core permission map.
+            operation = OperationUtil.getOperation(UserServletInterface.class, "getAllUsers");
+            checkUserAuthorized();
+        } finally {
+            operation = sentinelOperation;
+        }
+    }
 
     /**
      * Import already requires Manage Monitoring. A document that can write
@@ -989,7 +988,11 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
                 requested.add(channel.getChannelId());
             }
         }
-        return redactChannelIds(requested);
+        Set<String> authorized = redactChannelIds(requested);
+        if (authorized == null) {
+            throw new IllegalStateException("Channel authorization is unavailable");
+        }
+        return authorized;
     }
 
     /**

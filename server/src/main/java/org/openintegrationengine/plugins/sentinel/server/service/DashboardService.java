@@ -17,7 +17,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -77,8 +76,8 @@ public final class DashboardService {
      * feed — is constrained to it. Otherwise the landing page would hand a
      * restricted viewer exactly the channel names and alert messages that
      * {@code /problems} and the activity endpoints redact. Monitor counts
-     * and the channels-watched total remain global: they are configuration/
-     * coverage scalars carrying no per-channel data.</p>
+     * include only readable definitions, and watched-channel coverage is
+     * intersected with the authorized set as well.</p>
      *
      * @param visibleChannelIds the caller's authorized channel ids, or
      *                          {@code null} when the caller is unrestricted;
@@ -96,7 +95,7 @@ public final class DashboardService {
         summary.setUnacknowledged(countUnacknowledged(openItems));
         summary.setTopChannels(topChannels(openItems));
 
-        List<Monitor> monitors = MonitorRepository.listMonitors(null, null, null, null);
+        List<Monitor> monitors = MonitorService.list(visibleChannelIds);
         summary.setMonitorsTotal(monitors.size());
         int enabled = 0;
         for (Monitor monitor : monitors) {
@@ -105,7 +104,7 @@ public final class DashboardService {
             }
         }
         summary.setMonitorsEnabled(enabled);
-        summary.setChannelsWatched(countWatchedChannels(monitors));
+        summary.setChannelsWatched(countWatchedChannels(monitors, visibleChannelIds));
 
         summary.setRecentProblems(recentProblems(visibleChannelIds));
 
@@ -246,7 +245,7 @@ public final class DashboardService {
      * deleted group must cost its own contribution, not the whole
      * dashboard.
      */
-    private static int countWatchedChannels(List<Monitor> monitors) {
+    private static int countWatchedChannels(List<Monitor> monitors, Set<String> visibleChannelIds) {
         Set<String> watched = new HashSet<>();
         for (Monitor monitor : monitors) {
             if (!monitor.isEnabled()) {
@@ -254,7 +253,10 @@ public final class DashboardService {
             }
             try {
                 for (ScopeResolver.ChannelTarget target : ScopeResolver.resolveStartedChannels(monitor)) {
-                    watched.add(target.channelId);
+                    // Membership may change after definition authorization.
+                    if (visibleChannelIds == null || visibleChannelIds.contains(target.channelId)) {
+                        watched.add(target.channelId);
+                    }
                 }
             } catch (Exception e) {
                 log.warn("Could not resolve scope for monitor {} while counting watched channels",

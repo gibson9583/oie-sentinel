@@ -120,18 +120,15 @@ public final class MonitorHistoryService {
      * <p>So a restricted caller's series is computed from channel-filtered
      * events instead of from the SQL aggregate, which has no channel predicate.
      * That is the same rule {@code /dashboard/summary} applies — constrain every
-     * channel-attributed element to the authorized set, leave non-channel facts
-     * alone — implemented one layer up because the aggregation cannot be pushed
-     * into a statement that does not take the filter. The monitor's
-     * <em>existence</em> is deliberately not hidden: monitor definitions are not
-     * channel-filtered anywhere in this plugin (an unknown id still 404s, a known
-     * one still resolves), so this method narrows the data and never the
-     * lookup.</p>
+     * channel-attributed element to the authorized set — implemented one layer
+     * up because the aggregation cannot be pushed into a statement that does
+     * not take the filter. The definition must also be visible: a hidden
+     * monitor returns the same not-found response as an unknown id, before
+     * any history query runs.</p>
      *
-     * <p>An empty authorized set short-circuits to an all-zero series rather
-     * than to an empty {@code IN} filter, which the mapper reads as "no filter"
-     * and would leak every channel — the same trap the servlet's other endpoints
-     * guard against.</p>
+     * <p>An empty authorized set cannot read any monitor definition, so the
+     * visibility check rejects it before an empty {@code IN} filter could be
+     * interpreted as unrestricted by the mapper.</p>
      *
      * @param monitorId         the monitor to chart
      * @param fromEpochMillis   range start (epoch ms), or {@code null} for
@@ -142,15 +139,14 @@ public final class MonitorHistoryService {
      * @return {@code {monitorId, from, to, bucket, truncated, points}}, where
      *         {@code points} is one {@link MonitorHistoryPoint} per calendar day
      *         in the range, oldest first, with no gaps
-     * @throws java.util.NoSuchElementException if no monitor has that id
+     * @throws java.util.NoSuchElementException if the monitor is missing or hidden
      * @throws IllegalArgumentException         if the range is inverted or wider
      *                                          than {@value #MAX_RANGE_DAYS} days
      */
     public static Map<String, Object> build(int monitorId, Long fromEpochMillis, Long toEpochMillis,
             Set<String> visibleChannelIds) {
-        // Existence check first: a chart for a monitor that is not there is a
-        // 404, not an empty series that reads as "this monitor never fires".
-        MonitorService.get(monitorId);
+        // Check current permissions before any historical data is queried.
+        MonitorService.get(monitorId, visibleChannelIds);
 
         Instant to = toEpochMillis != null ? Instant.ofEpochMilli(toEpochMillis) : Instant.now();
         Instant from = fromEpochMillis != null

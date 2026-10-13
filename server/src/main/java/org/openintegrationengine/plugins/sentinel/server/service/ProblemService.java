@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +20,6 @@ import com.mirth.connect.server.controllers.ChannelController;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -181,7 +181,19 @@ public final class ProblemService {
      * @throws NoSuchElementException if no event has that id
      */
     public static ProblemDetail getDetail(long id) {
+        return getDetail(id, null);
+    }
+
+    /**
+     * Reads only an authorized event and current monitor metadata the caller
+     * may see. A historical event can remain on an allowed channel after its
+     * monitor has been retargeted to a restricted scope.
+     */
+    public static ProblemDetail getDetail(long id, Set<String> authorizedChannelIds) {
         AlertEvent event = requireEvent(id);
+        if (authorizedChannelIds != null && !authorizedChannelIds.contains(event.getChannelId())) {
+            throw new NoSuchElementException("No problem with id " + id);
+        }
 
         ProblemDetail detail = new ProblemDetail();
         detail.setEvent(event);
@@ -189,8 +201,14 @@ public final class ProblemService {
         // The monitor FK cascades on delete (deleting a monitor deletes its
         // events), so a missing monitor is rare — but a row read mid-delete
         // must degrade to a placeholder, not a 500.
-        Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
-        detail.setMonitorName(monitor != null ? monitor.getName() : DELETED_MONITOR);
+        Monitor monitor = null;
+        try {
+            monitor = MonitorService.get(event.getMonitorId(), authorizedChannelIds);
+        } catch (NoSuchElementException e) {
+            // Hidden and missing definitions have the same response shape.
+        }
+        detail.setMonitorName(monitor != null ? monitor.getName()
+                : authorizedChannelIds == null ? DELETED_MONITOR : "(unavailable monitor)");
         detail.setMonitorType(monitor != null ? monitor.getMonitorType() : null);
 
         detail.setChannelName(ScopeResolver.channelName(event.getChannelId()));
