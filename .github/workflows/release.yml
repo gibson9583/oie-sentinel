@@ -192,7 +192,7 @@ jobs:
       # by whoever can overwrite the release assets. Runs before the release is
       # created so a failure here means no draft is staged at all.
       - name: Attest build provenance for the release asset
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: out/${{ steps.pkg.outputs.asset }}
 
