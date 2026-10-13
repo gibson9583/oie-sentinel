@@ -7,11 +7,13 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -110,6 +112,35 @@ public final class ProblemService {
                 acknowledged, fromEpochMillis, toEpochMillis, q, sortColumn, sortDir, page, pageSize));
     }
 
+    public static Set<Integer> acknowledgingUserIds(Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds != null && authorizedChannelIds.isEmpty()) {
+            return new HashSet<>();
+        }
+        return new HashSet<>(AlertEventRepository.listAcknowledgingUserIds(
+                authorizedChannelIds == null ? null : new ArrayList<>(authorizedChannelIds)));
+    }
+
+    public static PagedResult<AlertEvent> list(String status, String severityCsv, String channelIdCsv,
+            Integer monitorId, String monitorTypeName, Boolean acknowledged, Long fromEpochMillis,
+            Long toEpochMillis, String q, String sortColumn, String sortDir, int page, int pageSize,
+            Set<String> authorizedChannelIds) {
+        AlertEventFilter filter = buildFilter(status, severityCsv, channelIdCsv, monitorId, monitorTypeName,
+                acknowledged, fromEpochMillis, toEpochMillis, q, sortColumn, sortDir, page, pageSize);
+        if (authorizedChannelIds != null && filter.getMonitorType() != null) {
+            List<Integer> readable = new ArrayList<>();
+            for (Monitor monitor : MonitorService.list(authorizedChannelIds)) {
+                if (monitor.getMonitorType() == filter.getMonitorType()) {
+                    readable.add(monitor.getId());
+                }
+            }
+            if (readable.isEmpty()) {
+                return new PagedResult<>(List.of(), 0L, filter.getPage(), filter.getPageSize());
+            }
+            filter.setMonitorIdIn(readable);
+        }
+        return list(filter);
+    }
+
     /**
      * Translates the raw {@code GET /problems} query parameters into an
      * {@link AlertEventFilter}: CSV values are split, enum names parsed
@@ -190,8 +221,20 @@ public final class ProblemService {
      * monitor has been retargeted to a restricted scope.
      */
     public static ProblemDetail getDetail(long id, Set<String> authorizedChannelIds) {
+        return getDetail(id, authorizedChannelIds,
+                channelId -> authorizedChannelIds == null || authorizedChannelIds.contains(channelId));
+    }
+
+    /**
+     * Authorizes the fetched event by its stored channel identity, separately
+     * from the current channel inventory used to authorize monitor metadata.
+     * This keeps retained events readable after channel deletion without
+     * broadening access to their monitor's current definition.
+     */
+    public static ProblemDetail getDetail(long id, Set<String> authorizedMonitorChannelIds,
+            Predicate<String> canReadEventChannel) {
         AlertEvent event = requireEvent(id);
-        if (authorizedChannelIds != null && !authorizedChannelIds.contains(event.getChannelId())) {
+        if (!canReadEventChannel.test(event.getChannelId())) {
             throw new NoSuchElementException("No problem with id " + id);
         }
 
@@ -203,13 +246,14 @@ public final class ProblemService {
         // must degrade to a placeholder, not a 500.
         Monitor monitor = null;
         try {
-            monitor = MonitorService.get(event.getMonitorId(), authorizedChannelIds);
+            monitor = MonitorService.get(event.getMonitorId(), authorizedMonitorChannelIds);
         } catch (NoSuchElementException e) {
-            // Hidden and missing definitions have the same response shape.
+            // A readable event does not grant access to a hidden current definition.
         }
         detail.setMonitorName(monitor != null ? monitor.getName()
-                : authorizedChannelIds == null ? DELETED_MONITOR : "(unavailable monitor)");
+                : authorizedMonitorChannelIds == null ? DELETED_MONITOR : "(unavailable monitor)");
         detail.setMonitorType(monitor != null ? monitor.getMonitorType() : null);
+        detail.setRunbookUrl(monitor != null ? monitor.getRunbookUrl() : null);
 
         detail.setChannelName(ScopeResolver.channelName(event.getChannelId()));
         detail.setConnectorName(resolveConnectorName(event));

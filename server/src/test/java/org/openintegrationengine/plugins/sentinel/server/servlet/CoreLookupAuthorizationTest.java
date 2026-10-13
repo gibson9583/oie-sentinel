@@ -22,6 +22,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedStatic;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
+import org.openintegrationengine.plugins.sentinel.server.service.ProblemService;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelGroupInfo;
@@ -33,26 +34,26 @@ class CoreLookupAuthorizationTest {
     private static final String RESTRICTED = "restricted";
 
     @Test
-    void monitoringPermissionDoesNotEnumerateTheUserDirectory() {
-        PermissionServlet servlet = servlet();
-        Operation original = servlet.currentOperation();
-        try (MockedStatic<ControllerFactory> host = mockStatic(ControllerFactory.class)) {
-            assertStatus(403, servlet::getCoreUsers);
-            assertEquals(List.of("getAllUsers"), servlet.checked);
-            assertSame(original, servlet.currentOperation());
-            host.verifyNoInteractions();
+    void monitoringPermissionDoesNotEnumerateTheUserDirectory() throws Exception {
+        try (UserFixture f = new UserFixture()) {
+            Operation original = f.servlet.currentOperation();
+            JsonNode result = tree(f.servlet.getCoreUsers());
+            assertEquals(1, result.size());
+            assertEquals(42, result.get(0).path("userId").asInt());
+            assertEquals(List.of("getAllUsers"), f.servlet.checked);
+            assertSame(original, f.servlet.currentOperation());
         }
     }
 
     @Test
-    void manageMonitoringIsNotASubstituteForCoreUserPermission() {
-        PermissionServlet servlet = servlet();
-        servlet.allowedOperations = Set.of("OIE Sentinel#sentinelGetCoreUsers",
-                "OIE Sentinel#sentinelCreateMonitor", "OIE Sentinel#sentinelExportConfiguration");
-        try (MockedStatic<ControllerFactory> host = mockStatic(ControllerFactory.class)) {
-            assertStatus(403, servlet::getCoreUsers);
-            assertEquals(List.of("getAllUsers"), servlet.checked);
-            host.verifyNoInteractions();
+    void manageMonitoringIsNotASubstituteForCoreUserPermission() throws Exception {
+        try (UserFixture f = new UserFixture()) {
+            f.servlet.allowedOperations = Set.of("OIE Sentinel#sentinelGetCoreUsers",
+                    "OIE Sentinel#sentinelCreateMonitor", "OIE Sentinel#sentinelExportConfiguration");
+            JsonNode result = tree(f.servlet.getCoreUsers());
+            assertEquals(1, result.size());
+            assertEquals(42, result.get(0).path("userId").asInt());
+            assertEquals(List.of("getAllUsers"), f.servlet.checked);
         }
     }
 
@@ -94,11 +95,14 @@ class CoreLookupAuthorizationTest {
             assertEquals(2, tree(f.servlet.getCoreUsers()).size());
             Operation original = f.servlet.currentOperation();
             f.servlet.allowedOperations = Set.of();
-            assertStatus(403, f.servlet::getCoreUsers);
-            assertStatus(403, f.servlet::getCoreUsers);
+            for (int retry = 0; retry < 2; retry++) {
+                JsonNode result = tree(f.servlet.getCoreUsers());
+                assertEquals(1, result.size());
+                assertEquals(42, result.get(0).path("userId").asInt());
+            }
             assertEquals(List.of("getAllUsers", "getAllUsers", "getAllUsers"), f.servlet.checked);
             assertSame(original, f.servlet.currentOperation());
-            verify(f.users, times(1)).getAllUsers();
+            verify(f.users, times(3)).getAllUsers();
         }
     }
 
@@ -107,7 +111,7 @@ class CoreLookupAuthorizationTest {
         PermissionServlet servlet = servlet();
         Operation original = servlet.currentOperation();
         doThrow(new IllegalStateException("synthetic-secret authorization failure"))
-                .when(servlet).checkUserAuthorized();
+                .when(servlet).isUserAuthorized();
         try (MockedStatic<ControllerFactory> host = mockStatic(ControllerFactory.class)) {
             MirthApiException failure = assertThrows(MirthApiException.class, servlet::getCoreUsers);
             assertEquals(500, failure.getResponse().getStatus());
@@ -138,12 +142,12 @@ class CoreLookupAuthorizationTest {
             Operation deniedOriginal = denied.currentOperation();
             Operation allowedOriginal = f.servlet.currentOperation();
             f.servlet.allowedOperations = Set.of("getAllUsers");
-            assertStatus(403, denied::getCoreUsers);
+            assertEquals(1, tree(denied.getCoreUsers()).size());
             assertEquals(2, tree(f.servlet.getCoreUsers()).size());
-            assertStatus(403, denied::getCoreUsers);
+            assertEquals(1, tree(denied.getCoreUsers()).size());
             assertSame(deniedOriginal, denied.currentOperation());
             assertSame(allowedOriginal, f.servlet.currentOperation());
-            verify(f.users, times(1)).getAllUsers();
+            verify(f.users, times(3)).getAllUsers();
         }
     }
 
@@ -229,6 +233,8 @@ class CoreLookupAuthorizationTest {
     private static class UserFixture implements AutoCloseable {
         final PermissionServlet servlet = servlet();
         final MockedStatic<ControllerFactory> host = mockStatic(ControllerFactory.class);
+        final MockedStatic<ScopeResolver> scopes = mockStatic(ScopeResolver.class);
+        final MockedStatic<ProblemService> problems = mockStatic(ProblemService.class);
         final UserController users = mock(UserController.class);
         UserFixture() throws Exception {
             ControllerFactory factory = mock(ControllerFactory.class);
@@ -238,8 +244,13 @@ class CoreLookupAuthorizationTest {
             User admin = new User(); admin.setId(99); admin.setUsername("synthetic-admin");
             admin.setEmail("synthetic-secret@example.invalid");
             when(users.getAllUsers()).thenReturn(List.of(reader, admin));
+            ChannelInfo allowed = new ChannelInfo(); allowed.setChannelId(ALLOWED);
+            ChannelInfo restricted = new ChannelInfo(); restricted.setChannelId(RESTRICTED);
+            scopes.when(ScopeResolver::listChannels).thenReturn(List.of(allowed, restricted));
+            problems.when(() -> ProblemService.acknowledgingUserIds(Set.of(ALLOWED)))
+                    .thenAnswer(call -> new HashSet<>());
         }
-        @Override public void close() { host.close(); }
+        @Override public void close() { problems.close(); scopes.close(); host.close(); }
     }
 
     private static class ScopeFixture implements AutoCloseable {

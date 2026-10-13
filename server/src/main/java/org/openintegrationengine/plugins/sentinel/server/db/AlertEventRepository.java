@@ -263,6 +263,18 @@ public final class AlertEventRepository {
         }
     }
 
+    public static List<Integer> listAcknowledgingUserIds(List<String> channelIdIn) {
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("channelIdIn", channelIdIn == null ? null : new ArrayList<>(channelIdIn));
+            return SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listAcknowledgingUserIds"), params);
+        } catch (Exception e) {
+            log.error("Failed to list acknowledging users", e);
+            throw new RepositoryException(e);
+        }
+    }
+
     /**
      * Aggregates one monitor's alert history into per-day points: how many
      * alerts it opened each day, and their mean time to resolve.
@@ -412,7 +424,8 @@ public final class AlertEventRepository {
 
         params.put("channelIdIn", filter.getChannelIdIn());
         params.put("monitorId", filter.getMonitorId());
-        params.put("monitorType", filter.getMonitorType() != null ? filter.getMonitorType().name() : null);
+        params.put("monitorIdIn", filter.getMonitorIdIn());
+        params.put("monitorType",filter.getMonitorType() != null ? filter.getMonitorType().name() : null);
         params.put("acknowledged", filter.getAcknowledged());
         params.put("from", toTimestamp(filter.getFrom()));
         params.put("to", toTimestamp(filter.getTo()));

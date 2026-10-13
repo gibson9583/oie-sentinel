@@ -606,8 +606,9 @@ public interface SentinelServletInterface extends BaseServletInterface {
     /**
      * Returns the dashboard's entire top fold (severity counts, top problem
      * channels, monitor health, recent problems, collector heartbeats) in one
-     * payload so the landing page renders with a single request. Monitor and
-     * coverage totals include only visible definitions and authorized channels.
+     * payload so the landing page renders with a single request. Monitor
+     * totals include only visible definitions. Coverage counts the authorized
+     * channels that any enabled monitor watches.
      *
      * @return JSON DashboardSummary
      * @throws ClientException on persistence failure
@@ -617,6 +618,21 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @Operation(summary = "Returns the aggregated dashboard summary")
     @MirthOperation(name = "sentinelGetDashboardSummary", display = "Get Sentinel dashboard summary", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
     String getDashboardSummary() throws ClientException;
+
+    /**
+     * Returns the authorized channels that at least one enabled monitor
+     * covers, whatever their deployed state. Restricted readers receive
+     * explicit authorized channel IDs with {@code coversAll=false}; only
+     * unrestricted readers can receive the global ALL-scope flag.
+     *
+     * @return JSON {@code {coversAll, channelIds}}
+     * @throws ClientException on persistence or engine controller failure
+     */
+    @GET
+    @Path("/dashboard/coverage")
+    @Operation(summary = "Returns the channels covered by enabled monitors")
+    @MirthOperation(name = "sentinelGetDashboardCoverage", display = "Get Sentinel monitor coverage", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getDashboardCoverage() throws ClientException;
 
     /**
      * Returns one channel's message-activity time series for charting.
@@ -742,10 +758,11 @@ public interface SentinelServletInterface extends BaseServletInterface {
     String getCoreTags() throws ClientException;
 
     /**
-     * Returns the engine's users as id/username pairs. In addition to
-     * {@link #PERMISSION_VIEW}, this requires the core getAllUsers operation
-     * (Manage Users). Monitoring permission alone cannot enumerate accounts.
-     * The UI falls back to user IDs when this lookup is forbidden.
+     * Returns id/username pairs for display. In addition to
+     * {@link #PERMISSION_VIEW}, the full directory requires the core
+     * getAllUsers operation (Manage Users). Other readers receive only
+     * themselves and acknowledgement authors on authorized channels.
+     * The UI falls back to user IDs for names unavailable through this lookup.
      *
      * @return JSON array of UserInfo
      * @throws ClientException on engine controller failure

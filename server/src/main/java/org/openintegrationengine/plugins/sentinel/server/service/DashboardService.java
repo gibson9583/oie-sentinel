@@ -9,9 +9,11 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,8 +78,8 @@ public final class DashboardService {
      * feed — is constrained to it. Otherwise the landing page would hand a
      * restricted viewer exactly the channel names and alert messages that
      * {@code /problems} and the activity endpoints redact. Monitor counts
-     * include only readable definitions, and watched-channel coverage is
-     * intersected with the authorized set as well.</p>
+     * include only readable definitions. Watched-channel coverage counts
+     * every enabled monitor, limited to the authorized set.</p>
      *
      * @param visibleChannelIds the caller's authorized channel ids, or
      *                          {@code null} when the caller is unrestricted;
@@ -104,7 +106,8 @@ public final class DashboardService {
             }
         }
         summary.setMonitorsEnabled(enabled);
-        summary.setChannelsWatched(countWatchedChannels(monitors, visibleChannelIds));
+        summary.setChannelsWatched(countWatchedChannels(
+                visibleChannelIds != null ? MonitorService.list() : monitors, visibleChannelIds));
 
         summary.setRecentProblems(recentProblems(visibleChannelIds));
 
@@ -253,7 +256,6 @@ public final class DashboardService {
             }
             try {
                 for (ScopeResolver.ChannelTarget target : ScopeResolver.resolveStartedChannels(monitor)) {
-                    // Membership may change after definition authorization.
                     if (visibleChannelIds == null || visibleChannelIds.contains(target.channelId)) {
                         watched.add(target.channelId);
                     }
@@ -264,5 +266,38 @@ public final class DashboardService {
             }
         }
         return watched.size();
+    }
+
+    public static Map<String, Object> coverage(Set<String> visibleChannelIds) {
+        boolean coversAll = false;
+        Set<String> covered = new TreeSet<>();
+        for (Monitor monitor : MonitorService.list()) {
+            if (!monitor.isEnabled() || monitor.getScopeType() == null) {
+                continue;
+            }
+            switch (monitor.getScopeType()) {
+                case ALL -> coversAll = true;
+                case CHANNEL -> {
+                    if (monitor.getScopeId() != null) {
+                        covered.add(monitor.getScopeId());
+                    }
+                }
+                case GROUP -> covered.addAll(ScopeResolver.strictGroupChannelIds(monitor.getScopeId()));
+                case TAG -> covered.addAll(ScopeResolver.strictTagChannelIds(monitor.getScopeId()));
+            }
+        }
+        if (visibleChannelIds != null) {
+            // Expose only this reader's coverage, not whether it came from
+            // an otherwise hidden ALL-scope monitor.
+            if (coversAll) {
+                covered.addAll(visibleChannelIds);
+            }
+            covered.retainAll(visibleChannelIds);
+            coversAll = false;
+        }
+        Map<String, Object> coverage = new LinkedHashMap<>();
+        coverage.put("coversAll", coversAll);
+        coverage.put("channelIds", new ArrayList<>(covered));
+        return coverage;
     }
 }

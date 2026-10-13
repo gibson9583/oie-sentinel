@@ -50,6 +50,38 @@ class ProblemDetailVisibilityTest {
         }
     }
 
+    @Test
+    void retainedEventPermissionDoesNotGrantCurrentMonitorMetadata() {
+        try (Fixture f = new Fixture()) {
+            var detail = ProblemService.getDetail(1, Set.of(), channelId -> channelId.equals("allowed"));
+            assertSame(f.event, detail.getEvent());
+            assertEquals("(unavailable monitor)", detail.getMonitorName());
+            assertNull(detail.getMonitorType());
+            assertNull(detail.getRunbookUrl());
+            f.events.verify(() -> AlertEventRepository.getAlertEvent(1L), times(1));
+        }
+    }
+
+    @Test
+    void eventPermissionRevocationOverridesAnEarlierMonitorAuthorizationSnapshot() {
+        try (Fixture f = new Fixture()) {
+            assertThrows(NoSuchElementException.class,
+                    () -> ProblemService.getDetail(1, Set.of("allowed"), channelId -> false));
+            f.monitors.verifyNoInteractions(); f.scopes.verifyNoInteractions(); f.dispatches.verifyNoInteractions();
+        }
+    }
+
+    @Test
+    void eventAuthorizationFailureCannotReturnPartialEnrichment() {
+        try (Fixture f = new Fixture()) {
+            assertThrows(IllegalStateException.class,
+                    () -> ProblemService.getDetail(1, Set.of("allowed"), channelId -> {
+                        throw new IllegalStateException("authorization unavailable");
+                    }));
+            f.monitors.verifyNoInteractions(); f.scopes.verifyNoInteractions(); f.dispatches.verifyNoInteractions();
+        }
+    }
+
     static Monitor monitor(int id, String channel) {
         Monitor m = new Monitor(); m.setId(id); m.setScopeType(ScopeType.CHANNEL); m.setScopeId(channel);
         m.setMonitorType(MonitorType.QUEUE_DEPTH); m.setName("Visible monitor"); return m;

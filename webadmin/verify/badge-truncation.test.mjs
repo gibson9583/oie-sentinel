@@ -40,8 +40,8 @@ const nodes = (node) => node == null || typeof node === 'boolean' ? []
 const cell = () => nodes(mod.SentinelCell({ channelId: 'excluded-channel' }));
 const isClear = () => cell().some(n => n.props?.className?.includes('sn-clear'));
 mod.platform.store.getState = () => ({ id: 1 });
-mod.platform.api.get = async p => p.endsWith('/monitors')
-    ? [{ enabled: true, scopeType: 'ALL' }]
+mod.platform.api.get = async p => p.endsWith('/dashboard/coverage')
+    ? { coversAll: true, channelIds: [] }
     : p.endsWith('/problems')
         ? { items: Array.from({ length: 500 }, (_, id) => ({ id, channelId: 'other', severity: 'HIGH' })), total: 501 }
         : [];

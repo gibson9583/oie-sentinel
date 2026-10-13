@@ -199,6 +199,9 @@ export const bulkResolveProblems = (ids, comment) =>
       lastEvaluatorRun, lastConnectorEvent } */
 export const getDashboardSummary = () => apiGet(`${BASE}/dashboard/summary`);
 
+/** GET /dashboard/coverage -> { coversAll, channelIds } */
+export const getDashboardCoverage = () => apiGet(`${BASE}/dashboard/coverage`);
+
 /** GET /channels/{channelId}/activity -> ChannelActivity
     { channelId, granularity, points: [{ time, received, sent, error, filtered, queued }] }.
     opts: { from (epoch millis), to (epoch millis), granularity AUTO|RAW|HOURLY }.

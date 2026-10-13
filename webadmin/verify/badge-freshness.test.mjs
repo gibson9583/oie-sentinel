@@ -42,7 +42,7 @@ const realNow = Date.now;
 Date.now = () => now;
 after(() => { Date.now = realNow; });
 mod.platform.store.getState = () => ({ id: 1 });
-const goodGet = async p => p.endsWith('/monitors') ? [{ enabled: true, scopeType: 'ALL' }]
+const goodGet = async p => p.endsWith('/dashboard/coverage') ? { coversAll: true, channelIds: [] }
     : p.endsWith('/problems') ? { items: [], total: 0 } : [];
 const cell = (id = 'a') => nodes(mod.SentinelCell({ channelId: id }));
 const clear = () => cell().some(n => n.props?.className?.includes('sn-clear'));

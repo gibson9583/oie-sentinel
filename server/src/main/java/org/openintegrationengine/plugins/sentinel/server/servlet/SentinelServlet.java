@@ -461,14 +461,18 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             String sortDir, int page, int pageSize) {
         try {
             Set<String> authorized = authorizedChannelIds(channelId);
+            Set<String> monitorReader = null;
             if (authorized != null) {
                 if (authorized.isEmpty()) {
                     return Json.write(new PagedResult<AlertEvent>(List.of(), 0L, page, pageSize));
                 }
+                if (monitorType != null && !monitorType.isBlank()) {
+                    monitorReader = authorizedChannelIds(null);
+                }
                 channelId = String.join(",", authorized);
             }
             return Json.write(ProblemService.list(status, severity, channelId, monitorId, monitorType,
-                    acknowledged, from, to, q, sort, sortDir, page, pageSize));
+                    acknowledged, from, to, q, sort, sortDir, page, pageSize, monitorReader));
         } catch (Exception e) {
             throw translate("getProblems", e);
         }
@@ -483,7 +487,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String getProblem(long id) {
         try {
-            return Json.write(ProblemService.getDetail(id, authorizedChannelIds(null)));
+            Set<String> monitorChannels = authorizedChannelIds(null);
+            return Json.write(ProblemService.getDetail(id, monitorChannels,
+                    channelId -> monitorChannels == null || !isChannelRedacted(channelId)));
         } catch (Exception e) {
             throw translate("getProblem", e);
         }
@@ -581,6 +587,15 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             return Json.write(DashboardService.build(authorizedChannelIds(null)));
         } catch (Exception e) {
             throw translate("getDashboardSummary", e);
+        }
+    }
+
+    @Override
+    public String getDashboardCoverage() {
+        try {
+            return Json.write(DashboardService.coverage(authorizedChannelIds(null)));
+        } catch (Exception e) {
+            throw translate("getDashboardCoverage", e);
         }
     }
 
@@ -717,9 +732,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String getCoreUsers() {
         try {
-            requireUserDirectoryPermission();
+            Set<Integer> readable = isUserDirectoryReader() ? null : readableUserIds();
             List<UserInfo> users = new ArrayList<>();
             for (User user : ControllerFactory.getFactory().createUserController().getAllUsers()) {
+                if (readable != null && !readable.contains(user.getId())) {
+                    continue;
+                }
                 UserInfo info = new UserInfo();
                 info.setUserId(user.getId());
                 info.setUsername(user.getUsername());
@@ -805,16 +823,27 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
 
     // ========== Boundary helpers ==========
 
-    private void requireUserDirectoryPermission() {
+    private boolean isUserDirectoryReader() {
         Operation sentinelOperation = operation;
         try {
             // Assign the core operation directly. setOperation would wrap it
             // in the Sentinel extension and bypass the core permission map.
             operation = OperationUtil.getOperation(UserServletInterface.class, "getAllUsers");
-            checkUserAuthorized();
+            return isUserAuthorized();
+        } catch (MirthApiException e) {
+            if (e.getResponse() != null && e.getResponse().getStatus() == Status.FORBIDDEN.getStatusCode()) {
+                return false;
+            }
+            throw e;
         } finally {
             operation = sentinelOperation;
         }
+    }
+
+    private Set<Integer> readableUserIds() {
+        Set<Integer> ids = ProblemService.acknowledgingUserIds(authorizedChannelIds(null));
+        ids.add(getCurrentUserId());
+        return ids;
     }
 
     /**

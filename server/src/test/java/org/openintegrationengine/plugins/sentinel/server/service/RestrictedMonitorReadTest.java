@@ -194,6 +194,8 @@ class RestrictedMonitorReadTest {
             resolver.when(() -> ScopeResolver.resolveStartedChannels(allowed)).thenReturn(List.of(
                     new ScopeResolver.ChannelTarget("allowed", "Allowed"),
                     new ScopeResolver.ChannelTarget("forbidden", "Forbidden")));
+            resolver.when(() -> ScopeResolver.resolveStartedChannels(forbidden)).thenReturn(List.of(
+                    new ScopeResolver.ChannelTarget("forbidden", "Forbidden")));
             events.when(() -> AlertEventRepository.listAlertEvents(any())).thenAnswer(invocation -> {
                 AlertEventFilter filter = invocation.getArgument(0);
                 assertEquals(ALLOWED, new HashSet<>(filter.getChannelIdIn()));
@@ -204,7 +206,7 @@ class RestrictedMonitorReadTest {
             assertEquals(2, dashboard.getMonitorsTotal());
             assertEquals(1, dashboard.getMonitorsEnabled());
             assertEquals(1, dashboard.getChannelsWatched());
-            resolver.verify(() -> ScopeResolver.resolveStartedChannels(forbidden), never());
+            resolver.verify(() -> ScopeResolver.resolveStartedChannels(forbidden));
             resolver.verify(() -> ScopeResolver.resolveStartedChannels(disabled), never());
             DashboardSummary empty = DashboardService.build(Set.of());
             assertEquals(0, empty.getMonitorsTotal());

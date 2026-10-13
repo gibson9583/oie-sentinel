@@ -23,6 +23,7 @@ public class ProblemDetail {
     private AlertEvent event;
     private String monitorName;
     private MonitorType monitorType;
+    private String runbookUrl;
     private String channelName;
     private String connectorName;
     private List<ActionDispatchLog> dispatches;
@@ -75,6 +76,14 @@ public class ProblemDetail {
      */
     public void setMonitorType(MonitorType monitorType) {
         this.monitorType = monitorType;
+    }
+
+    public String getRunbookUrl() {
+        return runbookUrl;
+    }
+
+    public void setRunbookUrl(String runbookUrl) {
+        this.runbookUrl = runbookUrl;
     }
 
     /**

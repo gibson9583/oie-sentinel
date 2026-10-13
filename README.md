@@ -302,13 +302,17 @@ scheduler-interval and retention values on the Settings page.
 Channel-restricted viewers see monitor definitions only when their complete, nonempty scope is
 within the user's authorized channels, including stopped and undeployed members. This applies to
 CHANNEL, GROUP, TAG and ALL scopes, suppression ancestors, monitor details and history, and dashboard
-monitor/coverage totals. Mixed, empty, missing and unresolved scopes are hidden; hidden monitor IDs
+monitor totals. Mixed, empty, missing and unresolved scopes are hidden; hidden monitor IDs
 return 404. Group and tag pickers use the same complete-membership rule. Scope membership and
 permissions are checked for each request. Authorized channel events remain readable even if their
-monitor's current definition is hidden; problem details omit that definition's current name/type.
+monitor's current definition is hidden or the channel has been deleted; problem details omit a
+hidden definition's current name, type and runbook URL. Coverage includes authorized channels watched
+by any enabled monitor, even when the definition itself is hidden. Restricted coverage responses
+contain explicit authorized channel IDs and never identify global ALL-scope monitoring.
 
-The user-name directory additionally requires the engine's **Manage Users** permission. Without it,
-the UI displays user IDs for acknowledgement attribution. Action and schedule definitions remain
+The full user-name directory additionally requires the engine's **Manage Users** permission. Without
+it, the lookup returns only the caller and acknowledgement authors on their visible channels; the UI
+uses user IDs for any remaining attribution. Action and schedule definitions remain
 global configuration reads. **Manage Monitoring** grants global configuration authoring and export;
 **Manage Schedules** grants global schedule authoring. These management grants are broader than a
 channel-scoped monitoring view and should be assigned accordingly.
