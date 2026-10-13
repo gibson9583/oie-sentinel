@@ -118,9 +118,12 @@ class InactivityEvaluatorTest {
     }
 
     private void givenProbeReturns(List<ActivitySample> samples) {
-        activityRepository.when(() -> ActivityRepository.listActivitySamples(
-                CHANNEL_ID, WINDOW_START.minusSeconds(COLLECTOR_SLACK_SECONDS), NOW))
-                .thenReturn(samples);
+        activityRepository.when(() -> ActivityRepository.listActivitySampleTimes(
+                CHANNEL_ID, WINDOW_START.minusSeconds(COLLECTOR_SLACK_SECONDS), NOW, null,
+                ActivityRepository.SAMPLE_TIME_PAGE_SIZE))
+                .thenAnswer(call -> samples.stream().map(ActivitySample::getSampleTime)
+                        .filter(time -> time == null || !time.isBefore(WINDOW_START.minusSeconds(COLLECTOR_SLACK_SECONDS)))
+                        .toList());
     }
 
     private static EvaluationOutcome evaluate() {

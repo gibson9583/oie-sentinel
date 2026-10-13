@@ -39,7 +39,8 @@ class ActivityCoverageRegressionTest {
                 var activity = mockStatic(ActivityRepository.class);
                 var baseline = mockStatic(BaselineResolver.class)) {
             settings.when(SettingsService::get).thenReturn(config);
-            activity.when(() -> ActivityRepository.listActivitySamples(eq(CHANNEL), any(), any())).thenReturn(samples);
+            activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
+                    .thenAnswer(call -> samples.stream().map(ActivitySample::getSampleTime).toList());
             activity.when(() -> ActivityRepository.sumActivitySamplesForRange(eq(CHANNEL), any(), any()))
                     .thenReturn(new ActivityAggregate());
             baseline.when(() -> BaselineResolver.resolve(eq(CHANNEL), any(), anyString(), anyInt(), anyBoolean()))
@@ -60,8 +61,8 @@ class ActivityCoverageRegressionTest {
         ActivitySample anchor = new ActivitySample(); anchor.setSampleTime(END.minusSeconds(620));
         try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(config);
-            activity.when(() -> ActivityRepository.listActivitySamples(eq(CHANNEL), any(), any()))
-                    .thenReturn(List.of(anchor));
+            activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
+                    .thenAnswer(call -> List.of(anchor.getSampleTime()));
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(120), END));
             anchor.setSampleTime(END.minusSeconds(120));
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(120), END),
@@ -69,19 +70,13 @@ class ActivityCoverageRegressionTest {
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(longs = {999990L, 999991L, 7776000L})
-    void boundsHistoricalRawRowsBeforeLoadingEvenAfterCadenceWasSlowed(long queryWidthSeconds) {
-        SentinelSettings config = new SentinelSettings(); config.setCollectorIntervalSeconds(600);
-        config.setSampleRetentionDays(90);
-        Instant start = END.minusSeconds(queryWidthSeconds - 900);
+    @org.junit.jupiter.api.Test
+    void rangesBeyondRetentionDoNotQueryRawHistory() {
+        SentinelSettings config = new SentinelSettings(); config.setSampleRetentionDays(90);
         try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(config);
-            assertFalse(ActivityCoverage.covers(CHANNEL, start, END));
-            activity.verify(() -> ActivityRepository.listActivitySamples(CHANNEL, start.minusSeconds(900), END),
-                    times(queryWidthSeconds <= 999990 ? 1 : 0));
-            activity.verifyNoMoreInteractions();
+            assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(90 * 86400L + 1), END));
+            activity.verifyNoInteractions();
         }
     }
-
 }

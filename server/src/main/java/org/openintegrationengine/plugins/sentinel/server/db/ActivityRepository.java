@@ -44,6 +44,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  */
 public final class ActivityRepository {
 
+    /** Maximum timestamps materialized by one coverage query, enforced in SQL. */
+    public static final int SAMPLE_TIME_PAGE_SIZE = 2_048;
+
     private static final String NAMESPACE = "Sentinel";
     private static final Logger log = LoggerFactory.getLogger(ActivityRepository.class);
 
@@ -205,6 +208,38 @@ public final class ActivityRepository {
             return samples;
         } catch (Exception e) {
             log.error("Failed to list activity samples for channel {} from {} to {}", channelId, from, to, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
+     * Reads a bounded page of distinct observation times in an inclusive range.
+     * Pass the last returned timestamp as {@code after} for the next page (or
+     * null for the first). Distinct times keep duplicate observations from
+     * consuming the scan budget. The channel/time index supports ordered keyset
+     * traversal without OFFSET scans or loading the full activity row payload.
+     */
+    public static List<Instant> listActivitySampleTimes(String channelId, Instant from, Instant to,
+            Instant after, int limit) {
+        if (limit < 1 || limit > SAMPLE_TIME_PAGE_SIZE) {
+            throw new IllegalArgumentException("Activity timestamp page limit must be between 1 and "
+                    + SAMPLE_TIME_PAGE_SIZE);
+        }
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("channelId", channelId);
+            params.put("from", toTimestamp(from));
+            params.put("to", toTimestamp(to));
+            params.put("after", toTimestamp(after));
+            params.put("limit", limit);
+            List<Timestamp> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listActivitySampleTimes"), params);
+            List<Instant> times = new ArrayList<>(rows.size());
+            for (Timestamp row : rows) times.add(row == null ? null : row.toInstant());
+            return times;
+        } catch (Exception e) {
+            log.error("Failed to page activity sample times for channel {} from {} to {}",
+                    channelId, from, to, e);
             throw new RepositoryException(e);
         }
     }
