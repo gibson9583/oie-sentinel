@@ -406,6 +406,16 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public String setMaintenanceWindowEnabled(int id, Boolean enabled) {
+        try {
+            return Json.write(MaintenanceWindowService.setEnabled(id, enabled, getCurrentUserId()));
+        } catch (Exception e) {
+            throw translate("setMaintenanceWindowEnabled", e);
+        }
+    }
+
     /**
      * {@inheritDoc}
      * <p>Delegates to {@code MaintenanceWindowService.delete(int, int)}.</p>

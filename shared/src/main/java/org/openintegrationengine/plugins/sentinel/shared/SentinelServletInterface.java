@@ -432,6 +432,17 @@ public interface SentinelServletInterface extends BaseServletInterface {
             @Param(value = "body", excludeFromAudit = true) String windowJson) throws ClientException;
 
     /**
+     * Changes only a schedule's enabled flag, preserving concurrent definition edits.
+     * An explicit target state is required so retries are idempotent.
+     */
+    @POST
+    @Path("/maintenanceWindows/{id}/_setEnabled")
+    @Operation(summary = "Enables or disables a maintenance window without replacing its definition")
+    @MirthOperation(name = "sentinelSetMaintenanceWindowEnabled", display = "Enable/disable Sentinel maintenance window", permission = PERMISSION_MAINTENANCE, type = ExecuteType.ASYNC)
+    String setMaintenanceWindowEnabled(@Param("id") @PathParam("id") int id,
+            @Param("enabled") @QueryParam("enabled") Boolean enabled) throws ClientException;
+
+    /**
      * Deletes a maintenance window.
      *
      * @param id database id of the window to delete

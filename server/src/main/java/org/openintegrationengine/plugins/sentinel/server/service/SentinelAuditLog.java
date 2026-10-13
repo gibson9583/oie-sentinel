@@ -176,6 +176,12 @@ public final class SentinelAuditLog {
         dispatchWindowEvent(userId, "Updated Sentinel maintenance window", window);
     }
 
+    /** Records the operational flag change separately from a definition edit. */
+    public static void windowEnabledChanged(int userId, MaintenanceWindow window) {
+        dispatchWindowEvent(userId,
+                (window.isEnabled() ? "Enabled" : "Disabled") + " Sentinel maintenance window", window);
+    }
+
     /** Records that a user deleted a maintenance window. */
     public static void windowDeleted(int userId, MaintenanceWindow window) {
         dispatchWindowEvent(userId, "Deleted Sentinel maintenance window", window);

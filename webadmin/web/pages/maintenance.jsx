@@ -14,7 +14,7 @@
 import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog, promptDialog } from '@oie/web-ui';
 import {
-    listMaintenanceWindows, createMaintenanceWindow, updateMaintenanceWindow,
+    listMaintenanceWindows, createMaintenanceWindow, updateMaintenanceWindow, setMaintenanceWindowEnabled,
     deleteMaintenanceWindow, activateMaintenanceWindowNow,
     getCoreChannels, getCoreChannelGroups, getCoreTags, errText,
 } from '../api.js';
@@ -247,7 +247,7 @@ function buildColumns(handlersRef) {
                 title: r.enabled ? 'Disable this window' : 'Enable this window',
                 onclick: (e) => e.stopPropagation(),
                 ondblclick: (e) => e.stopPropagation(),
-                onchange: () => handlersRef.current.toggle(r),
+                onchange: (e) => handlersRef.current.toggle(r, e.target.checked),
             }),
             sortValue: (r) => (r.enabled ? 0 : 1),
         },
@@ -651,27 +651,12 @@ export function MaintenancePage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     })), [windows.data, channelNames, groupNames, tagNames]); // windowList derives from windows.data
 
-    // No _setEnabled endpoint for windows — toggling round-trips the full entity.
-    const toggleEnabled = async (w) => {
+    // Send the checkbox's requested state, never the stale row's definition.
+    const toggleEnabled = async (w, enabled) => {
         if (!canManageMaintenance()) return;
         try {
-            await updateMaintenanceWindow(w.id, {
-                id: w.id,
-                name: w.name,
-                mode: w.mode,
-                scopeType: w.scopeType,
-                scopeId: w.scopeId == null ? null : w.scopeId,
-                repeatType: w.repeatType,
-                daysOfWeek: w.daysOfWeek == null ? null : w.daysOfWeek,
-                daysOfMonth: w.daysOfMonth == null ? null : w.daysOfMonth,
-                startTime: w.startTime == null ? null : w.startTime,
-                endTime: w.endTime == null ? null : w.endTime,
-                timezone: w.timezone == null ? null : w.timezone,
-                activeFrom: w.activeFrom == null ? null : w.activeFrom,
-                activeUntil: w.activeUntil == null ? null : w.activeUntil,
-                enabled: !w.enabled,
-            });
-            toast(`Maintenance window "${w.name}" ${w.enabled ? 'disabled' : 'enabled'}.`, 'success');
+            await setMaintenanceWindowEnabled(w.id, enabled);
+            toast(`Maintenance window "${w.name}" ${enabled ? 'enabled' : 'disabled'}.`, 'success');
         } catch (e) {
             errorModal('Enable/Disable Failed', errText(e), w.name);
         }
