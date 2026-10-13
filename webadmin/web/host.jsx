@@ -433,6 +433,14 @@ function SentinelCell({ channelId }) {
         return <span className="sn-host-cell sn-host-idle" title="Sentinel is still loading">·</span>;
     }
     if (coversAll || covered.has(channelId)) {
+        // A missing row in an incomplete page cannot establish that the
+        // channel is healthy: its oldest incident may be beyond the cap.
+        if (snapshot.truncated) {
+            return (
+                <span className="sn-host-cell sn-host-idle"
+                    title={`Sentinel status incomplete — only the first ${MAX_PROBLEMS} open problems were loaded`}>?</span>
+            );
+        }
         return (
             <span className="sn-host-cell">
                 <span className="sn-host-badge sn-clear"
