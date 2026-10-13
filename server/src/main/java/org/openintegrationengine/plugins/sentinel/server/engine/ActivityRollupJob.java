@@ -8,6 +8,7 @@ package org.openintegrationengine.plugins.sentinel.server.engine;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.ArrayList;
 
 import org.quartz.DisallowConcurrentExecution;
 import org.quartz.Job;
@@ -33,8 +34,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * <p>Scheduled at five past the hour (cron {@code 0 5 * * * ?}) so the hour
  * being rolled up is fully closed and every collector tick belonging to it
  * has long since been written. The write path is
- * {@link ActivityRepository#replaceActivityTrendForHour(ActivityTrend)} —
- * a transactional delete-then-insert — so re-running the rollup for the
+ * {@link ActivityRepository#replaceActivityTrendsForHour(List, LeaseFence)} —
+ * one transaction for every channel in the hour — so re-running the rollup for the
  * same hour (misfired-then-recovered scheduler, manual replay) is
  * idempotent instead of duplicating buckets, without resorting to
  * vendor-specific {@code MERGE}/{@code ON CONFLICT} SQL.</p>
@@ -45,9 +46,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * left alone, that hour's bucket would never exist and every baseline built
  * over the gap would be quietly wrong. Instead each run resumes from
  * {@link ActivityRepository#getLatestTrendHourBucket()}: it rolls every hour
- * after the last written bucket up to the previous completed hour, capped at
- * {@link #MAX_BACKFILL_HOURS} per run. In steady state that is exactly one
- * hour; after an outage it is the outage. Hours with no samples on any
+ * from the last written bucket up to the previous completed hour, capped at
+ * {@link #MAX_BACKFILL_HOURS} per run. Missing channel buckets in the latest hour are replayed to repair a partial checkpoint from older
+ * versions; in steady state this is at most two hours; after an outage it is the outage. Hours with no samples on any
  * channel write no bucket and so are re-scanned until a later hour writes
  * one — cheap (an empty indexed range read per channel) and bounded by the
  * same cap. An outage longer than the cap leaves the oldest hours to manual
@@ -88,7 +89,7 @@ public class ActivityRollupJob implements Job {
     static final int MAX_BACKFILL_HOURS = 48;
 
     /**
-     * Rolls up every un-rolled completed hour (normally exactly one; see the
+     * Replays the latest hour and rolls up subsequent completed hours (see the
      * backfill section of the class Javadoc), unless another node holds the
      * Sentinel leader lease. Never throws — the schedule must keep firing
      * (see collector job for the rationale); a failed hour is retried by the
@@ -115,10 +116,10 @@ public class ActivityRollupJob implements Job {
             // seasonality is unaffected.
             Instant prevHourStart = Instant.now().truncatedTo(ChronoUnit.HOURS)
                     .minus(1, ChronoUnit.HOURS);
-            Instant firstHour = resolveFirstHourToRoll(prevHourStart);
+            Instant latestBucket = ActivityRepository.getLatestTrendHourBucket();
+            Instant firstHour = resolveFirstHourToRoll(prevHourStart, latestBucket);
             if (firstHour.isAfter(prevHourStart)) {
-                // The previous hour is already rolled up (a second fire
-                // inside the same hour, or a clock step backwards).
+                // A clock step backwards can put the checkpoint in the future.
                 log.debug("No un-rolled hours before {}", prevHourStart);
                 return;
             }
@@ -139,21 +140,26 @@ public class ActivityRollupJob implements Job {
                 Instant hourEndInclusive = hourStart.plus(1, ChronoUnit.HOURS).minusMillis(1);
                 hoursRolled++;
 
+                List<ActivityTrend> trends = new ArrayList<>();
                 for (Channel channel : channels) {
                     if (!SentinelLeadership.recheckFence(fence)) {
                         log.info("Activity rollup stopped between channels because leadership epoch changed");
                         return;
                     }
-                    // Per-channel try/catch: one channel's bad rollup must not
-                    // cost every other channel its trend bucket for the hour.
-                    try {
-                        if (rollupChannel(channel.getId(), hourStart, hourEndInclusive, fence)) {
-                            bucketsWritten++;
-                        }
-                    } catch (Exception e) {
-                        log.error("Failed to roll up activity for channel {} hour {}", channel.getId(), hourStart, e);
+                    // Older releases committed one channel at a time. Repair only
+                    // missing buckets in their latest hour: replacing an existing
+                    // bucket could erase samples already removed by retention.
+                    if (latestBucket != null && !hourStart.isAfter(latestBucket)
+                            && ActivityRepository.hasActivityTrendForHour(channel.getId(), hourStart)) {
+                        continue;
                     }
+                    ActivityTrend trend = rollupChannel(channel.getId(), hourStart, hourEndInclusive);
+                    if (trend != null) trends.add(trend);
                 }
+                // A read/write failure aborts this hour and all later hours. The
+                // global MAX checkpoint must never describe a partial hour.
+                ActivityRepository.replaceActivityTrendsForHour(trends, fence);
+                bucketsWritten += trends.size();
             }
 
             if (bucketsWritten > 0) {
@@ -169,19 +175,18 @@ public class ActivityRollupJob implements Job {
     }
 
     /**
-     * Picks the first hour this run should roll: the hour after the latest
+     * Picks the first hour this run should roll: the latest
      * written trend bucket, clamped to {@link #MAX_BACKFILL_HOURS} behind the
-     * previous completed hour. An empty trend table (fresh install) starts at
-     * the previous hour — there is no history to resume from, and deep
-     * backfill from raw samples on first start would only front-load work the
-     * hourly cadence covers naturally.
+     * previous completed hour. An empty trend table starts at the earliest
+     * retained sample (also capped), so a failed first rollup is retried even
+     * if the next run happens in a later hour.
      */
-    private static Instant resolveFirstHourToRoll(Instant prevHourStart) {
-        Instant latestBucket = ActivityRepository.getLatestTrendHourBucket();
+    private static Instant resolveFirstHourToRoll(Instant prevHourStart, Instant latestBucket) {
         if (latestBucket == null) {
-            return prevHourStart;
+            latestBucket = ActivityRepository.getEarliestActivitySampleTime();
+            if (latestBucket == null) return prevHourStart;
         }
-        Instant resume = latestBucket.truncatedTo(ChronoUnit.HOURS).plus(1, ChronoUnit.HOURS);
+        Instant resume = latestBucket.truncatedTo(ChronoUnit.HOURS);
         Instant floor = prevHourStart.minus(MAX_BACKFILL_HOURS - 1, ChronoUnit.HOURS);
         if (resume.isBefore(floor)) {
             log.warn("Trend rollup is {} hours behind; backfilling the most recent {} and leaving "
@@ -193,19 +198,18 @@ public class ActivityRollupJob implements Job {
     }
 
     /**
-     * Computes and replaces one channel's bucket for the hour. Channels with
+     * Computes one channel's bucket for the hour. Channels with
      * no samples in the hour get no bucket at all (rather than a zero row):
      * "the collector wasn't watching" and "the channel received nothing"
      * are different facts, and {@code BaselineResolver} must not learn a
      * baseline of zeros from hours Sentinel simply wasn't running.
      *
-     * @return true if a bucket was written, false if the hour had no samples
+     * @return the computed bucket, or null if the hour had no samples
      */
-    private boolean rollupChannel(String channelId, Instant hourStart, Instant hourEndInclusive,
-            LeaseFence fence) {
+    private ActivityTrend rollupChannel(String channelId, Instant hourStart, Instant hourEndInclusive) {
         List<ActivitySample> samples = ActivityRepository.listActivitySamples(channelId, hourStart, hourEndInclusive);
         if (samples.isEmpty()) {
-            return false;
+            return null;
         }
 
         long receivedSum = 0L;
@@ -236,7 +240,6 @@ public class ActivityRollupJob implements Job {
         trend.setMinQueued(minQueued);
         trend.setMaxQueued(maxQueued);
 
-        ActivityRepository.replaceActivityTrendForHour(trend, fence);
-        return true;
+        return trend;
     }
 }

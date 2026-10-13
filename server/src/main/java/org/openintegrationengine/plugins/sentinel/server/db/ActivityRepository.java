@@ -288,31 +288,36 @@ public final class ActivityRepository {
     }
 
     public static void replaceActivityTrendForHour(ActivityTrend trend, LeaseFence fence) {
+        replaceActivityTrendsForHour(List.of(trend), fence);
+    }
+
+    /** Commits a complete hour together so a partial hour cannot advance the resume point. */
+    public static void replaceActivityTrendsForHour(List<ActivityTrend> trends, LeaseFence fence) {
+        if (trends.isEmpty()) return;
+        Instant hour = trends.get(0).getHourBucket();
+        if (hour == null || trends.stream().anyMatch(trend -> !hour.equals(trend.getHourBucket()))) {
+            throw new IllegalArgumentException("All replacement trends must belong to one hour");
+        }
         SqlSession session = null;
         try {
             session = SqlConfig.getInstance().getSqlSessionManager().openSession(false);
             if (!NodeLeaseRepository.lockFence(session, fence)) {
                 throw new IllegalStateException("Sentinel leadership fence changed before trend replacement");
             }
-
-            Map<String, Object> deleteParams = new HashMap<>();
-            deleteParams.put("channelId", trend.getChannelId());
-            deleteParams.put("hourBucket", toTimestamp(trend.getHourBucket()));
-            session.delete(stmt("deleteActivityTrendForHour"), deleteParams);
-
-            Map<String, Object> insertParams = toTrendColumnMap(trend);
-            session.insert(stmt("insertActivityTrend"), insertParams);
-
+            for (ActivityTrend trend : trends) {
+                Map<String, Object> deleteParams = new HashMap<>();
+                deleteParams.put("channelId", trend.getChannelId());
+                deleteParams.put("hourBucket", toTimestamp(trend.getHourBucket()));
+                session.delete(stmt("deleteActivityTrendForHour"), deleteParams);
+                session.insert(stmt("insertActivityTrend"), toTrendColumnMap(trend));
+            }
             NodeLeaseRepository.requireFence(session, fence);
             session.commit();
         } catch (Exception e) {
-            log.error("Failed to replace activity trend for channel {} hour {}",
-                    trend.getChannelId(), trend.getHourBucket(), e);
+            log.error("Failed to replace activity trends for hour {}", hour, e);
             throw new RepositoryException(e);
         } finally {
-            if (session != null) {
-                session.close();
-            }
+            if (session != null) session.close();
         }
     }
 
@@ -351,8 +356,8 @@ public final class ActivityRepository {
     /**
      * Returns the hour bucket of the most recent trend row across all
      * channels, or {@code null} when the trend table is empty. This is the
-     * rollup job's resume point: each run rolls forward from the hour after
-     * the last bucket any leader wrote, so hours missed to a restart,
+     * rollup job's resume point: each run replays the latest hour and rolls forward from
+     * that complete-hour checkpoint, so hours missed to a restart,
      * failover or thread-starved trigger are backfilled instead of skipped.
      *
      * @return the latest {@code hour_bucket}, or {@code null} when no trend
@@ -366,6 +371,29 @@ public final class ActivityRepository {
             return latest != null ? latest.toInstant() : null;
         } catch (Exception e) {
             log.error("Failed to read the latest activity trend hour bucket", e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /** Whether a channel bucket is already durable; replay must not replace it after raw pruning. */
+    public static boolean hasActivityTrendForHour(String channelId, Instant hour) {
+        try {
+            Integer count = SqlConfig.getInstance().getSqlSessionManager().selectOne(
+                    stmt("countActivityTrendForHour"), Map.of("channelId", channelId, "hourBucket", toTimestamp(hour)));
+            return count != null && count > 0;
+        } catch (Exception e) {
+            throw new RepositoryException("Failed to inspect existing activity trend", e);
+        }
+    }
+
+    /** Earliest retained sample, used to resume before the first successful rollup. */
+    public static Instant getEarliestActivitySampleTime() {
+        try {
+            Timestamp earliest = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectOne(stmt("getEarliestActivitySampleTime"));
+            return earliest != null ? earliest.toInstant() : null;
+        } catch (Exception e) {
+            log.error("Failed to read the earliest activity sample time", e);
             throw new RepositoryException(e);
         }
     }

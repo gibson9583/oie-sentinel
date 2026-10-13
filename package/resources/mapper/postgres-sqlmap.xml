@@ -438,6 +438,15 @@
         SELECT MAX(hour_bucket) FROM sentinel_channel_activity_trend
     </select>
 
+    <select id="countActivityTrendForHour" parameterType="map" resultType="int">
+        SELECT COUNT(*) FROM sentinel_channel_activity_trend
+        WHERE channel_id = #{channelId} AND hour_bucket = #{hourBucket}
+    </select>
+
+    <select id="getEarliestActivitySampleTime" resultType="java.sql.Timestamp">
+        SELECT MIN(sample_time) FROM sentinel_channel_activity_sample
+    </select>
+
     <!-- ========== CONNECTOR_STATUS_EVENT (table sentinel_connector_status_event) ========== -->
 
     <insert id="insertConnectorStatusEvent" parameterType="map">
