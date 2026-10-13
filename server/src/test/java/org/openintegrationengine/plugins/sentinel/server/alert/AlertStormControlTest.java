@@ -67,6 +67,8 @@ class AlertStormControlTest {
     private MockedStatic<AlertEventRepository> alertEventRepository;
     private MockedStatic<ActionDispatchLogRepository> dispatchLogRepository;
     private MockedStatic<ScopeResolver> scopeResolver;
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository> monitors;
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression> policy;
 
     /** The recent events the ceiling scan walks. */
     private final List<AlertEvent> recentEvents = new ArrayList<>();
@@ -81,12 +83,27 @@ class AlertStormControlTest {
                 .thenReturn(recentEvents);
         dispatchLogRepository = Mockito.mockStatic(ActionDispatchLogRepository.class);
         scopeResolver = Mockito.mockStatic(ScopeResolver.class);
+        alertEventRepository.when(() -> AlertEventRepository.getAlertEvent(Mockito.anyLong()))
+                .thenAnswer(call -> recentEvents.stream().filter(event -> event.getId().equals(call.getArgument(0)))
+                        .findFirst().orElse(null));
+        monitors = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository.class);
+        org.openintegrationengine.plugins.sentinel.shared.model.Monitor monitor = new org.openintegrationengine.plugins.sentinel.shared.model.Monitor();
+        monitor.setId(7);
+        monitor.setEnabled(true);
+        monitors.when(() -> org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository.getMonitor(7)).thenReturn(monitor);
+        policy = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.class);
+        policy.when(() -> org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.decision(any(), any()))
+                .thenAnswer(call -> ((AlertEvent) call.getArgument(0)).isSuppressed()
+                        ? org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.Decision.SUPPRESS
+                        : org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.Decision.ALLOW);
         scopeResolver.when(() -> ScopeResolver.channelName(anyString()))
                 .thenAnswer(invocation -> "name:" + invocation.getArgument(0));
     }
 
     @AfterEach
     void tearDown() {
+        policy.close();
+        monitors.close();
         scopeResolver.close();
         dispatchLogRepository.close();
         alertEventRepository.close();
@@ -100,6 +117,7 @@ class AlertStormControlTest {
         action.setId(10);
         action.setName("Page on-call");
         action.setEnabled(true);
+        action.setOperationMode(org.openintegrationengine.plugins.sentinel.shared.model.OperationMode.BOTH);
         action.setMaxNotificationsPerWindow(max);
         action.setRollupWindowSeconds(windowSeconds);
         return action;
