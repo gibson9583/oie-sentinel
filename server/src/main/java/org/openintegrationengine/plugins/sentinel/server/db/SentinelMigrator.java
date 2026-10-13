@@ -100,6 +100,7 @@ import org.slf4j.LoggerFactory;
  *   <li><b>10</b> — Durable problem dispatch outbox, backfilled for open events.</li>
  *   <li><b>11</b> — Per-node deployed-channel inventory for cluster-wide evaluation.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
+ *   <li><b>13</b> — Dispatch-time index for complete notification-budget accounting.</li>
  * </ul>
  * <p>Versions 7–12 are this release's sequence after released schema v6.
  * Unpublished hardening-branch versions are intentionally not the release
@@ -119,7 +120,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 12;
+    public static final int LATEST_VERSION = 13;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -198,6 +199,9 @@ public class SentinelMigrator extends Migrator {
         }
         if (current < 12 && targetVersion >= 12) {
             applyV12();
+        }
+        if (current < 13 && targetVersion >= 13) {
+            applyV13();
         }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
@@ -288,7 +292,9 @@ public class SentinelMigrator extends Migrator {
                                 && indexExists("sentinel_alert_event", "idx_sentinel_alert_problem",
                                         "problem_pending, status, opened_time")
                                 ? (tableExists("sentinel_channel_presence")
-                                        ? (columnExists("sentinel_connector_status_event", "deployment_time") ? 12 : 11) : 10) : 9;
+                                        ? (columnExists("sentinel_connector_status_event", "deployment_time")
+                                                ? (indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time",
+                                                        "dispatch_time") ? 13 : 12) : 11) : 10) : 9;
                     }
                     return 8;
                 }
@@ -399,6 +405,11 @@ public class SentinelMigrator extends Migrator {
         } catch (Exception e) {
             throw new MigrationException("Failed to add Sentinel observation deployment identity", e);
         }
+    }
+
+    /** Dispatch-time accounting includes deliveries on arbitrarily old incidents. */
+    private void applyV13() throws MigrationException {
+        createIndexIfAbsent("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time");
     }
 
     private void addColumnIfAbsent(String table, String column, String sqlType) throws MigrationException {
@@ -676,6 +687,7 @@ public class SentinelMigrator extends Migrator {
             object("sentinel_connector_status_event", "idx_sentinel_conn_node_id"),
             object("sentinel_action", "idx_sentinel_action_enabled"),
             object("sentinel_action_dispatch_log", "idx_sentinel_action_dispatch_log_event"),
+            object("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time"),
             object("sentinel_maintenance_window", "idx_sentinel_maintenance_window_scope")};
 
     /** PostgreSQL SERIAL sequences do not follow their table through a rename. */

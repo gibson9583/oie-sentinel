@@ -82,6 +82,7 @@ class AlertStormControlTest {
         alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
                 .thenReturn(recentEvents);
         dispatchLogRepository = Mockito.mockStatic(ActionDispatchLogRepository.class);
+
         scopeResolver = Mockito.mockStatic(ScopeResolver.class);
         alertEventRepository.when(() -> AlertEventRepository.getAlertEvent(Mockito.anyLong()))
                 .thenAnswer(call -> recentEvents.stream().filter(event -> event.getId().equals(call.getArgument(0)))
@@ -138,6 +139,8 @@ class AlertStormControlTest {
         return event;
     }
 
+    private final List<ActionDispatchLog> rangeRows = new ArrayList<>();
+
     /** Attaches dispatch rows for action 10 to an event: one per age, oldest first. */
     private void rowsFor(AlertEvent event, String marker, long... secondsAgo) {
         List<ActionDispatchLog> rows = new ArrayList<>();
@@ -152,6 +155,9 @@ class AlertStormControlTest {
         }
         dispatchLogRepository.when(() -> ActionDispatchLogRepository
                 .listActionDispatchLogsForEvent(event.getId())).thenReturn(rows);
+        rangeRows.addAll(rows);
+        dispatchLogRepository.when(() -> ActionDispatchLogRepository.listActionDispatchLogsInRange(any(), any()))
+                .thenReturn(rangeRows);
     }
 
     private static AlertStormControl.CeilingVerdict verdict(Action action) {
