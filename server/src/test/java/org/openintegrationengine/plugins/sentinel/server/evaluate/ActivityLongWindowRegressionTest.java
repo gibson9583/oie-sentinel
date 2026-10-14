@@ -44,7 +44,7 @@ class ActivityLongWindowRegressionTest {
             config.when(SettingsService::get).thenReturn(settings);
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings.getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings.getCollectorIntervalSeconds());
             repo.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                     .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             repo.when(() -> ActivityRepository.sumActivitySamplesForRange(eq(channel), any(), any()))

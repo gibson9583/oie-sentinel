@@ -5,6 +5,7 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
+import java.time.Instant;
 import java.util.Properties;
 
 import org.quartz.CronScheduleBuilder;
@@ -103,6 +104,10 @@ public final class SentinelScheduler {
     /** The live scheduler; null whenever the plugin is stopped. */
     private volatile Scheduler scheduler;
 
+    // Null during a collector schedule change. Published after Quartz returns,
+    // because a trigger's startTime precedes its possibly delayed installation.
+    private volatile Instant collectorCoverageSince;
+
     private SentinelScheduler() {
     }
 
@@ -112,24 +117,35 @@ public final class SentinelScheduler {
     }
 
     /**
-     * Returns the applied collector cadence, or zero when it cannot be established.
-     * Property reads may silently fail or disagree with a partially applied settings
-     * update, so coverage must use the actual trigger. Do not synchronize with
-     * shutdown(): it waits for evaluator jobs that call this method to finish.
+     * Returns the applied cadence only for observations from the current schedule,
+     * or zero if it cannot be established. A cadence change or restart requires a
+     * newly observed window; today's slower interval cannot excuse yesterday's
+     * missing samples. The anchor preceding a window must pass this check too.
+     * Do not synchronize with shutdown(), which waits for evaluator jobs.
      */
-    public int getCollectorIntervalSeconds() {
+    public int getCollectorIntervalSeconds(Instant observationTime) {
+        Instant since = collectorCoverageSince;
         Scheduler current = scheduler;
-        if (current == null) return 0;
+        if (current == null || since == null || observationTime == null
+                || observationTime.isBefore(since)) return 0;
         try {
-            Trigger trigger = current.getTrigger(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP));
-            if (trigger instanceof SimpleTrigger interval) {
-                long millis = interval.getRepeatInterval();
-                if (millis > 0 && millis % 1000 == 0 && millis / 1000 <= Integer.MAX_VALUE) {
-                    return (int) (millis / 1000);
-                }
-            }
-        } catch (SchedulerException e) {
+            int interval = collectorIntervalSeconds(current);
+            // A concurrent reschedule must not pair its new interval with the old
+            // boundary. Identity detects even two changes back to the same value.
+            return since == collectorCoverageSince && current == scheduler ? interval : 0;
+        } catch (SchedulerException | RuntimeException e) {
             log.warn("Cannot establish Sentinel collector cadence; deferring activity coverage", e);
+            return 0;
+        }
+    }
+
+    private static int collectorIntervalSeconds(Scheduler current) throws SchedulerException {
+        Trigger trigger = current.getTrigger(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP));
+        if (trigger instanceof SimpleTrigger interval) {
+            long millis = interval.getRepeatInterval();
+            if (millis > 0 && millis % 1000 == 0 && millis / 1000 <= Integer.MAX_VALUE) {
+                return (int) (millis / 1000);
+            }
         }
         return 0;
     }
@@ -180,6 +196,7 @@ public final class SentinelScheduler {
             newScheduler.scheduleJob(pruneJob, cronTrigger(PRUNE_TRIGGER, pruneJob, PRUNE_CRON));
 
             newScheduler.start();
+            collectorCoverageSince = Instant.now();
             scheduler = newScheduler;
 
             log.info("Sentinel scheduler started (collector every {}s, evaluator every {}s, "
@@ -192,10 +209,11 @@ public final class SentinelScheduler {
     }
 
     /**
-     * Swaps the two interval triggers in place to pick up changed collector
+     * Updates interval triggers in place to pick up changed collector
      * and evaluator intervals. Called by the settings service after a
      * successful settings update; the cron jobs are untouched because their
-     * schedules are fixed by design, not operator-configurable.
+     * schedules are fixed by design, not operator-configurable. An unchanged
+     * collector interval preserves its trigger and trusted observation window.
      *
      * <p>{@code rescheduleJob} replaces the trigger atomically inside the
      * live scheduler — no job unregistration, no missed or doubled tick
@@ -213,10 +231,19 @@ public final class SentinelScheduler {
             return;
         }
         try {
-            scheduler.rescheduleJob(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP),
-                    intervalTrigger(COLLECTOR_TRIGGER,
-                            scheduler.getJobDetail(JobKey.jobKey(COLLECTOR_JOB, GROUP)),
-                            settings.getCollectorIntervalSeconds()));
+            if (collectorIntervalSeconds(scheduler) != settings.getCollectorIntervalSeconds()) {
+                collectorCoverageSince = null;
+                try {
+                    scheduler.rescheduleJob(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP),
+                            intervalTrigger(COLLECTOR_TRIGGER,
+                                    scheduler.getJobDetail(JobKey.jobKey(COLLECTOR_JOB, GROUP)),
+                                    settings.getCollectorIntervalSeconds()));
+                } finally {
+                    // Even a throwing call may have installed the replacement.
+                    // Readers still verify the actual trigger, and defer if unknown.
+                    collectorCoverageSince = Instant.now();
+                }
+            }
             scheduler.rescheduleJob(TriggerKey.triggerKey(EVALUATOR_TRIGGER, GROUP),
                     intervalTrigger(EVALUATOR_TRIGGER,
                             scheduler.getJobDetail(JobKey.jobKey(EVALUATOR_JOB, GROUP)),
@@ -251,6 +278,7 @@ public final class SentinelScheduler {
             log.warn("Failed to shut down the Sentinel scheduler cleanly", e);
         } finally {
             scheduler = null;
+            collectorCoverageSince = null;
         }
     }
 

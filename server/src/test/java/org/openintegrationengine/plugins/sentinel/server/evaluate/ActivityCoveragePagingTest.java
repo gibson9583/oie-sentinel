@@ -35,7 +35,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(config);
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(config.getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         calls.incrementAndGet();
@@ -61,7 +61,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(settings(30));
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         int page = calls.incrementAndGet();
@@ -93,7 +93,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(settings(30));
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         calls.incrementAndGet();
@@ -121,7 +121,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(settings(30));
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenReturn(full, List.of());
             assertTrue(ActivityCoverage.covers(CHANNEL, start, END));
@@ -139,7 +139,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(settings(10));
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(10).getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings(10).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         int limit = call.getArgument(4);
@@ -162,7 +162,7 @@ class ActivityCoveragePagingTest {
             settings.when(SettingsService::get).thenReturn(settings(10));
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(10).getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(settings(10).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenReturn(cadence(start, END, 600, PAGE_SIZE));
             assertFalse(ActivityCoverage.covers(CHANNEL, start, END));

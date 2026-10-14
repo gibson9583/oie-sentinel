@@ -9,8 +9,9 @@ import org.openintegrationengine.plugins.sentinel.server.service.SettingsService
 
 /**
  * Requires persisted observations across the entire range before inferring absence.
- * Cadence uses the applied collector trigger; historical interval changes are not
- * persisted. A shortened interval can conservatively defer an older slow window.
+ * Cadence uses the applied collector trigger only for observations made after its
+ * installation. Restart or cadence changes conservatively defer older windows
+ * until the entire range, including its anchor, belongs to the new schedule.
  */
 final class ActivityCoverage {
     // The supported 90-day retention at the minimum 10-second cadence needs
@@ -21,7 +22,7 @@ final class ActivityCoverage {
 
     static boolean covers(String channelId, Instant start, Instant end) {
         var settings = SettingsService.get();
-        int interval = SentinelScheduler.getInstance().getCollectorIntervalSeconds();
+        int interval = SentinelScheduler.getInstance().getCollectorIntervalSeconds(start);
         if (interval <= 0 || !start.isBefore(end)
                 || start.isBefore(end.minusSeconds(settings.getSampleRetentionDays() * 86400L))) {
             return false;
@@ -39,7 +40,10 @@ final class ActivityCoverage {
             for (Instant time : times) {
                 if (time == null || time.isBefore(queryStart) || time.isAfter(end)) return false;
                 if (previous == null) {
-                    if (time.isAfter(start)) return false;
+                    if (time.isAfter(start)
+                            || SentinelScheduler.getInstance().getCollectorIntervalSeconds(time) != interval) {
+                        return false;
+                    }
                 } else if (!time.isAfter(previous) || time.isAfter(previous.plusSeconds(tolerance))) {
                     return false;
                 }

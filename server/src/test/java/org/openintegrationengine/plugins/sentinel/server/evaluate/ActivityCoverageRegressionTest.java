@@ -42,7 +42,7 @@ class ActivityCoverageRegressionTest {
             settings.when(SettingsService::get).thenReturn(config);
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(scenario.equals("cadence-unavailable") ? 0 : interval);
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(scenario.equals("cadence-unavailable") ? 0 : interval);
             activity.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                     .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
@@ -69,7 +69,7 @@ class ActivityCoverageRegressionTest {
             settings.when(SettingsService::get).thenReturn(config);
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(config.getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
                     .thenAnswer(call -> List.of(anchor.getSampleTime()));
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(120), END));
@@ -86,7 +86,7 @@ class ActivityCoverageRegressionTest {
             settings.when(SettingsService::get).thenReturn(config);
             SentinelScheduler runtime = mock(SentinelScheduler.class);
             scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
+            when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(config.getCollectorIntervalSeconds());
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(90 * 86400L + 1), END));
             activity.verifyNoInteractions();
         }

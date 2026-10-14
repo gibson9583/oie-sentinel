@@ -89,10 +89,10 @@ class MissingCoverageAnomalyPersistenceTest {
         config.when(SqlConfig::getInstance).thenReturn(engine);
         settings = mockStatic(SettingsService.class);
         settings.when(SettingsService::get).thenReturn(new SentinelSettings());
-        scheduler = mockStatic(SentinelScheduler.class);
+        scheduler = mockStatic(SentinelScheduler.class, CALLS_REAL_METHODS);
         runtime = mock(SentinelScheduler.class);
         scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
-        when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
+        when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(30);
         baseline = mockStatic(BaselineResolver.class);
         baseline.when(() -> BaselineResolver.resolve(eq(CHANNEL), any(), anyString(), anyInt(), anyBoolean()))
                 .thenReturn(new BaselineResolver.Baseline(100, 10, 30, 1));
@@ -215,7 +215,7 @@ class MissingCoverageAnomalyPersistenceTest {
     @ValueSource(strings = {"null", "throw", "blank", "invalid", "out-of-range", "persisted-slow"})
     void settingsFailureCannotLoosenAppliedCadenceOrResolveIncident(String scenario) {
         writeSamples("complete", 0); // Every 30 seconds is incomplete for the applied 10-second collector.
-        when(runtime.getCollectorIntervalSeconds()).thenReturn(10);
+        when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(10);
         settings.close();
         settings = null;
         try (var controllers = mockStatic(ConfigurationController.class)) {
@@ -273,7 +273,7 @@ class MissingCoverageAnomalyPersistenceTest {
     @org.junit.jupiter.api.Test
     void unavailableAppliedCadenceDefersUntilItCanBeReadAgain() {
         writeSamples("complete", 0);
-        when(runtime.getCollectorIntervalSeconds()).thenReturn(0);
+        when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(0);
         for (int retry = 0; retry < 2; retry++) {
             EvaluationOutcome outcome = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
             assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult());
@@ -281,7 +281,7 @@ class MissingCoverageAnomalyPersistenceTest {
             assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
             assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
         }
-        when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
+        when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(30);
         EvaluationOutcome recovered = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
         assertEquals(EvaluationOutcome.Result.OK, recovered.getResult());
         TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, recovered, NOW, LeaseFence.unmanaged());
@@ -363,6 +363,188 @@ class MissingCoverageAnomalyPersistenceTest {
                 : type.equals("ANOMALY") ? EvaluationOutcome.Result.BREACH : EvaluationOutcome.Result.OK;
         assertEquals(expected, retry.getResult(), "A retry must observe the newly committed sample set");
         assertFalse(sessions.isManagedSessionStarted());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ANOMALY,30,600", "INACTIVITY,30,600", "LOW_VOLUME,30,600",
+            "ANOMALY,600,30", "INACTIVITY,600,30", "LOW_VOLUME,600,30"})
+    void cadenceChangesNeverResolveFromUnchangedIncompleteHistoryButNewWindowsRecover(
+            String type, int previousInterval, int newInterval) throws Exception {
+        monitor.setMonitorType(MonitorType.valueOf(type));
+        monitor.setConfigJson("{\"direction\":\"HIGH_ONLY\",\"minCount\":10}");
+        writeCadenceSamples(HOUR, previousInterval, true, 0);
+        try (var actual = new CollectorCadenceTestRuntime()) {
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(actual.runtime);
+            actual.start(previousInterval, HOUR.minusSeconds(7200));
+            Instant evaluationTime = type.equals("ANOMALY") ? NOW : HOUR.plusSeconds(3600);
+            EvaluationOutcome before = evaluate(evaluationTime);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, before.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, before, evaluationTime, LeaseFence.unmanaged());
+            actual.reschedule(newInterval, NOW);
+            for (int retry = 0; retry < 2; retry++) {
+                EvaluationOutcome after = evaluate(evaluationTime);
+                TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, after, evaluationTime, LeaseFence.unmanaged());
+                AlertEvent persisted = AlertEventRepository.getAlertEvent(incident.getId());
+                System.out.println("Cadence " + previousInterval + " -> " + newInterval + ", unchanged "
+                        + type + " history: " + before.getResult() + " -> " + after.getResult()
+                        + "; incident=" + persisted.getStatus() + "; resolutionPending=" + persisted.isResolutionPending());
+                assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, after.getResult());
+                assertEquals(AlertStatus.PROBLEM, persisted.getStatus());
+                assertFalse(persisted.isResolutionPending());
+                assertEquals(incident.getId(), state().getOpenAlertEventId());
+            }
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), never());
+            Instant fresh = HOUR.plusSeconds(7200);
+            writeCadenceSamples(fresh, newInterval, false, newInterval == 30 ? 1 : 3);
+            Instant recoveredAt = fresh.plusSeconds(type.equals("ANOMALY") ? 3900 : 3600);
+            for (int retry = 0; retry < 2; retry++) {
+                EvaluationOutcome after = evaluate(recoveredAt);
+                assertEquals(EvaluationOutcome.Result.OK, after.getResult(), "Fully measured new cadence must recover");
+                TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, after, recoveredAt, LeaseFence.unmanaged());
+            }
+            AlertEvent recovered = AlertEventRepository.getAlertEvent(incident.getId());
+            assertEquals(AlertStatus.RESOLVED, recovered.getStatus());
+            assertTrue(recovered.isResolutionPending());
+            assertEquals(recoveredAt, recovered.getResolvedTime());
+            assertNull(state().getOpenAlertEventId());
+            assertEquals(1, incidentCount());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ANOMALY", "INACTIVITY", "LOW_VOLUME"})
+    void failbackBeforeCollectorAndRestartPreserveIncidentUntilANewWindow(String type) throws Exception {
+        monitor.setMonitorType(MonitorType.valueOf(type));
+        monitor.setConfigJson("{\"direction\":\"HIGH_ONLY\",\"minCount\":10}");
+        writeCadenceSamples(HOUR, 600, false, 0);
+        CollectorState state = CollectorState.getInstance();
+        LeaseFence first = new LeaseFence("sentinel", "node-a", 1L);
+        LeaseFence returned = new LeaseFence("sentinel", "node-a", 3L);
+        try (var actual = new CollectorCadenceTestRuntime(); var leadership = mockStatic(SentinelLeadership.class, CALLS_REAL_METHODS)) {
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(actual.runtime);
+            actual.start(600, HOUR.minusSeconds(7200));
+            state.prepareCounterEpoch(first);
+            state.markChannelStarted(CHANNEL, HOUR.minusSeconds(3600));
+            leadership.when(SentinelLeadership::captureFence).thenReturn(first);
+            Instant evaluationTime = type.equals("ANOMALY") ? NOW : HOUR.plusSeconds(3600);
+            assertEquals(type.equals("ANOMALY") ? EvaluationOutcome.Result.OK : EvaluationOutcome.Result.BREACH,
+                    evaluate(evaluationTime).getResult(), "Established slow cadence must be usable before failover");
+            leadership.when(SentinelLeadership::captureFence).thenReturn(returned);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, evaluate(evaluationTime).getResult(),
+                    "Evaluator running before first returning-leader collector must reject prior stamps");
+            state.prepareCounterEpoch(returned);
+            state.markChannelStarted(CHANNEL, NOW);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, evaluate(evaluationTime).getResult());
+            actual.runtime.shutdown();
+            actual.start(600, NOW);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, evaluate(evaluationTime).getResult());
+            // Writes use the unmanaged fixture transaction; restore only the lease mock.
+            state.prepareCounterEpoch(LeaseFence.unmanaged());
+            leadership.when(SentinelLeadership::captureFence).thenReturn(LeaseFence.unmanaged());
+            state.markChannelStarted(CHANNEL, NOW);
+            EvaluationOutcome waiting = evaluate(evaluationTime);
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, waiting, evaluationTime, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
+            Instant fresh = HOUR.plusSeconds(7200);
+            writeCadenceSamples(fresh, 600, false, 3);
+            Instant recoveredAt = fresh.plusSeconds(type.equals("ANOMALY") ? 3900 : 3600);
+            EvaluationOutcome recovered = evaluate(recoveredAt);
+            assertEquals(EvaluationOutcome.Result.OK, recovered.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, recovered, recoveredAt, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        } finally {
+            state.prepareCounterEpoch(LeaseFence.unmanaged());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"exact-anchor", "pre-change-anchor", "window-before-change"})
+    void installationBoundaryIncludesTheCoverageAnchor(String scenario) throws Exception {
+        writeCadenceSamples(HOUR, 600, false, 0);
+        if (scenario.equals("pre-change-anchor")) {
+            ActivitySample anchor = new ActivitySample();
+            anchor.setChannelId(CHANNEL);
+            anchor.setSampleTime(HOUR.minusSeconds(1));
+            ActivityRepository.insertActivitySample(anchor);
+        }
+        try (var actual = new CollectorCadenceTestRuntime()) {
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(actual.runtime);
+            actual.start(600, scenario.equals("window-before-change") ? HOUR.plusNanos(1) : HOUR);
+            EvaluationOutcome result = evaluate(NOW);
+            boolean covered = scenario.equals("exact-anchor");
+            assertEquals(covered ? EvaluationOutcome.Result.OK : EvaluationOutcome.Result.INSUFFICIENT_DATA,
+                    result.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, result, NOW, LeaseFence.unmanaged());
+            AlertEvent stored = AlertEventRepository.getAlertEvent(incident.getId());
+            assertEquals(covered ? AlertStatus.RESOLVED : AlertStatus.PROBLEM, stored.getStatus());
+            assertEquals(covered, stored.isResolutionPending());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "throw"})
+    void propertyOutageCannotMakeAnAppliedSlowCadenceCoverEarlierGaps(String scenario) throws Exception {
+        writeCadenceSamples(HOUR, 30, true, 0);
+        settings.close();
+        settings = null;
+        try (var actual = new CollectorCadenceTestRuntime(); var controllers = mockStatic(ConfigurationController.class)) {
+            ConfigurationController controller = mock(ConfigurationController.class);
+            controllers.when(ConfigurationController::getInstance).thenReturn(controller);
+            if (scenario.equals("throw")) {
+                when(controller.getProperty(anyString(), anyString())).thenThrow(new IllegalStateException("property outage"));
+            }
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(actual.runtime);
+            actual.start(30, HOUR.minusSeconds(7200));
+            actual.reschedule(600, NOW);
+            EvaluationOutcome unknown = evaluate(NOW);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, unknown.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, unknown, NOW, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
+            Instant fresh = HOUR.plusSeconds(7200);
+            writeCadenceSamples(fresh, 600, false, 0);
+            EvaluationOutcome measured = evaluate(fresh.plusSeconds(3900));
+            assertEquals(EvaluationOutcome.Result.OK, measured.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, measured, fresh.plusSeconds(3900), LeaseFence.unmanaged());
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    void runtimeReadOutageDefersAValidSlowWindowAndRetryRecovers() throws Exception {
+        writeCadenceSamples(HOUR, 600, false, 0);
+        try (var actual = new CollectorCadenceTestRuntime()) {
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(actual.runtime);
+            actual.start(600, HOUR.minusSeconds(7200));
+            var collector = org.quartz.TriggerKey.triggerKey("activityCollectorTrigger", "sentinel");
+            when(actual.quartz.getTrigger(collector)).thenThrow(new org.quartz.SchedulerException("runtime outage"));
+            EvaluationOutcome unknown = evaluate(NOW);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, unknown.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, unknown, NOW, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
+            doAnswer(call -> actual.triggers.get(collector)).when(actual.quartz).getTrigger(collector);
+            EvaluationOutcome measured = evaluate(NOW);
+            assertEquals(EvaluationOutcome.Result.OK, measured.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, measured, NOW, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+        }
+    }
+
+    private void writeCadenceSamples(Instant hour, int interval, boolean gap, int received) {
+        for (int second = 0; second < 3600; second += interval) {
+            if (gap && second == 1800) continue;
+            ActivitySample sample = new ActivitySample();
+            sample.setChannelId(CHANNEL);
+            sample.setSampleTime(hour.plusSeconds(second));
+            sample.setReceivedDelta(received);
+            ActivityRepository.insertActivitySample(sample);
+        }
     }
 
     private EvaluationOutcome evaluate(Instant now) {

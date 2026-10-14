@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
+import org.apache.commons.dbcp2.DelegatingConnection;
 import org.apache.commons.dbcp2.PoolableConnection;
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
@@ -148,20 +149,17 @@ public final class ActivityRepository {
             failure.addSuppressed(rollback);
         }
         if (pooled != null) {
+            // Close the delegate, not the pool wrapper. DBCP marks this delegate
+            // closed even if the driver throws, so poolable.close invalidates
+            // the pool entry and releases its borrowed slot in either case.
+            DelegatingConnection<Connection> discarded = new DelegatingConnection<>(physical);
+            pooled.setDelegate(discarded);
             try {
-                // Leave the pool wrapper open: its normal close will invalidate
-                // the closed physical connection and release the pool slot.
-                physical.close();
+                discarded.close();
             } catch (SQLException | RuntimeException | Error close) {
-                // A driver can also reject close (e.g. an unfinished transaction).
-                // Mark that wrapper closed so it is quarantined, never reused.
-                try {
-                    pooled.reallyClose();
-                } catch (SQLException | RuntimeException | Error quarantine) {
-                    close.addSuppressed(quarantine);
-                }
-                throw close;
+                failure.addSuppressed(close);
             }
+            pooled.close();
         } else {
             // BridgeDataSourceFactory exposes the engine's actual Hikari source.
             ((HikariDataSource) sessions.getConfiguration().getEnvironment().getDataSource())

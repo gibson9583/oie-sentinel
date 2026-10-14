@@ -66,7 +66,7 @@ class InactivityEvaluatorTest {
         scheduler = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler.class);
         var runtime = Mockito.mock(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler.class);
         scheduler.when(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler::getInstance).thenReturn(runtime);
-        Mockito.when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
+        Mockito.when(runtime.getCollectorIntervalSeconds(org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(30);
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
         activityRepository.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                 .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
