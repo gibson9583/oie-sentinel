@@ -8,6 +8,7 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.util.function.Consumer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -166,6 +167,11 @@ public final class MonitorService {
      * @throws IllegalArgumentException if validation fails
      */
     public static Monitor create(Monitor monitor, int userId) {
+        return create(monitor, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Monitor create(Monitor monitor, int userId, Consumer<Runnable> afterCommit) {
         validate(monitor, null);
         Instant now = Instant.now();
         monitor.setId(null);
@@ -174,7 +180,7 @@ public final class MonitorService {
         monitor.setUpdatedBy(userId);
         monitor.setUpdatedTime(now);
         MonitorRepository.insertMonitor(monitor);
-        SentinelAuditLog.monitorCreated(userId, monitor);
+        afterCommit.accept(() -> SentinelAuditLog.monitorCreated(userId, monitor));
         return monitor;
     }
 
@@ -191,6 +197,11 @@ public final class MonitorService {
      * @throws IllegalArgumentException if validation fails
      */
     public static Monitor update(int id, Monitor monitor, int userId) {
+        return update(id, monitor, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Monitor update(int id, Monitor monitor, int userId, Consumer<Runnable> afterCommit) {
         Monitor existing = get(id);
         validate(monitor, id);
         monitor.setId(id);
@@ -199,7 +210,7 @@ public final class MonitorService {
         monitor.setUpdatedBy(userId);
         monitor.setUpdatedTime(Instant.now());
         MonitorRepository.updateMonitor(monitor);
-        SentinelAuditLog.monitorUpdated(userId, monitor);
+        afterCommit.accept(() -> SentinelAuditLog.monitorUpdated(userId, monitor));
         return monitor;
     }
 

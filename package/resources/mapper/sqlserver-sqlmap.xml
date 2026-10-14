@@ -31,6 +31,11 @@
 
     <!-- ========== MONITOR (table sentinel_monitor) ========== -->
 
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockMonitor" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_monitor WITH (UPDLOCK, HOLDLOCK) WHERE id = #{id}
+    </select>
+
     <select id="getMonitor" parameterType="map" resultType="map">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
                config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
@@ -529,6 +534,11 @@
     </delete>
 
     <!-- ========== ACTION (table sentinel_action) ========== -->
+
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockAction" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_action WITH (UPDLOCK, HOLDLOCK) WHERE id = #{id}
+    </select>
 
     <select id="getAction" parameterType="map" resultType="map">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,

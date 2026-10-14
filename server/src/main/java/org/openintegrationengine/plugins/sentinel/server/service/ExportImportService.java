@@ -17,6 +17,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.UnaryOperator;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -26,6 +27,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
+import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -316,15 +320,15 @@ public final class ExportImportService {
      *
      * <p>An explicit JSON {@code null} is written when there is no parent, so
      * the key is always present and its absence in a document is unambiguous
-     * (a hand-written entry that omits it simply has no parent). An id that
-     * resolves to no monitor — which the foreign key makes unreachable in
-     * practice — also writes {@code null}: the source server's serial would be
-     * meaningless on the target, and import reports a genuinely missing parent
-     * from the name side.</p>
+     * (a hand-written entry that omits it simply has no parent). If a parent
+     * is missing from the export snapshot, retain its source id as an unresolved
+     * diagnostic. Import rejects it rather than silently removing suppression.</p>
      */
     private static ObjectNode monitorNode(Monitor monitor, String parentName) {
         ObjectNode node = portable(monitor);
-        node.remove(FIELD_SUPPRESSED_BY_ID);
+        if (parentName != null || monitor.getSuppressedByMonitorId() == null) {
+            node.remove(FIELD_SUPPRESSED_BY_ID);
+        }
         node.set(KEY_SUPPRESSED_BY_NAME, parentName == null ? NullNode.getInstance() : TextNode.valueOf(parentName));
         return node;
     }
@@ -536,7 +540,8 @@ public final class ExportImportService {
         List<JsonNode> pending = new ArrayList<>();
         for (JsonNode node : nodes) {
             String name = textOrNull(node, "name");
-            String problem = index.unavailableReason(name);
+            String problem = monitorReferenceProblem(node);
+            if (problem == null) problem = index.unavailableReason(name);
             if (problem == null) {
                 pending.add(node);
             } else {
@@ -657,22 +662,41 @@ public final class ExportImportService {
             return entry.skipped("Suppressing monitor '" + parentName + "' could not be resolved on this server");
         }
         Monitor existing = index.byName(name);
-        if (existing != null && sameDefinition(monitorNode(incoming, parent == null ? null : parent.getName()),
-                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())))) {
-            return entry.skipped(REASON_UNCHANGED);
-        }
         incoming.setSuppressedByMonitorId(parent == null ? null : parent.getId());
-
+        boolean unchanged = existing != null && sameDefinition(
+                monitorNode(incoming, parent == null ? null : parent.getName()),
+                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())));
+        Map<Integer, Monitor> references = new TreeMap<>();
+        collectMonitorChain(parent, index, references);
+        if (existing != null) references.put(existing.getId(), existing);
+        Monitor[] saved = new Monitor[1];
         try {
-            if (existing == null) {
-                index.put(MonitorService.create(incoming, userId));
-                return entry.created();
-            }
-            index.put(MonitorService.update(existing.getId(), incoming, userId));
-            return entry.updated();
+            AlertLifecycleTransaction.execute(afterCommit -> {
+                lockAndValidateReferences(references, referenceIds(existing == null ? null : existing.getId(),
+                        parent == null ? null : parent.getId()), Map.of(), Set.of());
+                if (!unchanged) {
+                    saved[0] = existing == null
+                            ? MonitorService.create(incoming, userId, afterCommit::add)
+                            : MonitorService.update(existing.getId(), incoming, userId, afterCommit::add);
+                }
+            });
+            if (saved[0] != null) index.put(saved[0]);
+            return unchanged ? entry.skipped(REASON_UNCHANGED) : existing == null ? entry.created() : entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
         }
+    }
+
+    private static String monitorReferenceProblem(JsonNode node) {
+        if (node != null && node.hasNonNull(FIELD_SUPPRESSED_BY_ID)) {
+            return "Source suppressedByMonitorId cannot be resolved safely; replace it with"
+                    + " suppressedByMonitorName before importing";
+        }
+        JsonNode parent = node == null ? null : node.get(KEY_SUPPRESSED_BY_NAME);
+        if (parent != null && !parent.isNull() && (!parent.isTextual() || parent.asText().isBlank())) {
+            return "suppressedByMonitorName must be a non-blank monitor name or null";
+        }
+        return null;
     }
 
     // ========== Import: actions ==========
@@ -832,6 +856,8 @@ public final class ExportImportService {
         incoming.setEscalateToActionId(target == null ? null : target.getId());
         List<String> ambiguousMonitors = new ArrayList<>();
         List<String> unresolved = new ArrayList<>();
+        Map<Integer, Monitor> monitorReferences = new TreeMap<>();
+        Set<Integer> namedMonitors = new LinkedHashSet<>();
         String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), value -> {
             String problem = monitors.unavailableReferenceReason(value);
             if (problem != null) {
@@ -843,6 +869,8 @@ public final class ExportImportService {
                 unresolved.add(value);
                 return null;
             }
+            namedMonitors.add(id);
+            collectMonitorChain(monitors.byId(id), monitors, monitorReferences);
             return String.valueOf(id);
         });
         // Both sides now refer to destination ids. The runtime compares
@@ -878,11 +906,7 @@ public final class ExportImportService {
                     + String.join(", ", unresolved)
                     + "; the condition was not widened, so this action was left untouched");
         }
-        if (unchanged) {
-            return entry.skipped(REASON_UNCHANGED);
-        }
-
-        if (!secrets.required.isEmpty()) {
+        if (!unchanged && !secrets.required.isEmpty()) {
             // Dropping an unavailable body template can replace a carefully
             // limited payload with the full alert; dropping an auth header can
             // send it unauthenticated. Preserve the whole action until every
@@ -895,15 +919,74 @@ public final class ExportImportService {
         incoming.setConditionJson(resolvedCondition);
         incoming.setConfigJson(secrets.configJson);
 
+        Map<Integer, Action> actionReferences = new TreeMap<>();
+        for (Action next = target; next != null && !actionReferences.containsKey(next.getId());
+                next = actions.byId(next.getEscalateToActionId())) {
+            actionReferences.put(next.getId(), next);
+        }
+        if (existing != null) actionReferences.put(existing.getId(), existing);
+        Action[] saved = new Action[1];
         try {
-            if (existing == null) {
-                actions.put(ActionService.create(incoming, userId));
-                return entry.created();
-            }
-            actions.put(ActionService.update(existing.getId(), incoming, userId));
-            return entry.updated();
+            AlertLifecycleTransaction.execute(afterCommit -> {
+                lockAndValidateReferences(monitorReferences, namedMonitors, actionReferences,
+                        referenceIds(existing == null ? null : existing.getId(), target == null ? null : target.getId()));
+                if (!unchanged) {
+                    saved[0] = existing == null
+                            ? ActionService.create(incoming, userId, afterCommit::add)
+                            : ActionService.update(existing.getId(), incoming, userId, afterCommit::add);
+                }
+            });
+            if (saved[0] != null) actions.put(saved[0]);
+            return unchanged ? entry.skipped(REASON_UNCHANGED) : existing == null ? entry.created() : entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        }
+    }
+
+    private static void collectMonitorChain(Monitor monitor, MonitorIndex index, Map<Integer, Monitor> references) {
+        while (monitor != null && !references.containsKey(monitor.getId())) {
+            references.put(monitor.getId(), monitor);
+            monitor = index.byId(monitor.getSuppressedByMonitorId());
+        }
+    }
+
+    private static Set<Integer> referenceIds(Integer... ids) {
+        Set<Integer> present = new LinkedHashSet<>();
+        for (Integer id : ids) if (id != null) present.add(id);
+        return present;
+    }
+
+    /**
+     * Lock in one order, then recheck the snapshot used for prerequisite ordering
+     * and name resolution. Holding every referenced row prevents rename/delete or
+     * chain rewrites between this check and the entry's write (including unchanged
+     * entries that unlock later dependents). A changed snapshot needs a fresh retry.
+     */
+    private static void lockAndValidateReferences(Map<Integer, Monitor> monitors, Set<Integer> namedMonitors,
+            Map<Integer, Action> actions, Set<Integer> namedActions) {
+        monitors.keySet().forEach(MonitorRepository::lockMonitor);
+        actions.keySet().forEach(ActionRepository::lockAction);
+        if (!monitors.isEmpty()) {
+            MonitorIndex current = MonitorIndex.of(MonitorService.list());
+            for (Monitor expected : monitors.values()) {
+                Monitor actual = current.byId(expected.getId());
+                if (actual == null || !portable(expected).equals(portable(actual))
+                        || (namedMonitors.contains(expected.getId()) && current.byName(expected.getName()) != actual)) {
+                    throw new IllegalArgumentException("Monitor '" + expected.getName()
+                            + "' changed during import; retry with the current configuration");
+                }
+            }
+        }
+        if (!actions.isEmpty()) {
+            ActionIndex current = ActionIndex.of(ActionService.list());
+            for (Action expected : actions.values()) {
+                Action actual = current.byId(expected.getId());
+                if (actual == null || !portable(expected).equals(portable(actual))
+                        || (namedActions.contains(expected.getId()) && current.byName(expected.getName()) != actual)) {
+                    throw new IllegalArgumentException("Action '" + expected.getName()
+                            + "' changed during import; retry with the current configuration");
+                }
+            }
         }
     }
 
