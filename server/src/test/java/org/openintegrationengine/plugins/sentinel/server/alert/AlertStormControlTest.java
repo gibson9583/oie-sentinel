@@ -14,6 +14,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -267,6 +268,52 @@ class AlertStormControlTest {
             AlertStormControl.releaseReservation(blocked);
 
             assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(action).outcome());
+        }
+
+        @Test
+        void failedSummaryLookupDoesNotReserveAnUndeliveredRollup() {
+            AtomicInteger reads = new AtomicInteger();
+            alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
+                    .thenAnswer(call -> {
+                        if (reads.incrementAndGet() == 2) {
+                            throw new IllegalStateException("transient subject lookup failure");
+                        }
+                        return recentEvents;
+                    });
+            Action action = ceilingAction(0, 600);
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome(),
+                    "summary failures still fail open");
+            AlertStormControl.CeilingVerdict recovered =
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(100));
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, recovered.outcome(),
+                    "retry must not wait for the two-second snapshot expiry");
+            assertEquals(AlertStormControl.CeilingOutcome.SILENT,
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(200)).outcome(),
+                    "the successful retry still owns the one-rollup reservation");
+            AlertStormControl.releaseReservation(recovered);
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP,
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(300)).outcome(),
+                    "a final policy rejection can release the recovered reservation normally");
+        }
+
+        @Test
+        void repeatedSummaryFailuresLeaveOtherActionsAndFutureRollupsAvailable() {
+            AtomicInteger reads = new AtomicInteger();
+            alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
+                    .thenAnswer(call -> {
+                        int read = reads.incrementAndGet();
+                        if (read == 2 || read == 3) throw new AssertionError("failed subject lookup");
+                        return recentEvents;
+                    });
+            Action action = ceilingAction(0, 600);
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome());
+            Action other = ceilingAction(0, 600);
+            other.setId(11);
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(other).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(action).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.SILENT, verdict(other).outcome(),
+                    "releasing one action's failed claim must not release another action's claim");
         }
 
         @Test
