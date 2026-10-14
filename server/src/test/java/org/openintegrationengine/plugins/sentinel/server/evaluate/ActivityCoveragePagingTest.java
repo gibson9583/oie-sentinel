@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 class ActivityCoveragePagingTest {
@@ -30,8 +31,11 @@ class ActivityCoveragePagingTest {
         Instant start = END.minusSeconds(days * 86400L);
         SentinelSettings config = settings(currentInterval);
         AtomicInteger calls = new AtomicInteger();
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(config);
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         calls.incrementAndGet();
@@ -53,8 +57,11 @@ class ActivityCoveragePagingTest {
     void checksAnchorCrossPageAdjacencyAndTail(String scenario) {
         Instant start = END.minusSeconds(2L * PAGE_SIZE * 30);
         AtomicInteger calls = new AtomicInteger();
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(settings(30));
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         int page = calls.incrementAndGet();
@@ -82,8 +89,11 @@ class ActivityCoveragePagingTest {
         Instant start = END.minusSeconds(PAGE_SIZE * 30L);
         List<Instant> first = cadence(start, END, 30, PAGE_SIZE);
         AtomicInteger calls = new AtomicInteger();
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(settings(30));
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         calls.incrementAndGet();
@@ -107,8 +117,11 @@ class ActivityCoveragePagingTest {
     void fullPageNeedsExhaustionUnlessItReachedExactRangeEnd() {
         Instant start = END.minusSeconds(PAGE_SIZE * 30L);
         List<Instant> full = cadence(start, END.minusSeconds(30), 30, PAGE_SIZE);
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(settings(30));
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(30).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenReturn(full, List.of());
             assertTrue(ActivityCoverage.covers(CHANNEL, start, END));
@@ -122,8 +135,11 @@ class ActivityCoveragePagingTest {
         Instant start = END.minusSeconds(90 * 86400L);
         AtomicInteger observed = new AtomicInteger();
         AtomicInteger queries = new AtomicInteger();
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(settings(10));
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(10).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenAnswer(call -> {
                         int limit = call.getArgument(4);
@@ -142,8 +158,11 @@ class ActivityCoveragePagingTest {
     @Test
     void shortenedCurrentCadenceStillRejectsHistoricalSlowGaps() {
         Instant start = END.minusSeconds(3600);
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(settings(10));
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings(10).getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), eq(END),
                     nullable(Instant.class), anyInt())).thenReturn(cadence(start, END, 600, PAGE_SIZE));
             assertFalse(ActivityCoverage.covers(CHANNEL, start, END));

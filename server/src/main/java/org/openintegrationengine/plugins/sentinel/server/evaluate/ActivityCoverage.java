@@ -4,11 +4,12 @@ package org.openintegrationengine.plugins.sentinel.server.evaluate;
 import java.time.Instant;
 import java.util.List;
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 
 /**
  * Requires persisted observations across the entire range before inferring absence.
- * Cadence uses current collector settings; historical interval changes are not
+ * Cadence uses the applied collector trigger; historical interval changes are not
  * persisted. A shortened interval can conservatively defer an older slow window.
  */
 final class ActivityCoverage {
@@ -20,7 +21,7 @@ final class ActivityCoverage {
 
     static boolean covers(String channelId, Instant start, Instant end) {
         var settings = SettingsService.get();
-        int interval = settings.getCollectorIntervalSeconds();
+        int interval = SentinelScheduler.getInstance().getCollectorIntervalSeconds();
         if (interval <= 0 || !start.isBefore(end)
                 || start.isBefore(end.minusSeconds(settings.getSampleRetentionDays() * 86400L))) {
             return false;

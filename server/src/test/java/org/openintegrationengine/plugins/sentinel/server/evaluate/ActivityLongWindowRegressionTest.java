@@ -12,6 +12,7 @@ import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorService;
 import org.openintegrationengine.plugins.sentinel.shared.model.*;
 
@@ -38,9 +39,12 @@ class ActivityLongWindowRegressionTest {
         var validateConfig = MonitorService.class.getDeclaredMethod("validateConfig", Monitor.class);
         validateConfig.setAccessible(true);
         assertDoesNotThrow(() -> validateConfig.invoke(null, monitor), "The actual save validator accepts this duration");
-        try (var config = mockStatic(SettingsService.class); var repo = mockStatic(ActivityRepository.class);
+        try (var scheduler = mockStatic(SentinelScheduler.class); var config = mockStatic(SettingsService.class); var repo = mockStatic(ActivityRepository.class);
                 var states = mockStatic(TriggerStateRepository.class)) {
             config.when(SettingsService::get).thenReturn(settings);
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(settings.getCollectorIntervalSeconds());
             repo.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                     .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             repo.when(() -> ActivityRepository.sumActivitySamplesForRange(eq(channel), any(), any()))

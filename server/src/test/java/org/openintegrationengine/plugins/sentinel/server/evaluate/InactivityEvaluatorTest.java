@@ -54,6 +54,7 @@ class InactivityEvaluatorTest {
     private static final int COLLECTOR_SLACK_SECONDS = 45;
 
     private MockedStatic<org.openintegrationengine.plugins.sentinel.server.service.SettingsService> settings;
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler> scheduler;
     private MockedStatic<ActivityRepository> activityRepository;
     private MockedStatic<TriggerStateRepository> triggerStateRepository;
 
@@ -62,6 +63,10 @@ class InactivityEvaluatorTest {
         settings = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.service.SettingsService.class);
         settings.when(org.openintegrationengine.plugins.sentinel.server.service.SettingsService::get)
                 .thenReturn(new org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings());
+        scheduler = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler.class);
+        var runtime = Mockito.mock(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler.class);
+        scheduler.when(org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler::getInstance).thenReturn(runtime);
+        Mockito.when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
         activityRepository.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                 .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
@@ -75,6 +80,7 @@ class InactivityEvaluatorTest {
         triggerStateRepository.close();
         activityRepository.close();
         settings.close();
+        scheduler.close();
     }
 
     // ---------------------------------------------------------------- helpers

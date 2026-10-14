@@ -56,6 +56,8 @@ class MissingCoverageAnomalyPersistenceTest {
     private AlertEvent incident;
     private MockedStatic<SqlConfig> config;
     private MockedStatic<SettingsService> settings;
+    private MockedStatic<SentinelScheduler> scheduler;
+    private SentinelScheduler runtime;
     private MockedStatic<BaselineResolver> baseline;
     private MockedStatic<ActionDispatcher> dispatch;
     private MockedStatic<AlertPayload> payload;
@@ -87,6 +89,10 @@ class MissingCoverageAnomalyPersistenceTest {
         config.when(SqlConfig::getInstance).thenReturn(engine);
         settings = mockStatic(SettingsService.class);
         settings.when(SettingsService::get).thenReturn(new SentinelSettings());
+        scheduler = mockStatic(SentinelScheduler.class);
+        runtime = mock(SentinelScheduler.class);
+        scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+        when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
         baseline = mockStatic(BaselineResolver.class);
         baseline.when(() -> BaselineResolver.resolve(eq(CHANNEL), any(), anyString(), anyInt(), anyBoolean()))
                 .thenReturn(new BaselineResolver.Baseline(100, 10, 30, 1));
@@ -137,6 +143,7 @@ class MissingCoverageAnomalyPersistenceTest {
                 if (dispatch != null) dispatch.close();
                 if (baseline != null) baseline.close();
                 if (settings != null) settings.close();
+                if (scheduler != null) scheduler.close();
                 if (config != null) config.close();
                 if (sessions != null && sessions.isManagedSessionStarted()) sessions.close();
             } finally {
@@ -202,6 +209,84 @@ class MissingCoverageAnomalyPersistenceTest {
                 argThat(event -> incident.getId().equals(event.getId())), any()), times(1));
         dispatch.verify(() -> ActionDispatcher.onAlertOpened(any(), any()), never());
         assertEquals(1, incidentCount());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "throw", "blank", "invalid", "out-of-range", "persisted-slow"})
+    void settingsFailureCannotLoosenAppliedCadenceOrResolveIncident(String scenario) {
+        writeSamples("complete", 0); // Every 30 seconds is incomplete for the applied 10-second collector.
+        when(runtime.getCollectorIntervalSeconds()).thenReturn(10);
+        settings.close();
+        settings = null;
+        try (var controllers = mockStatic(ConfigurationController.class)) {
+            ConfigurationController controller = mock(ConfigurationController.class);
+            controllers.when(ConfigurationController::getInstance).thenReturn(controller);
+            var property = when(controller.getProperty(anyString(), eq("collector.interval.seconds")));
+            switch (scenario) {
+                case "throw" -> property.thenThrow(new IllegalStateException("injected settings outage"));
+                case "blank" -> property.thenReturn(" ");
+                case "invalid" -> property.thenReturn("broken");
+                case "out-of-range" -> property.thenReturn("1");
+                case "persisted-slow" -> property.thenReturn("600");
+                default -> property.thenReturn(null);
+            }
+            for (int retry = 0; retry < 2; retry++) {
+                EvaluationOutcome outcome = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
+                assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult());
+                TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, outcome, NOW, LeaseFence.unmanaged());
+                assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+                assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
+                assertEquals(incident.getId(), state().getOpenAlertEventId());
+            }
+            baseline.verifyNoInteractions();
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), never());
+            assertEquals(1, incidentCount());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"default-install", "persisted-fast"})
+    void appliedDefaultCadenceCanStillRecoverWhenPropertiesAreMissingOrStale(String scenario) {
+        writeSamples("complete", 0);
+        settings.close();
+        settings = null;
+        try (var controllers = mockStatic(ConfigurationController.class)) {
+            ConfigurationController controller = mock(ConfigurationController.class);
+            controllers.when(ConfigurationController::getInstance).thenReturn(controller);
+            if (scenario.equals("persisted-fast")) {
+                when(controller.getProperty(anyString(), eq("collector.interval.seconds"))).thenReturn("10");
+            }
+            for (int retry = 0; retry < 2; retry++) {
+                EvaluationOutcome outcome = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
+                assertEquals(EvaluationOutcome.Result.OK, outcome.getResult());
+                TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, outcome, NOW, LeaseFence.unmanaged());
+            }
+            AlertEvent stored = AlertEventRepository.getAlertEvent(incident.getId());
+            assertEquals(AlertStatus.RESOLVED, stored.getStatus());
+            assertTrue(stored.isResolutionPending());
+            assertNull(state().getOpenAlertEventId());
+            dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
+            assertEquals(1, incidentCount());
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    void unavailableAppliedCadenceDefersUntilItCanBeReadAgain() {
+        writeSamples("complete", 0);
+        when(runtime.getCollectorIntervalSeconds()).thenReturn(0);
+        for (int retry = 0; retry < 2; retry++) {
+            EvaluationOutcome outcome = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
+            assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult());
+            TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, outcome, NOW, LeaseFence.unmanaged());
+            assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+            assertFalse(AlertEventRepository.getAlertEvent(incident.getId()).isResolutionPending());
+        }
+        when(runtime.getCollectorIntervalSeconds()).thenReturn(30);
+        EvaluationOutcome recovered = AnomalyEvaluator.evaluate(monitor, CHANNEL, NOW);
+        assertEquals(EvaluationOutcome.Result.OK, recovered.getResult());
+        TriggerEvaluatorJob.applyOutcome(monitor, CHANNEL, null, recovered, NOW, LeaseFence.unmanaged());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(incident.getId()).getStatus());
+        dispatch.verify(() -> ActionDispatcher.onAlertResolved(any(), any()), times(1));
     }
 
     @ParameterizedTest

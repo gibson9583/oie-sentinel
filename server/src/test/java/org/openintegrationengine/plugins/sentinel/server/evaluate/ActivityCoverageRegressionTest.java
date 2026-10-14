@@ -11,6 +11,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
 import org.openintegrationengine.plugins.sentinel.shared.model.*;
 
 class ActivityCoverageRegressionTest {
@@ -19,7 +20,7 @@ class ActivityCoverageRegressionTest {
     private static final Instant START = END.minusSeconds(3600);
 
     @ParameterizedTest
-    @ValueSource(strings = {"complete", "empty", "stale", "gap", "partial", "startup", "retention", "slow-complete", "slow-gap"})
+    @ValueSource(strings = {"complete", "empty", "stale", "gap", "partial", "startup", "retention", "slow-complete", "slow-gap", "cadence-unavailable"})
     void absenceRequiresDurableCoverageAcrossEntireWindow(String scenario) {
         int interval = scenario.startsWith("slow") ? 600 : 30;
         SentinelSettings config = new SentinelSettings(); config.setCollectorIntervalSeconds(interval);
@@ -35,10 +36,13 @@ class ActivityCoverageRegressionTest {
         CollectorState.getInstance().forgetChannel(CHANNEL);
         CollectorState.getInstance().markChannelStarted(CHANNEL,
                 scenario.equals("startup") ? START.plusSeconds(60) : START.minusSeconds(60));
-        try (var settings = mockStatic(SettingsService.class);
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class);
                 var activity = mockStatic(ActivityRepository.class);
                 var baseline = mockStatic(BaselineResolver.class)) {
             settings.when(SettingsService::get).thenReturn(config);
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(scenario.equals("cadence-unavailable") ? 0 : interval);
             activity.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
                     .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
@@ -61,8 +65,11 @@ class ActivityCoverageRegressionTest {
     void slowCollectorAnchorAloneCannotProveAShortWindow() {
         SentinelSettings config = new SentinelSettings(); config.setCollectorIntervalSeconds(600);
         ActivitySample anchor = new ActivitySample(); anchor.setSampleTime(END.minusSeconds(620));
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(config);
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
                     .thenAnswer(call -> List.of(anchor.getSampleTime()));
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(120), END));
@@ -75,8 +82,11 @@ class ActivityCoverageRegressionTest {
     @org.junit.jupiter.api.Test
     void rangesBeyondRetentionDoNotQueryRawHistory() {
         SentinelSettings config = new SentinelSettings(); config.setSampleRetentionDays(90);
-        try (var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
+        try (var scheduler = mockStatic(SentinelScheduler.class); var settings = mockStatic(SettingsService.class); var activity = mockStatic(ActivityRepository.class)) {
             settings.when(SettingsService::get).thenReturn(config);
+            SentinelScheduler runtime = mock(SentinelScheduler.class);
+            scheduler.when(SentinelScheduler::getInstance).thenReturn(runtime);
+            when(runtime.getCollectorIntervalSeconds()).thenReturn(config.getCollectorIntervalSeconds());
             assertFalse(ActivityCoverage.covers(CHANNEL, END.minusSeconds(90 * 86400L + 1), END));
             activity.verifyNoInteractions();
         }

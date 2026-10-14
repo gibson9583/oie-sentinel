@@ -15,6 +15,7 @@ import org.quartz.JobKey;
 import org.quartz.Scheduler;
 import org.quartz.SchedulerException;
 import org.quartz.SimpleScheduleBuilder;
+import org.quartz.SimpleTrigger;
 import org.quartz.Trigger;
 import org.quartz.TriggerBuilder;
 import org.quartz.TriggerKey;
@@ -100,7 +101,7 @@ public final class SentinelScheduler {
     private static final String PRUNE_CRON = "0 30 3 * * ?";
 
     /** The live scheduler; null whenever the plugin is stopped. */
-    private Scheduler scheduler;
+    private volatile Scheduler scheduler;
 
     private SentinelScheduler() {
     }
@@ -108,6 +109,29 @@ public final class SentinelScheduler {
     /** Returns the single shared instance (see class Javadoc for why this is a stateful singleton). */
     public static SentinelScheduler getInstance() {
         return INSTANCE;
+    }
+
+    /**
+     * Returns the applied collector cadence, or zero when it cannot be established.
+     * Property reads may silently fail or disagree with a partially applied settings
+     * update, so coverage must use the actual trigger. Do not synchronize with
+     * shutdown(): it waits for evaluator jobs that call this method to finish.
+     */
+    public int getCollectorIntervalSeconds() {
+        Scheduler current = scheduler;
+        if (current == null) return 0;
+        try {
+            Trigger trigger = current.getTrigger(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP));
+            if (trigger instanceof SimpleTrigger interval) {
+                long millis = interval.getRepeatInterval();
+                if (millis > 0 && millis % 1000 == 0 && millis / 1000 <= Integer.MAX_VALUE) {
+                    return (int) (millis / 1000);
+                }
+            }
+        } catch (SchedulerException e) {
+            log.warn("Cannot establish Sentinel collector cadence; deferring activity coverage", e);
+        }
+        return 0;
     }
 
     /**
