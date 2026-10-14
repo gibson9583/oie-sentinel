@@ -78,6 +78,10 @@ class ActionDispatcherQueueDurabilityTest {
         ActionDispatcher.startDispatchExecutor();
 
         actions = Mockito.mockStatic(ActionRepository.class);
+        actions.when(() -> ActionRepository.getAction(Mockito.anyInt())).thenAnswer(call ->
+                ActionRepository.listActions(Boolean.TRUE).stream()
+                        .filter(candidate -> candidate.getId().equals(call.getArgument(0)))
+                        .findFirst().orElse(null));
         dispatches = Mockito.mockStatic(ActionDispatchLogRepository.class);
         persistedRows = new ArrayList<>();
         dispatches.when(() -> ActionDispatchLogRepository
@@ -401,8 +405,11 @@ class ActionDispatcherQueueDurabilityTest {
     private static Thread blockedDecision(String phase, CountDownLatch entered,
             CountDownLatch release, AtomicReference<Throwable> failure) {
         return new Thread(() -> {
-            try (MockedStatic<AlertEventRepository> workerAlerts = Mockito.mockStatic(AlertEventRepository.class);
+            try (MockedStatic<ActionRepository> workerActions = Mockito.mockStatic(ActionRepository.class);
+                    MockedStatic<AlertEventRepository> workerAlerts = Mockito.mockStatic(AlertEventRepository.class);
                     MockedStatic<SentinelLeadership> workerLeadership = Mockito.mockStatic(SentinelLeadership.class)) {
+                workerActions.when(() -> ActionRepository.getAction(Mockito.anyInt()))
+                        .thenReturn(action("resolve".equals(phase) ? OperationMode.ON_RESOLVE : OperationMode.ON_PROBLEM));
                 workerLeadership.when(() -> SentinelLeadership.recheckFence(any(LeaseFence.class))).thenReturn(true);
                 workerAlerts.when(() -> AlertEventRepository.getAlertEvent(EVENT_ID)).thenAnswer(invocation -> {
                     entered.countDown();

@@ -55,6 +55,10 @@ class ActionDispatcherSuppressionTest {
         action.setOperationMode(OperationMode.BOTH);
 
         actions = Mockito.mockStatic(ActionRepository.class);
+        actions.when(() -> ActionRepository.getAction(Mockito.anyInt())).thenAnswer(call ->
+                ActionRepository.listActions(Boolean.TRUE).stream()
+                        .filter(candidate -> candidate.getId().equals(call.getArgument(0)))
+                        .findFirst().orElse(null));
         actions.when(() -> ActionRepository.listActions(Boolean.TRUE)).thenReturn(List.of(action));
         dispatches = Mockito.mockStatic(ActionDispatchLogRepository.class);
         dispatches.when(() -> ActionDispatchLogRepository.listActionDispatchLogsForEvent(EVENT_ID))
