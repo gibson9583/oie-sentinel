@@ -30,6 +30,71 @@ import org.openintegrationengine.plugins.sentinel.shared.model.*;
 /** Exercise the queued transport guard after the escalation decision has already been made. */
 class ActionDispatcherEscalationActionTimeTest {
     @ParameterizedTest
+    @ValueSource(strings = {"filter", "phase", "both"})
+    void explicitEscalationDoesNotRequireTargetsOrdinarySubscription(String restriction) {
+        try (Scenario s = new Scenario()) {
+            if (!restriction.equals("phase")) s.stored.get(2).setConditionJson(
+                    "[{\"field\":\"CHANNEL\",\"operator\":\"=\",\"value\":\"other-channel\"}]");
+            if (!restriction.equals("filter")) s.stored.get(2).setOperationMode(OperationMode.ON_RESOLVE);
+            s.run();
+            s.run();
+            assertEquals(List.of(2), s.sent, "an explicit escalation route authorizes its enabled target");
+            assertEquals(List.of(1, 2), s.rows.stream().map(ActionDispatchLog::getActionId).toList());
+        }
+    }
+
+    @Test
+    void alreadyNotifiedIntermediateDoesNotNeedAnIndependentSubscription() {
+        try (Scenario s = new Scenario()) {
+            s.addSecondHop();
+            s.stored.get(2).setOperationMode(OperationMode.ON_RESOLVE);
+            s.stored.get(2).setConditionJson(
+                    "[{\"field\":\"CHANNEL\",\"operator\":\"=\",\"value\":\"other-channel\"}]");
+            s.stored.get(3).setOperationMode(OperationMode.ON_RESOLVE);
+            s.run();
+            s.run();
+            assertEquals(List.of(3), s.sent, "the source route remains valid through an enabled intermediate");
+            assertEquals(List.of(1, 2, 3), s.rows.stream().map(ActionDispatchLog::getActionId).toList());
+        }
+    }
+
+    @Test
+    void sourceLookupFailureBeforeChainTraversalPreservesPendingInitialWork() {
+        try (Scenario s = new Scenario()) {
+            s.event.setProblemPending(true);
+            s.stored.remove(3);
+            s.stored.get(2).setOperationMode(OperationMode.ON_RESOLVE);
+            s.unavailableAction = 1;
+            s.run();
+            assertEquals(List.of(), s.sent);
+            assertTrue(s.event.isProblemPending(), "uncertainty must not complete the event outbox");
+            s.unavailableAction = null;
+            s.run();
+            s.run();
+            assertEquals(List.of(2), s.sent);
+            assertFalse(s.event.isProblemPending());
+        }
+    }
+
+    @Test
+    void intermediateLookupFailureBeforeChainTraversalPreservesPendingWork() {
+        try (Scenario s = new Scenario()) {
+            s.addSecondHop();
+            s.event.setProblemPending(true);
+            s.stored.get(3).setOperationMode(OperationMode.ON_RESOLVE);
+            s.unavailableAction = 2;
+            s.run();
+            assertEquals(List.of(), s.sent);
+            assertTrue(s.event.isProblemPending());
+            s.unavailableAction = null;
+            s.run();
+            s.run();
+            assertEquals(List.of(3), s.sent);
+            assertFalse(s.event.isProblemPending());
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"disabled", "deleted", "filter", "phase", "retargeted", "delay",
             "credentials", "lookup-failure"})
     void sourceChangedAtIoBoundaryCannotAuthorizeOldTarget(String change) {

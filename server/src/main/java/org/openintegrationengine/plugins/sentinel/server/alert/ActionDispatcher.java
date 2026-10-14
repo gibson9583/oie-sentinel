@@ -694,8 +694,9 @@ public final class ActionDispatcher {
             List<ActionDispatchLog> allRows, Set<Integer> notifiedThisPass,
             AlertEvent event, AlertPayload payload, Instant now) {
         // A source can be edited/disabled while earlier fan-out transports run.
-        if (actionDecision(source, payload, false) != ActionDecision.ALLOW) {
-            return true;
+        ActionDecision sourcePolicy = actionDecision(source, payload, false);
+        if (sourcePolicy != ActionDecision.ALLOW) {
+            return sourcePolicy == ActionDecision.INAPPLICABLE;
         }
         if (source.getEscalateAfterSeconds() == null || source.getEscalateToActionId() == null) {
             return true;
@@ -716,8 +717,12 @@ public final class ActionDispatcher {
         long threshold = 0;
 
         for (int hop = 1; hop <= MAX_ESCALATION_HOPS; hop++) {
-            if (actionDecision(current, payload, false) != ActionDecision.ALLOW) {
-                return true;
+            // Only the originating source needs an ordinary subscription.
+            // Explicit escalation links authorize enabled intermediate/target
+            // actions even when their own phase or condition does not match.
+            ActionDecision linkPolicy = actionDecision(current, payload, false, hop == 1);
+            if (linkPolicy != ActionDecision.ALLOW) {
+                return linkPolicy == ActionDecision.INAPPLICABLE;
             }
             Integer after = current.getEscalateAfterSeconds();
             Integer targetId = current.getEscalateToActionId();
@@ -1169,6 +1174,12 @@ public final class ActionDispatcher {
                     // observe those rows and never become first-and-only.
                     priorRows = ActionDispatchLogRepository
                             .listActionDispatchLogsForEvent(event.getId());
+                    // Replay can take multiple transports. An action changed
+                    // from BOTH to ON_RESOLVE during it has no problem row,
+                    // but now explicitly subscribes to recovery. Do not let
+                    // the old BOTH snapshot discard that recovery and consume
+                    // its durable edge before a fresh pass can see the edit.
+                    actions = ActionRepository.listActions(Boolean.TRUE);
                 }
             }
 
@@ -1317,7 +1328,7 @@ public final class ActionDispatcher {
 
     private static boolean gatedAttempt(Action action, AlertEvent event, AlertPayload payload,
             boolean resolvedPhase, List<Action> authorizingSources, AttemptReceipt receipt) {
-        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
+        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase, authorizingSources.isEmpty());
         if (actionPolicy != ActionDecision.ALLOW) {
             return actionPolicy == ActionDecision.INAPPLICABLE;
         }
@@ -1530,13 +1541,18 @@ public final class ActionDispatcher {
 
     /** A snapshot authorizes I/O only while the persisted delivery definition still agrees. */
     private static ActionDecision actionDecision(Action expected, AlertPayload payload, boolean resolvedPhase) {
+        return actionDecision(expected, payload, resolvedPhase, true);
+    }
+
+    private static ActionDecision actionDecision(Action expected, AlertPayload payload, boolean resolvedPhase,
+            boolean requireSubscription) {
         try {
             Action current = expected == null || expected.getId() == null ? null
                     : ActionRepository.getAction(expected.getId());
             if (current == null || !current.isEnabled()
-                    || !firesOnPhase(current.getOperationMode(), resolvedPhase)
-                    || !ActionConditionMatcher.matches(current,
-                            withEventType(payload, resolvedPhase ? "RESOLVED" : "PROBLEM"))) {
+                    || (requireSubscription && (!firesOnPhase(current.getOperationMode(), resolvedPhase)
+                            || !ActionConditionMatcher.matches(current,
+                                    withEventType(payload, resolvedPhase ? "RESOLVED" : "PROBLEM"))))) {
                 return ActionDecision.INAPPLICABLE;
             }
             // Do not splice new credentials/routing into a decision whose
@@ -1551,7 +1567,12 @@ public final class ActionDispatcher {
     }
 
     static void verifyActionAtTransport(Action expected, AlertPayload payload, boolean resolvedPhase) {
-        ActionDecision decision = actionDecision(expected, payload, resolvedPhase);
+        verifyActionAtTransport(expected, payload, resolvedPhase, true);
+    }
+
+    private static void verifyActionAtTransport(Action expected, AlertPayload payload, boolean resolvedPhase,
+            boolean requireSubscription) {
+        ActionDecision decision = actionDecision(expected, payload, resolvedPhase, requireSubscription);
         if (decision == ActionDecision.INAPPLICABLE) {
             throw new ActionDiscardedException();
         }
@@ -1709,7 +1730,7 @@ public final class ActionDispatcher {
      */
     private static boolean attempt(Action action, AlertEvent event, AlertPayload payload, String marker,
             AttemptReceipt receipt, boolean resolvedPhase, List<Action> authorizingSources) {
-        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase);
+        ActionDecision actionPolicy = actionDecision(action, payload, resolvedPhase, authorizingSources.isEmpty());
         if (actionPolicy != ActionDecision.ALLOW) {
             return actionPolicy == ActionDecision.INAPPLICABLE;
         }
@@ -1745,13 +1766,14 @@ public final class ActionDispatcher {
                                         "Lifecycle, notification policy, or leadership changed before delivery");
                             }
                             // The target alone cannot authorize an escalation: any
-                            // upstream link can be disabled, retargeted, or cease
-                            // matching while pacing/rollup/transport work is queued.
+                            // upstream link can be disabled or edited, and the
+                            // originating source can cease matching while work
+                            // is queued for pacing, rollup, or transport.
                             // Keep the whole decision path through the I/O handoff.
-                            for (Action source : authorizingSources) {
-                                verifyActionAtTransport(source, payload, false);
+                            for (int index = 0; index < authorizingSources.size(); index++) {
+                                verifyActionAtTransport(authorizingSources.get(index), payload, false, index == 0);
                             }
-                            verifyActionAtTransport(action, payload, resolvedPhase);
+                            verifyActionAtTransport(action, payload, resolvedPhase, authorizingSources.isEmpty());
                             receipt.transportAttempted = true;
                         } finally {
                             dispatchFence.remove();
