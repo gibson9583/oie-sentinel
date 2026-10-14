@@ -5,19 +5,26 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.db;
 
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
+import org.apache.commons.dbcp2.DelegatingConnection;
+import org.apache.commons.dbcp2.PoolableConnection;
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.mirth.connect.server.util.SqlConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivityAggregate;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivitySample;
@@ -34,7 +41,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * so unlike {@code RbacRepository} this class carries no constructor-time
  * setup and needs no singleton lifecycle — plain static methods are
  * sufficient. Most statements here are a single MyBatis call and use
- * auto-commit. Two methods are not: {@link #replaceActivityTrendForHour(ActivityTrend)}
+ * auto-commit outside {@link #readActivitySnapshot(Supplier)}, which shares a
+ * managed read transaction across an evaluation's totals, coverage and baseline.
+ * Two write methods also use explicit transactions:
+ * {@link #replaceActivityTrendForHour(ActivityTrend)}
  * is a multi-statement sequence (delete-then-reinsert) and opens a
  * manual-commit session so a mid-flight failure leaves the prior bucket in
  * place rather than a deleted-but-not-reinserted gap, and
@@ -44,10 +54,125 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  */
 public final class ActivityRepository {
 
+    /** Maximum timestamps materialized by one coverage query, enforced in SQL. */
+    public static final int SAMPLE_TIME_PAGE_SIZE = 2_048;
+
     private static final String NAMESPACE = "Sentinel";
     private static final Logger log = LoggerFactory.getLogger(ActivityRepository.class);
 
     private ActivityRepository() {
+    }
+
+    /**
+     * Keeps totals, coverage pages and baseline reads in one database snapshot.
+     * A late collector insert must not certify an older aggregate, and retention
+     * must not remove measured rows between coverage and aggregation. SERIALIZABLE
+     * is supported by all five packaged databases, unlike REPEATABLE_READ on
+     * Oracle. Locking implementations may briefly delay collector/pruner writes;
+     * snapshot implementations keep this reader on one consistent version.
+     * No incident mutation or transport submission belongs inside this read scope.
+     */
+    public static <T> T readActivitySnapshot(Supplier<T> read) {
+        SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
+        if (sessions.isManagedSessionStarted()) {
+            throw new IllegalStateException("Nested activity read transaction");
+        }
+        // Borrow before changing isolation: MyBatis cannot restore the original
+        // level, and the engine's DBCP pool does not reset it when returned.
+        sessions.startManagedSession(false);
+        Connection connection = null;
+        Integer originalIsolation = null;
+        Throwable failure = null;
+        boolean discard = false;
+        T result = null;
+        try {
+            connection = sessions.getConnection();
+            originalIsolation = connection.getTransactionIsolation();
+            connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+            result = read.get();
+            sessions.commit(true);
+        } catch (SQLException error) {
+            failure = new RepositoryException(error);
+        } catch (RuntimeException | Error error) {
+            failure = error;
+        }
+        if (failure != null) {
+            try {
+                sessions.rollback(true);
+            } catch (RuntimeException | Error rollback) {
+                failure.addSuppressed(rollback);
+                discard = true;
+            }
+        }
+        // Finish the transaction before restoring isolation: some drivers commit
+        // when the level changes. A failed rollback must instead discard it.
+        if (connection != null && originalIsolation != null && !discard) {
+            try {
+                connection.setTransactionIsolation(originalIsolation);
+            } catch (SQLException | RuntimeException | Error reset) {
+                failure = snapshotFailure(failure, reset);
+                discard = true;
+            }
+        }
+        if (connection != null && discard) {
+            try {
+                connection.abort(Runnable::run);
+            } catch (SQLException | RuntimeException | Error abort) {
+                failure.addSuppressed(abort);
+                try {
+                    discardActivityConnection(sessions, connection, failure);
+                } catch (SQLException | RuntimeException | Error discardFailure) {
+                    failure.addSuppressed(discardFailure);
+                }
+            }
+        }
+        try {
+            sessions.close();
+        } catch (RuntimeException | Error close) {
+            failure = snapshotFailure(failure, close);
+        }
+        if (failure instanceof Error) throw (Error) failure;
+        if (failure != null) throw (RuntimeException) failure;
+        return result;
+    }
+
+    private static void discardActivityConnection(SqlSessionManager sessions, Connection connection,
+                                                  Throwable failure) throws SQLException {
+        PoolableConnection pooled = connection.isWrapperFor(PoolableConnection.class)
+                ? connection.unwrap(PoolableConnection.class) : null;
+        Connection physical = pooled == null ? connection.unwrap(Connection.class) : pooled.getInnermostDelegate();
+        // A pool wrapper may have failed before reaching the driver. End that
+        // transaction directly so drivers such as Derby will allow physical close.
+        try {
+            physical.rollback();
+        } catch (SQLException | RuntimeException | Error rollback) {
+            failure.addSuppressed(rollback);
+        }
+        if (pooled != null) {
+            // Close the delegate, not the pool wrapper. DBCP marks this delegate
+            // closed even if the driver throws, so poolable.close invalidates
+            // the pool entry and releases its borrowed slot in either case.
+            DelegatingConnection<Connection> discarded = new DelegatingConnection<>(physical);
+            pooled.setDelegate(discarded);
+            try {
+                discarded.close();
+            } catch (SQLException | RuntimeException | Error close) {
+                failure.addSuppressed(close);
+            }
+            pooled.close();
+        } else {
+            // BridgeDataSourceFactory exposes the engine's actual Hikari source.
+            ((HikariDataSource) sessions.getConfiguration().getEnvironment().getDataSource())
+                    .evictConnection(connection);
+        }
+    }
+
+    private static Throwable snapshotFailure(Throwable failure, Throwable cleanup) {
+        if (failure == null) {
+            return cleanup instanceof SQLException ? new RepositoryException(cleanup) : cleanup;
+        }
+        failure.addSuppressed(cleanup);
+        return failure;
     }
 
     /** Qualifies a mapped-statement id with the plugin's MyBatis namespace. */
@@ -205,6 +330,38 @@ public final class ActivityRepository {
             return samples;
         } catch (Exception e) {
             log.error("Failed to list activity samples for channel {} from {} to {}", channelId, from, to, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
+     * Reads a bounded page of distinct observation times in an inclusive range.
+     * Pass the last returned timestamp as {@code after} for the next page (or
+     * null for the first). Distinct times keep duplicate observations from
+     * consuming the scan budget. The channel/time index supports ordered keyset
+     * traversal without OFFSET scans or loading the full activity row payload.
+     */
+    public static List<Instant> listActivitySampleTimes(String channelId, Instant from, Instant to,
+            Instant after, int limit) {
+        if (limit < 1 || limit > SAMPLE_TIME_PAGE_SIZE) {
+            throw new IllegalArgumentException("Activity timestamp page limit must be between 1 and "
+                    + SAMPLE_TIME_PAGE_SIZE);
+        }
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("channelId", channelId);
+            params.put("from", toTimestamp(from));
+            params.put("to", toTimestamp(to));
+            params.put("after", toTimestamp(after));
+            params.put("limit", limit);
+            List<Timestamp> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listActivitySampleTimes"), params);
+            List<Instant> times = new ArrayList<>(rows.size());
+            for (Timestamp row : rows) times.add(row == null ? null : row.toInstant());
+            return times;
+        } catch (Exception e) {
+            log.error("Failed to page activity sample times for channel {} from {} to {}",
+                    channelId, from, to, e);
             throw new RepositoryException(e);
         }
     }

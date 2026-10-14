@@ -600,6 +600,15 @@
         ORDER BY sample_time
     </select>
 
+    <select id="listActivitySampleTimes" parameterType="map" resultType="java.sql.Timestamp">
+        SELECT DISTINCT sample_time
+        FROM sentinel_channel_activity_sample
+        WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
+        <if test="after != null">AND sample_time &gt; #{after}</if>
+        ORDER BY sample_time
+        OFFSET 0 ROWS FETCH NEXT #{limit} ROWS ONLY
+    </select>
+
     <select id="sumActivitySamplesForRange" parameterType="map" resultMap="activitySampleSumResult">
         SELECT COALESCE(SUM(received_delta), 0) AS received_sum,
                COALESCE(SUM(sent_delta), 0) AS sent_sum,

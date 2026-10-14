@@ -132,6 +132,40 @@ export const testAction = (id) => apiPost(`${BASE}/actions/${enc(id)}/_test`);
 
 /* ---- Maintenance windows ------------------------------------------------ */
 
+// Per-ID writes stay independent. Creates and imports match schedules by name,
+// so they wait for every earlier write and hold back all later schedule writes.
+const pendingScheduleWrites = new Map();
+let pendingScheduleBatch = null;
+export class ScheduleChangeCanceled extends Error {}
+export const hasPendingScheduleChanges = (id) =>
+    pendingScheduleBatch != null || pendingScheduleWrites.has(String(id));
+
+function scheduleWrite(id, write, allowed = () => platform.checkTask('', 'doManageSentinelMaintenance')) {
+    const key = id == null ? null : String(id);
+    const predecessors = key == null ? [...pendingScheduleWrites.values(), pendingScheduleBatch]
+        : [pendingScheduleWrites.get(key), pendingScheduleBatch];
+    const request = (async () => {
+        // Keep each tail owned until every inherited request has finished, even
+        // if another ID fails first. Early rejection would allow a retry to
+        // overtake an older request that is still writing on the server.
+        const settled = await Promise.allSettled(predecessors.filter(Boolean));
+        if (settled.some(result => result.status === 'rejected')) {
+            throw new ScheduleChangeCanceled('An earlier schedule change failed. Check the saved schedules before trying again.');
+        }
+        if (!allowed()) throw new ScheduleChangeCanceled('Your permission changed. This schedule change was canceled.');
+        return write();
+    })().finally(() => {
+        if (key == null) {
+            if (pendingScheduleBatch === request) pendingScheduleBatch = null;
+        } else if (pendingScheduleWrites.get(key) === request) {
+            pendingScheduleWrites.delete(key);
+        }
+    });
+    if (key == null) pendingScheduleBatch = request;
+    else pendingScheduleWrites.set(key, request);
+    return request;
+}
+
 /** GET /maintenanceWindows -> MaintenanceWindow[] */
 export const listMaintenanceWindows = () => apiGet(`${BASE}/maintenanceWindows`);
 
@@ -139,23 +173,25 @@ export const listMaintenanceWindows = () => apiGet(`${BASE}/maintenanceWindows`)
 export const getMaintenanceWindow = (id) => apiGet(`${BASE}/maintenanceWindows/${enc(id)}`);
 
 /** POST /maintenanceWindows -> created MaintenanceWindow */
-export const createMaintenanceWindow = (window_) => apiPost(`${BASE}/maintenanceWindows`, window_);
+export const createMaintenanceWindow = (window_) =>
+    scheduleWrite(null, () => apiPost(`${BASE}/maintenanceWindows`, window_));
 
 /** PUT /maintenanceWindows/{id} -> updated MaintenanceWindow */
 export const updateMaintenanceWindow = (id, window_) =>
-    apiPut(`${BASE}/maintenanceWindows/${enc(id)}`, window_);
+    scheduleWrite(id, () => apiPut(`${BASE}/maintenanceWindows/${enc(id)}`, window_));
 
 /** POST /maintenanceWindows/{id}/_setEnabled?enabled= -> current MaintenanceWindow */
 export const setMaintenanceWindowEnabled = (id, enabled) =>
-    apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_setEnabled`, null, { enabled });
+    scheduleWrite(id, () => apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_setEnabled`, null, { enabled }));
 
 /** DELETE /maintenanceWindows/{id} -> {} */
-export const deleteMaintenanceWindow = (id) => apiDel(`${BASE}/maintenanceWindows/${enc(id)}`);
+export const deleteMaintenanceWindow = (id) =>
+    scheduleWrite(id, () => apiDel(`${BASE}/maintenanceWindows/${enc(id)}`));
 
 /** POST /maintenanceWindows/{id}/_activateNow?durationMinutes= -> MaintenanceWindow */
 export const activateMaintenanceWindowNow = (id, durationMinutes) =>
-    apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_activateNow`, null,
-        { durationMinutes: durationMinutes == null ? 60 : durationMinutes });
+    scheduleWrite(id, () => apiPost(`${BASE}/maintenanceWindows/${enc(id)}/_activateNow`, null,
+        { durationMinutes: durationMinutes == null ? 60 : durationMinutes }));
 
 /* ---- Problems ----------------------------------------------------------- */
 
@@ -274,10 +310,19 @@ export const exportConfiguration = () => apiGet(`${BASE}/export`);
                   outcome: 'CREATED'|'UPDATED'|'SKIPPED', reason,
                   secretsKept: [], secretsRequired: [], secretsNote }] }
 
-    Writes immediately — confirm before calling. Entities match on name: known
+    Confirm before calling. Imports containing schedules wait for earlier
+    schedule writes. Entities match on name: known
     name -> update, unknown -> create, nothing is ever deleted, and an entity
     already matching the server is skipped as unchanged, which is what makes a
     re-run safe after a partial failure. The per-entry outcome is the point of
     the response: an entity the server's own validation rejected comes back
     SKIPPED with its reason rather than failing the whole document. */
-export const importConfiguration = (document_) => apiPost(`${BASE}/import`, document_);
+export const importConfiguration = async (document_) => {
+    const manage = () => platform.checkTask('', 'doManageSentinel');
+    if (Array.isArray(document_?.maintenanceWindows) && document_.maintenanceWindows.length) {
+        return scheduleWrite(null, () => apiPost(`${BASE}/import`, document_),
+            () => manage() && platform.checkTask('', 'doManageSentinelMaintenance'));
+    }
+    if (!manage()) throw new Error('Your permission changed. The import was canceled.');
+    return apiPost(`${BASE}/import`, document_);
+};

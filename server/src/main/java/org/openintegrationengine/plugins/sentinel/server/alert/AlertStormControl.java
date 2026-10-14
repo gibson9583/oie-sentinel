@@ -313,7 +313,16 @@ final class AlertStormControl {
             if (!snap.reserveRollupIfNone(actionId, from, now)) {
                 return CeilingVerdict.silent(sent, windowSeconds);
             }
-            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, RollupRecipients.channels(action, now.minusSeconds(windowSeconds), now),
+            List<String> channels;
+            try {
+                channels = RollupRecipients.channels(action, from, now);
+            } catch (Throwable failure) {
+                // No rollup reached transport. Release this snapshot's claim
+                // before failing open so a recovered lookup can try again.
+                snap.releaseRollup(actionId, now);
+                throw failure;
+            }
+            return new CeilingVerdict(CeilingOutcome.ROLLUP, sent, windowSeconds, channels,
                     new Reservation(snap, actionId, CeilingOutcome.ROLLUP, now));
         } catch (Throwable t) {
             // Fail open: a ceiling that cannot be computed must not silence

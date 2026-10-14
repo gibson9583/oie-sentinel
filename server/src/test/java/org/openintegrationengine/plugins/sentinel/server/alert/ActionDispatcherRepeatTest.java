@@ -80,6 +80,10 @@ class ActionDispatcherRepeatTest {
     @BeforeEach
     void setUp() {
         actionRepository = Mockito.mockStatic(ActionRepository.class);
+        actionRepository.when(() -> ActionRepository.getAction(Mockito.anyInt())).thenAnswer(call ->
+                ActionRepository.listActions(Boolean.TRUE).stream()
+                        .filter(candidate -> candidate.getId().equals(call.getArgument(0)))
+                        .findFirst().orElse(null));
         actionRepository.when(() -> ActionRepository.listActions(Boolean.TRUE)).thenReturn(actions);
 
         dispatchLogRepository = Mockito.mockStatic(ActionDispatchLogRepository.class);
