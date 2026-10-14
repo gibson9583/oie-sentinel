@@ -613,6 +613,7 @@ export function MaintenancePage() {
     const tags = useApi(getCoreTags, []);
     const [view, setView] = React.useState(null); // null | { mode: 'new' } | { mode: 'edit', window }
     const manage = canManageMaintenance();
+    const pendingToggles = React.useRef(new Map());
 
     // Scope names silently degrade to raw ids when these fail — still surface
     // it, but as 'info': the host shows warn toasts as blocking modals, too
@@ -651,16 +652,36 @@ export function MaintenancePage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     })), [windows.data, channelNames, groupNames, tagNames]); // windowList derives from windows.data
 
-    // Send the checkbox's requested state, never the stale row's definition.
+    // Send the requested state without the stale row definition. Serialize per
+    // window so a slow earlier request cannot overwrite the latest choice.
     const toggleEnabled = async (w, enabled) => {
         if (!canManageMaintenance()) return;
+        const id = String(w.id);
+        const previous = pendingToggles.current.get(id);
+        const request = (async () => {
+            if (previous && !await previous.catch(() => false)) return false;
+            // Permission can change while this update waits for its predecessor.
+            if (!canManageMaintenance()) return false;
+            try {
+                await setMaintenanceWindowEnabled(w.id, enabled);
+                toast(`Maintenance window "${w.name}" ${enabled ? 'enabled' : 'disabled'}.`, 'success');
+                return true;
+            } catch (e) {
+                // A timeout does not prove the server stopped writing. Do not
+                // automatically send queued changes after an uncertain result.
+                errorModal('Enable/Disable Failed', `${errText(e)}\n\nQueued enable/disable changes for this window were canceled. Check its saved state before trying again.`, w.name);
+                return false;
+            }
+        })();
+        pendingToggles.current.set(id, request);
         try {
-            await setMaintenanceWindowEnabled(w.id, enabled);
-            toast(`Maintenance window "${w.name}" ${enabled ? 'enabled' : 'disabled'}.`, 'success');
-        } catch (e) {
-            errorModal('Enable/Disable Failed', errText(e), w.name);
+            await request;
+        } finally {
+            if (pendingToggles.current.get(id) === request) {
+                pendingToggles.current.delete(id);
+                windows.reload(); // re-sync after the last queued update, including failures
+            }
         }
-        windows.reload(); // re-sync the checkbox either way
     };
 
     const activateNow = async (w) => {

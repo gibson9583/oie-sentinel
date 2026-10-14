@@ -40,17 +40,34 @@ const nodes = (node) => node == null || typeof node === 'boolean' ? []
 const originalHooks = { ...React };
 function page() {
     const state = [], refs = [];
-    let index = 0;
-    React.useState = initial => {
-        const i = index++;
-        state[i] = typeof initial === 'function' ? initial() : initial;
-        return [state[i], value => { state[i] = typeof value === 'function' ? value(state[i]) : value; }];
+    function render() {
+        let stateIndex = 0, refIndex = 0;
+        React.useState = initial => {
+            const i = stateIndex++;
+            if (!(i in state)) state[i] = typeof initial === 'function' ? initial() : initial;
+            return [state[i], value => { state[i] = typeof value === 'function' ? value(state[i]) : value; }];
+        };
+        React.useRef = initial => {
+            const i = refIndex++;
+            return refs[i] || (refs[i] = { current: initial });
+        };
+        try { mod.MaintenancePage(); }
+        finally { Object.assign(React, originalHooks); }
+    }
+    render();
+    return {
+        state, render,
+        get toggle() { return refs.find(r => typeof r.current?.toggle === 'function').current.toggle; },
     };
-    React.useRef = initial => { const ref = { current: initial }; refs.push(ref); return ref; };
-    mod.MaintenancePage();
-    Object.assign(React, originalHooks);
-    return { state, toggle: refs.find(r => typeof r.current?.toggle === 'function').current.toggle };
 }
+
+function deferred() {
+    let resolve, reject;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+}
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
 const stale = Object.freeze({ id: 7, enabled: true, name: 'Old name', scopeType: 'ALL', mode: 'SUPPRESS' });
 for (const requested of [false, true]) {
     test(`sets explicit ${requested} without sending a stale schedule definition, including retries`, async () => {
@@ -92,4 +109,107 @@ test('a rejected request refreshes the checkbox and can be retried without a who
     assert.equal(p.state[1], 2);
     assert.equal(writes, 2);
     assert.equal(puts, 0);
+});
+
+for (const states of [[true, false], [false, true], [true, false, true, false]]) {
+    test(`overlapping toggles ${states.join(' → ')} preserve request order across renders`, async () => {
+        const requests = [];
+        let stored;
+        mod.platform.checkTask = () => true;
+        mod.platform.api.post = (url, body, options) => {
+            const gate = deferred();
+            requests.push({ ...gate, enabled: options.params.enabled });
+            return gate.promise.then(() => { stored = options.params.enabled; });
+        };
+        const p = page();
+        const completions = states.map((enabled, i) => {
+            p.render();
+            // Numeric and string representations still identify the same row.
+            return p.toggle({ ...stale, id: i % 2 ? '7' : 7 }, enabled);
+        });
+        await flush();
+        assert.equal(requests.length, 1, 'only one request for a window may be in flight');
+        for (let i = 0; i < states.length; i++) {
+            assert.equal(requests[i].enabled, states[i]);
+            assert.equal(p.state[1], 0, 'do not refresh an intermediate state over the latest choice');
+            requests[i].resolve();
+            await completions[i];
+            await flush();
+            assert.equal(requests.length, Math.min(i + 2, states.length));
+        }
+        assert.equal(stored, states.at(-1), 'the last requested state must win');
+        assert.equal(p.state[1], 1, 'refresh when this window has drained its queue');
+    });
+}
+
+test('different windows remain independent while one update is slow', async () => {
+    const requests = [];
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = url => {
+        const gate = deferred();
+        requests.push({ ...gate, url });
+        return gate.promise;
+    };
+    const p = page();
+    const first = p.toggle(stale, false);
+    const other = p.toggle({ ...stale, id: 8 }, true);
+    await flush();
+    assert.equal(requests.length, 2);
+    requests[1].resolve();
+    await other;
+    assert.equal(p.state[1], 1);
+    requests[0].resolve();
+    await first;
+    assert.equal(p.state[1], 2);
+});
+
+test('an uncertain failed update cancels queued changes and allows a later explicit retry', async () => {
+    const requests = [];
+    let stored = false;
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = (url, body, options) => {
+        const gate = deferred();
+        requests.push({ ...gate, commit: () => { stored = options.params.enabled; } });
+        return gate.promise;
+    };
+    const p = page();
+    const first = p.toggle(stale, true);
+    const opposite = p.toggle(stale, false);
+    const repeated = p.toggle(stale, false);
+    await flush();
+    assert.equal(requests.length, 1);
+    requests[0].reject(new Error('request timed out; engine may still be completing it'));
+    await Promise.all([first, opposite, repeated]);
+    assert.equal(requests.length, 1, 'never send queued changes after an uncertain predecessor');
+    assert.equal(p.state[1], 1);
+    requests[0].commit(); // The timed-out server operation finishes late.
+    assert.equal(stored, true);
+    const retry = p.toggle(stale, false);
+    await flush();
+    assert.equal(requests.length, 2, 'an explicit retry starts a new queue');
+    requests[1].commit();
+    requests[1].resolve();
+    await retry;
+    assert.equal(stored, false);
+    assert.equal(p.state[1], 2);
+});
+
+test('queued updates recheck permission when they are about to be sent', async () => {
+    const gate = deferred();
+    let permitted = true, writes = 0;
+    mod.platform.checkTask = () => permitted;
+    mod.platform.api.post = () => { writes++; return gate.promise; };
+    const p = page();
+    const first = p.toggle(stale, true);
+    const queued = p.toggle(stale, false);
+    await flush();
+    permitted = false;
+    gate.resolve();
+    await Promise.all([first, queued]);
+    assert.equal(writes, 1, 'revoked permission also applies to already-queued changes');
+    assert.equal(p.state[1], 1, 'refresh the state actually saved');
+    permitted = true;
+    await p.toggle(stale, false);
+    assert.equal(writes, 2, 'a skipped queued request does not retain the queue');
+    assert.equal(p.state[1], 2);
 });
