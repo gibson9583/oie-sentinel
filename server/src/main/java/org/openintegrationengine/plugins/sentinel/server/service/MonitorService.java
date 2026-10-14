@@ -396,6 +396,9 @@ public final class MonitorService {
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
         }
+        if (monitor.getName() != null) {
+            monitor.setName(monitor.getName().trim());
+        }
         if (isBlank(monitor.getName())) {
             throw new IllegalArgumentException("Monitor name is required");
         }
@@ -719,14 +722,14 @@ public final class MonitorService {
     }
 
     /**
-     * Case-insensitive uniqueness pre-check so a duplicate name yields a
-     * clear 400 instead of a raw constraint violation. Case-insensitive
-     * because two monitors differing only in case are indistinguishable in
-     * every list the UI shows.
+     * Compare both names using the export/import identity rule. Existing
+     * rows may predate name trimming; saving a new monitor must not create
+     * a collision with one of those legacy names.
      */
     private static void requireUniqueName(String name, Integer selfId) {
+        String key = name.trim().toLowerCase(Locale.ROOT);
         for (Monitor other : MonitorRepository.listMonitors(null, null, null, null)) {
-            if (other.getName() != null && other.getName().equalsIgnoreCase(name.trim())
+            if (other.getName() != null && other.getName().trim().toLowerCase(Locale.ROOT).equals(key)
                     && !other.getId().equals(selfId)) {
                 throw new IllegalArgumentException("A monitor named '" + other.getName() + "' already exists");
             }

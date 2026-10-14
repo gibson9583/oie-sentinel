@@ -152,7 +152,13 @@ through the same permission check it applies to those.
   throughput, and collector/evaluator heartbeat age, honouring channel restrictions.
 - **Export / import** of monitors, actions and schedules as one JSON document, matched by name and
   reported entity by entity, so configuration is promotable dev → test → prod and
-  version-controllable.
+  version-controllable. Export preserves all monitors, including legacy names that differ only
+  by surrounding spaces or case. Import skips ambiguous monitor names and dependent references;
+  rename the colliding monitors before retrying. New monitor names are trimmed on save.
+  Format 3 marks unresolved action monitor IDs and skips those actions and their escalation
+  dependents until the source conditions are repaired and exported again. Older Sentinel versions
+  reject format 3. Formats 1 and 2 remain accepted with monitor references interpreted as names;
+  re-export old documents if their source actions contain stale IDs.
 - Five RBAC permissions published for authorization plugins (see [Permissions](#permissions)).
 - Mutations audited through the engine's event log; alert history, trigger state, and activity
   samples persist across restarts with configurable retention.

@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.service;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -54,7 +55,7 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
  * {@code MonitorService}/{@code ActionService} already use to reject duplicate
  * names, so import can never create a pair the editors would consider a
  * collision). A name that exists uniquely on the target is an update; a name
- * that does not is a create. Legacy action rows can have distinct literal
+ * that does not is a create. Legacy monitor and action rows can have distinct literal
  * names that collide after normalization: export retains every row, and
  * import rejects ambiguous matches instead of choosing one recipient.</p>
  *
@@ -171,6 +172,8 @@ public final class ExportImportService {
      *
      * <p>Version 2 adds {@code escalateToActionName}; older servers must reject
      * it rather than silently discard an escalation reference they do not know.
+     * Version 3 marks unresolved exported monitor ids with
+     * {@code unresolvedMonitorIds}, so they cannot be mistaken for numeric names.
      * Version 1 remains accepted, but populated numeric escalation ids are
      * rejected per action because they cannot identify a destination safely.
      * The original format has ids and audit stamps removed,
@@ -181,7 +184,7 @@ public final class ExportImportService {
      * Sentinel may encode a reference this server does not know how to
      * resolve, and applying it half-understood is worse than refusing it.</p>
      */
-    public static final int SCHEMA_VERSION = 2;
+    public static final int SCHEMA_VERSION = 3;
 
     /** Entity type of an {@link ImportEntry} sourced from {@code monitors}. */
     public static final String TYPE_MONITOR = "MONITOR";
@@ -223,6 +226,7 @@ public final class ExportImportService {
     /** Portable escalation reference; numeric action ids belong to the source database. */
     private static final String KEY_ESCALATE_TO_NAME = "escalateToActionName";
     private static final String FIELD_ESCALATE_TO_ID = "escalateToActionId";
+    private static final String KEY_UNRESOLVED_MONITOR_IDS = "unresolvedMonitorIds";
     private static final String REASON_UNCHANGED = "Already matches this server";
 
     /** The one {@code ActionConditionMatcher} field whose values are Sentinel ids. */
@@ -260,7 +264,7 @@ public final class ExportImportService {
      * <p>Shape:</p>
      * <pre>
      * {
-     *   "schemaVersion": 2,
+     *   "schemaVersion": 3,
      *   "exportedAt": "2026-08-06T09:15:22.481Z",
      *   "monitors":           [ { ...definition, "suppressedByMonitorName": "Upstream down"|null } ],
      *   "actions":            [ { ...definition, secrets as the redaction marker } ],
@@ -329,9 +333,8 @@ public final class ExportImportService {
      * Renders one already-redacted action in portable form, rewriting the
      * monitor ids inside its {@code MONITOR} condition rows to monitor names
      * and its escalation target to an action name.
-     * A stale id matching no monitor is left exactly as it is: rewriting it to
-     * nothing would silently widen the action's condition, and leaving it
-     * makes import report it by value so the operator can clean it up.
+     * Unresolved ids remain in the condition and are also marked explicitly:
+     * without that marker, import could mistake an id for a numeric name.
      */
     private static ObjectNode actionNode(Action action, MonitorIndex monitors, ActionIndex actions) {
         Action target = actions.byId(action.getEscalateToActionId());
@@ -343,8 +346,20 @@ public final class ExportImportService {
             // accidentally binding it to an unrelated destination action.
             node.put(FIELD_ESCALATE_TO_ID, action.getEscalateToActionId());
         }
+        Set<String> unresolved = new LinkedHashSet<>();
         node.set("conditionJson", TextNode.valueOf(
-                mapMonitorConditionValues(action.getConditionJson(), monitors::nameOf)));
+                mapMonitorConditionValues(action.getConditionJson(), value -> {
+                    String name = monitors.nameOf(value);
+                    if (name == null || name.trim().isEmpty()) {
+                        unresolved.add(value);
+                        return null;
+                    }
+                    return name;
+                })));
+        if (!unresolved.isEmpty()) {
+            ArrayNode ids = node.putArray(KEY_UNRESOLVED_MONITOR_IDS);
+            unresolved.forEach(ids::add);
+        }
         return node;
     }
 
@@ -486,12 +501,46 @@ public final class ExportImportService {
         }
 
         Set<String> documentNames = new LinkedHashSet<>();
-        List<JsonNode> pending = new ArrayList<>();
+        Map<String, Integer> nameCounts = new LinkedHashMap<>();
+        Map<String, List<String>> dependents = new LinkedHashMap<>();
         for (JsonNode node : nodes) {
-            pending.add(node);
             String name = textOrNull(node, "name");
             if (!isBlank(name)) {
-                documentNames.add(nameKey(name));
+                String key = nameKey(name);
+                documentNames.add(key);
+                nameCounts.merge(key, 1, Integer::sum);
+                String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
+                if (!isBlank(parentName)) {
+                    dependents.computeIfAbsent(nameKey(parentName), ignored -> new ArrayList<>()).add(key);
+                }
+            }
+        }
+        for (Map.Entry<String, Integer> count : nameCounts.entrySet()) {
+            if (count.getValue() > 1) {
+                index.rejectName(count.getKey(), "is duplicated in this document after trimming and ignoring case");
+            }
+        }
+        // Reject every document dependency on a collision before any write.
+        // Otherwise a child processed first could reuse an old destination
+        // row for a parent whose imported definition is about to be rejected.
+        ArrayDeque<String> rejected = new ArrayDeque<>(index.unavailableNames());
+        while (!rejected.isEmpty()) {
+            for (String dependent : dependents.getOrDefault(rejected.removeFirst(), List.of())) {
+                if (index.rejectName(dependent, "depends on an ambiguous monitor reference in this document")) {
+                    rejected.addLast(dependent);
+                }
+            }
+        }
+
+        List<JsonNode> pending = new ArrayList<>();
+        for (JsonNode node : nodes) {
+            String name = textOrNull(node, "name");
+            String problem = index.unavailableReason(name);
+            if (problem == null) {
+                pending.add(node);
+            } else {
+                entries.add(new ImportEntry(TYPE_MONITOR, name).skipped(
+                        "Monitor '" + name + "' " + problem + "; this monitor was left untouched"));
             }
         }
 
@@ -549,6 +598,10 @@ public final class ExportImportService {
         if (isBlank(name)) {
             return entry.skipped("Entry has no name; monitors are matched by name");
         }
+        String problem = index.unavailableReason(name);
+        if (problem != null) {
+            return entry.skipped("Monitor '" + name + "' " + problem + "; this monitor was left untouched");
+        }
 
         Monitor incoming;
         try {
@@ -557,19 +610,24 @@ public final class ExportImportService {
             return entry.skipped("Not a valid monitor definition: " + rootMessage(e));
         }
         incoming.setId(null);
+        incoming.setName(incoming.getName().trim());
 
         String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
-        Monitor existing = index.byName(name);
-        if (existing != null && sameDefinition(monitorNode(incoming, parentName),
-                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())))) {
-            return entry.skipped(REASON_UNCHANGED);
+        problem = index.unavailableReason(parentName);
+        if (problem != null) {
+            return entry.skipped("Suppressing monitor '" + parentName + "' " + problem
+                    + "; this monitor was left untouched");
         }
-
         Monitor parent = isBlank(parentName) ? null : index.byName(parentName);
         if (!isBlank(parentName) && parent == null) {
             // Unreachable via importMonitors, which defers until the parent is
             // in the index; kept so a future caller cannot lose the dependency.
             return entry.skipped("Suppressing monitor '" + parentName + "' could not be resolved on this server");
+        }
+        Monitor existing = index.byName(name);
+        if (existing != null && sameDefinition(monitorNode(incoming, parent == null ? null : parent.getName()),
+                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())))) {
+            return entry.skipped(REASON_UNCHANGED);
         }
         incoming.setSuppressedByMonitorId(parent == null ? null : parent.getId());
 
@@ -606,7 +664,7 @@ public final class ExportImportService {
         List<JsonNode> pending = new ArrayList<>();
         for (JsonNode node : nodes) {
             String name = textOrNull(node, "name");
-            String problem = escalationReferenceProblem(node);
+            String problem = actionReferenceProblem(node);
             if (nameCounts.get(nameKey(name)) > 1) {
                 problem = "Duplicate action name in this document; rename or remove the duplicate entries";
             }
@@ -682,7 +740,14 @@ public final class ExportImportService {
         return false;
     }
 
-    private static String escalationReferenceProblem(JsonNode node) {
+    private static String actionReferenceProblem(JsonNode node) {
+        // Export only emits this key for unresolved source references. Its
+        // presence is enough to reject, even if someone damaged its contents.
+        if (node != null && node.has(KEY_UNRESOLVED_MONITOR_IDS)) {
+            return "Export contains unresolved monitor IDs; fix the action's monitor conditions on the source"
+                    + " and export again, or replace them with intended monitor names and remove unresolvedMonitorIds;"
+                    + " this action was left untouched";
+        }
         if (node != null && node.hasNonNull(FIELD_ESCALATE_TO_ID)) {
             return "Numeric escalateToActionId belongs to the source server and cannot be resolved safely;"
                     + " replace it with escalateToActionName before importing";
@@ -698,13 +763,13 @@ public final class ExportImportService {
      * Creates, updates, or skips one action, classifying its secrets and
      * resolving its monitor condition rows on the way.
      *
-     * <p>Ordering inside this method matters. The unchanged comparison runs
-     * <i>before</i> either rewrite, with both sides in name space and both
-     * sides redacted, so it compares like with like. One consequence is worth
-     * stating plainly: an action whose only difference is a secret reads as
-     * unchanged, because the export never carried the secret to compare
-     * against. Secrets are re-entered on the target, never diffed from a
-     * file.</p>
+     * <p>The unchanged comparison uses resolved destination ids for monitor
+     * conditions and escalation targets. Existing monitor values are compared
+     * as trimmed text, matching the runtime without parsing them as integers:
+     * exporting them to names could disguise a dangling id as a numeric
+     * monitor name or erase a runtime-significant leading zero.
+     * Config remains untouched for comparison, so exported secret markers
+     * compare with the existing action's redacted config.</p>
      */
     private static ImportEntry applyAction(JsonNode node, ActionIndex actions, MonitorIndex monitors,
             int userId) {
@@ -733,11 +798,32 @@ public final class ExportImportService {
             return entry.skipped("Escalation target chain is circular; this action was left untouched");
         }
         incoming.setEscalateToActionId(target == null ? null : target.getId());
-        // Computed against the UNTOUCHED incoming config, so both sides are
-        // redacted the same way and compare like with like.
-        boolean unchanged = existing != null
-                && sameDefinition(actionPolicyNode(incoming, target == null ? null : target.getName()),
-                        actionNode(existing, monitors, actions));
+        List<String> ambiguousMonitors = new ArrayList<>();
+        List<String> unresolved = new ArrayList<>();
+        String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), value -> {
+            String problem = monitors.unavailableReason(value);
+            if (problem != null) {
+                ambiguousMonitors.add("'" + value + "' " + problem);
+                return null;
+            }
+            Integer id = monitors.idOf(value);
+            if (id == null) {
+                unresolved.add(value);
+                return null;
+            }
+            return String.valueOf(id);
+        });
+        // Both sides now refer to destination ids. The runtime compares
+        // trimmed scalar text, so JSON 1 and " 1 " match "1", but "01"
+        // does not. Never translate existing values through monitor names.
+        ObjectNode incomingPolicy = portable(incoming);
+        incomingPolicy.put("conditionJson", resolvedCondition);
+        ObjectNode existingPolicy = existing == null ? null : portable(existing);
+        if (existingPolicy != null) {
+            existingPolicy.put("conditionJson",
+                    mapMonitorConditionValues(existing.getConditionJson(), String::trim));
+        }
+        boolean unchanged = existingPolicy != null && sameDefinition(incomingPolicy, existingPolicy);
 
         // Secret classification runs even for an unchanged or about-to-be-
         // skipped action: "this action is already here and its key is already
@@ -748,6 +834,18 @@ public final class ExportImportService {
         entry.setSecretsRequired(secrets.required);
         entry.setSecretsNote(secretsNote(secrets.kept, secrets.required));
 
+        // Even an apparently unchanged action must not bless an ambiguous
+        // or missing name: escalation dependents treat "unchanged" as a
+        // resolved target, and unresolved numeric names can resemble old ids.
+        if (!ambiguousMonitors.isEmpty()) {
+            return entry.skipped("MONITOR condition references cannot be resolved safely: "
+                    + String.join(", ", ambiguousMonitors) + "; this action was left untouched");
+        }
+        if (!unresolved.isEmpty()) {
+            return entry.skipped("MONITOR condition rows name monitor(s) that do not exist on this server: "
+                    + String.join(", ", unresolved)
+                    + "; the condition was not widened, so this action was left untouched");
+        }
         if (unchanged) {
             return entry.skipped(REASON_UNCHANGED);
         }
@@ -762,21 +860,6 @@ public final class ExportImportService {
                     + "; supply them in the import document or configure the action on this server before retrying");
         }
 
-        List<String> unresolved = new ArrayList<>();
-        UnaryOperator<String> toId = value -> {
-            Integer id = monitors.idOf(value);
-            if (id == null) {
-                unresolved.add(value);
-                return null;
-            }
-            return String.valueOf(id);
-        };
-        String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), toId);
-        if (!unresolved.isEmpty()) {
-            return entry.skipped("MONITOR condition rows name monitor(s) that do not exist on this server: "
-                    + String.join(", ", unresolved)
-                    + "; the condition was not widened, so this action was left untouched");
-        }
         incoming.setConditionJson(resolvedCondition);
         incoming.setConfigJson(secrets.configJson);
 
@@ -1037,6 +1120,9 @@ public final class ExportImportService {
      * in place after recording it as unresolved. Nothing is ever removed —
      * dropping a condition row silently widens what the action matches.</p>
      *
+     * <p>Null, container and blank values remain untouched. The runtime ignores
+     * these members in an {@code IN} list; they are not monitor references.</p>
+     *
      * <p>Anything that is not a condition array is returned untouched;
      * {@code ActionService.validateCondition} owns rejecting a malformed
      * one.</p>
@@ -1057,7 +1143,7 @@ public final class ExportImportService {
         boolean rewritten = false;
         for (JsonNode row : condition) {
             JsonNode field = row.isObject() ? row.get("field") : null;
-            if (field == null || !CONDITION_FIELD_MONITOR.equalsIgnoreCase(field.asText(""))) {
+            if (field == null || !CONDITION_FIELD_MONITOR.equalsIgnoreCase(field.asText("").trim())) {
                 continue;
             }
             JsonNode value = row.get("value");
@@ -1067,14 +1153,16 @@ public final class ExportImportService {
             if (value.isArray()) {
                 ArrayNode values = (ArrayNode) value;
                 for (int i = 0; i < values.size(); i++) {
-                    String next = rewrite.apply(values.get(i).asText(""));
+                    JsonNode element = values.get(i);
+                    if (!isMonitorReferenceValue(element)) continue;
+                    String next = rewrite.apply(element.asText());
                     if (next != null) {
                         values.set(i, TextNode.valueOf(next));
                         rewritten = true;
                     }
                 }
-            } else {
-                String next = rewrite.apply(value.asText(""));
+            } else if (isMonitorReferenceValue(value)) {
+                String next = rewrite.apply(value.asText());
                 if (next != null) {
                     ((ObjectNode) row).set("value", TextNode.valueOf(next));
                     rewritten = true;
@@ -1082,6 +1170,12 @@ public final class ExportImportService {
             }
         }
         return rewritten ? Json.write(condition) : conditionJson;
+    }
+
+    /** Same scalar/blank rule as ActionConditionMatcher.text. */
+    private static boolean isMonitorReferenceValue(JsonNode value) {
+        return value != null && !value.isNull() && value.isValueNode()
+                && !value.asText().trim().isEmpty();
     }
 
     // ========== Comparison ==========
@@ -1163,8 +1257,9 @@ public final class ExportImportService {
     }
 
     /**
-     * The monitor name index shared by the monitor and action passes: name →
-     * monitor for matching and id lookup, id → name for rendering the export.
+     * Preserve every persisted monitor by id for export. Names may only be
+     * resolved when unique, including in the incoming document. Rejected
+     * collision dependencies remain unavailable to the later action pass.
      *
      * <p>Kept live through the run — every create feeds back into it — so a
      * monitor created early in a document can be a suppression parent or a
@@ -1175,8 +1270,10 @@ public final class ExportImportService {
      */
     private static final class MonitorIndex {
 
-        private final Map<String, Monitor> byName = new LinkedHashMap<>();
-        private final Map<Integer, String> namesById = new HashMap<>();
+        private final Map<Integer, Monitor> byId = new LinkedHashMap<>();
+        private final Map<String, Monitor> byName = new HashMap<>();
+        private final Set<String> ambiguousNames = new LinkedHashSet<>();
+        private final Map<String, String> rejectedNames = new LinkedHashMap<>();
 
         static MonitorIndex of(List<Monitor> monitors) {
             MonitorIndex index = new MonitorIndex();
@@ -1187,25 +1284,47 @@ public final class ExportImportService {
         }
 
         void put(Monitor monitor) {
-            if (monitor == null || isBlank(monitor.getName())) {
-                return;
+            byId.put(monitor.getId(), monitor);
+            String key = nameKey(monitor.getName());
+            Monitor previous = byName.put(key, monitor);
+            if (previous != null && !previous.getId().equals(monitor.getId())) {
+                ambiguousNames.add(key);
             }
-            byName.put(nameKey(monitor.getName()), monitor);
-            if (monitor.getId() != null) {
-                namesById.put(monitor.getId(), monitor.getName());
+        }
+
+        String unavailableReason(String name) {
+            if (name == null) return null;
+            String key = nameKey(name);
+            if (rejectedNames.containsKey(key)) return rejectedNames.get(key);
+            return ambiguousNames.contains(key)
+                    ? "matches multiple monitors on this server after trimming and ignoring case"
+                    : null;
+        }
+
+        Set<String> unavailableNames() {
+            Set<String> names = new LinkedHashSet<>(ambiguousNames);
+            names.addAll(rejectedNames.keySet());
+            return names;
+        }
+
+        boolean rejectName(String name, String reason) {
+            if (unavailableReason(name) != null) {
+                return false;
             }
+            rejectedNames.put(nameKey(name), reason);
+            return true;
         }
 
         List<Monitor> all() {
-            return new ArrayList<>(byName.values());
+            return new ArrayList<>(byId.values());
         }
 
         Monitor byName(String name) {
-            return name == null ? null : byName.get(nameKey(name));
+            return name == null || unavailableReason(name) != null ? null : byName.get(nameKey(name));
         }
 
         boolean has(String name) {
-            return name != null && byName.containsKey(nameKey(name));
+            return byName(name) != null;
         }
 
         /**
@@ -1220,13 +1339,18 @@ public final class ExportImportService {
 
         /** Name for an id, or {@code null} for {@code null} and for ids this server does not have. */
         String nameOf(Integer id) {
-            return id == null ? null : namesById.get(id);
+            Monitor monitor = id == null ? null : byId.get(id);
+            return monitor == null ? null : monitor.getName();
         }
 
         /** Overload for the condition rewriter, which works in strings both ways. */
         String nameOf(String id) {
             try {
-                return nameOf(Integer.valueOf(id.trim()));
+                String text = id.trim();
+                Integer parsed = Integer.valueOf(text);
+                // Runtime compares scalar text, so "01" and "+1" do not
+                // reference monitor 1 and must not export as its name.
+                return parsed.toString().equals(text) ? nameOf(parsed) : null;
             } catch (NumberFormatException e) {
                 return null; // not an id at all — leave the value alone
             }
