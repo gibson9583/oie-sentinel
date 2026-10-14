@@ -15,6 +15,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
+import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActivityAggregate;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -80,6 +81,10 @@ public final class AnomalyEvaluator {
      *         INSUFFICIENT_DATA when no baseline tier has enough history yet
      */
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
+        return ActivityRepository.readActivitySnapshot(() -> evaluateSnapshot(monitor, channelId, now));
+    }
+
+    private static EvaluationOutcome evaluateSnapshot(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         String metric = config.path("metric").asText("RECEIVED");
         double zScoreThreshold = config.path("zScoreThreshold").asDouble(DEFAULT_Z_SCORE_THRESHOLD);
@@ -93,6 +98,12 @@ public final class AnomalyEvaluator {
         ActivityAggregate aggregate = ActivityRepository.sumActivitySamplesForRange(
                 channelId, hourStart, hourEnd.minusMillis(1));
         long current = metricSum(aggregate, metric);
+
+        if (!CollectorState.getInstance().isChannelStartedThroughout(channelId, hourStart)
+                || !ActivityCoverage.covers(channelId, hourStart, hourEnd.minusMillis(1))) {
+            return EvaluationOutcome.insufficientData(
+                    buildValueJson(current, null, null, null, null, null, hourStart));
+        }
 
         BaselineResolver.Baseline baseline = BaselineResolver.resolve(
                 channelId, hourStart, metric, baselineWindowDays, useWeekendBucket);

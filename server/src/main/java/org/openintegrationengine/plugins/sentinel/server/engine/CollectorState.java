@@ -125,6 +125,8 @@ public final class CollectorState {
      * epoch. Its old counters span traffic already sampled by its successor;
      * retaining them would count that interval twice on failback. Renewal
      * keeps the epoch and its baseline, including after a failed DB batch.
+     * Started stamps must also begin again: another leader may have collected at
+     * a different cadence while this node was inactive.
      */
     synchronized void prepareCounterEpoch(LeaseFence fence) {
         if (fence == null) {
@@ -132,6 +134,7 @@ public final class CollectorState {
         }
         if (!fence.equals(counterEpoch)) {
             previousCounters.clear();
+            startedSince.clear();
             counterEpoch = fence;
         }
     }
@@ -231,7 +234,10 @@ public final class CollectorState {
      * @param channelId   the OIE channel id
      * @param windowStart start of the evaluation window being judged
      */
-    public boolean isChannelStartedThroughout(String channelId, Instant windowStart) {
+    public synchronized boolean isChannelStartedThroughout(String channelId, Instant windowStart) {
+        // An evaluator can run before the first collector tick after failback.
+        // Do not reuse the prior leader epoch's started stamps or cadence history.
+        if (!counterEpoch.equals(SentinelLeadership.captureFence())) return false;
         Instant since = startedSince.get(channelId);
         return since != null && !since.isAfter(windowStart);
     }

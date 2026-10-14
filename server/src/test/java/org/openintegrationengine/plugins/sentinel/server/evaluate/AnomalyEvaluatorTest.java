@@ -72,19 +72,28 @@ class AnomalyEvaluatorTest {
     private static final Instant HOUR_START =
             NOW.truncatedTo(ChronoUnit.HOURS).minus(1, ChronoUnit.HOURS);
 
+    private MockedStatic<ActivityCoverage> coverage;
     private MockedStatic<ActivityRepository> activityRepository;
     private MockedStatic<BaselineResolver> baselineResolver;
 
     @BeforeEach
     void setUp() {
+        coverage = Mockito.mockStatic(ActivityCoverage.class);
+        coverage.when(() -> ActivityCoverage.covers(Mockito.anyString(), Mockito.any(), Mockito.any()))
+                .thenReturn(true);
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
+        activityRepository.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
         baselineResolver = Mockito.mockStatic(BaselineResolver.class);
+        org.openintegrationengine.plugins.sentinel.server.engine.CollectorState.getInstance().markChannelStarted(CHANNEL_ID, HOUR_START.minusSeconds(1));
     }
 
     @AfterEach
     void tearDown() {
+        org.openintegrationengine.plugins.sentinel.server.engine.CollectorState.getInstance().forgetChannel(CHANNEL_ID);
         baselineResolver.close();
         activityRepository.close();
+        coverage.close();
     }
 
     // ---------------------------------------------------------------- helpers

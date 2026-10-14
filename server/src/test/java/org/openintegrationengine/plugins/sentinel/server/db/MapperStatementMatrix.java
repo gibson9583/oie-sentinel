@@ -54,6 +54,52 @@ final class MapperStatementMatrix {
         }
         verifyPendingOutboxValues(database, sessions, seed);
         verifyActiveDeploymentInventory(database, sessions, seed);
+        verifyActivityTimestampPages(database, sessions, seed);
+    }
+
+    /** Bounded keyset reads preserve endpoints and collapse duplicate observations. */
+    private static void verifyActivityTimestampPages(DatabaseMatrixSupport.MatrixDatabase database,
+            SqlSessionFactory sessions, Seed seed) throws Exception {
+        Timestamp start = Timestamp.from(Instant.parse("2026-08-30T12:00:00.123Z"));
+        Timestamp end = Timestamp.from(start.toInstant().plusSeconds(4));
+        try (Connection connection = database.open()) {
+            connection.setAutoCommit(false);
+            SqlSession session = sessions.openSession(connection);
+            try {
+                try {
+                    Map<String, Object> sample = parameters(seed);
+                    sample.put("channel_id", "coverage-pages");
+                    for (int second : new int[] {-1, 0, 0, 1, 2, 2, 3, 4, 5}) {
+                        sample.put("sample_time", Timestamp.from(start.toInstant().plusSeconds(second)));
+                        session.insert("Sentinel.insertActivitySample", sample);
+                    }
+                    sample.put("channel_id", "different-channel");
+                    sample.put("sample_time", Timestamp.from(start.toInstant().plusMillis(500)));
+                    session.insert("Sentinel.insertActivitySample", sample);
+                    Map<String, Object> query = new HashMap<>();
+                    query.put("channelId", "coverage-pages");
+                    query.put("from", start);
+                    query.put("to", end);
+                    query.put("limit", 2);
+                    List<Timestamp> all = new ArrayList<>();
+                    for (int pageSize : new int[] {2, 2, 1, 0}) {
+                        List<Timestamp> page = session.selectList("Sentinel.listActivitySampleTimes", query);
+                        assertEquals(pageSize, page.size(), database.vendor() + " timestamp page bound");
+                        all.addAll(page);
+                        if (!page.isEmpty()) query.put("after", page.get(page.size() - 1));
+                    }
+                    assertEquals(java.util.stream.IntStream.rangeClosed(0, 4)
+                            .mapToObj(second -> Timestamp.from(start.toInstant().plusSeconds(second))).toList(), all,
+                            database.vendor() + " inclusive bounds, strict cursor and duplicate elimination");
+                    MatrixEvidenceSupport.observation(database.vendor(), "activity-timestamp-pages", all);
+                } finally {
+                    session.rollback();
+                    connection.rollback();
+                }
+            } finally {
+                session.close();
+            }
+        }
     }
 
     /** Syntax-only execution misses result-map casing errors on Derby and Oracle. */
