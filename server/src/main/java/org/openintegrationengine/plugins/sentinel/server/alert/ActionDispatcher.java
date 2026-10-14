@@ -1770,12 +1770,7 @@ public final class ActionDispatcher {
                     TRANSPORT_TIMEOUT_SECONDS, TimeUnit.SECONDS, () -> {
                         dispatchFence.set(fence);
                         try {
-                            if (!lifecycleStillCurrent(event, resolvedPhase)
-                                    || currentDecision(event) != NotificationSuppression.Decision.ALLOW
-                                    || !SentinelLeadership.recheckFence(fence)) {
-                                throw new DispatchDeferredException(
-                                        "Lifecycle, notification policy, or leadership changed before delivery");
-                            }
+                            requireCurrentDispatchState(event, resolvedPhase, fence);
                             // The target alone cannot authorize an escalation: any
                             // upstream link can be disabled or edited, and the
                             // originating source can cease matching while work
@@ -1785,6 +1780,9 @@ public final class ActionDispatcher {
                                 verifyActionAtTransport(authorizingSources.get(index), payload, false, index == 0);
                             }
                             verifyActionAtTransport(action, payload, resolvedPhase, authorizingSources.isEmpty());
+                            // The action lookups can be slow. Recheck so a lifecycle,
+                            // policy, or leadership change during them cannot send.
+                            requireCurrentDispatchState(event, resolvedPhase, fence);
                             receipt.transportAttempted = true;
                         } finally {
                             dispatchFence.remove();
@@ -1820,6 +1818,20 @@ public final class ActionDispatcher {
             log.error("Failed to record dispatch log for action {} on alert event {}",
                     action.getId(), event.getId(), t);
             return false;
+        }
+    }
+
+    /**
+     * Defers the send unless the alert lifecycle, notification policy and
+     * leadership fence still allow it. Leadership is checked last so the
+     * fence is as fresh as possible when the transport starts.
+     */
+    private static void requireCurrentDispatchState(AlertEvent event, boolean resolvedPhase, LeaseFence fence) {
+        if (!lifecycleStillCurrent(event, resolvedPhase)
+                || currentDecision(event) != NotificationSuppression.Decision.ALLOW
+                || !SentinelLeadership.recheckFence(fence)) {
+            throw new DispatchDeferredException(
+                    "Lifecycle, notification policy, or leadership changed before delivery");
         }
     }
 
