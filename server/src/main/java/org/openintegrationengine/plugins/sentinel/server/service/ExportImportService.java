@@ -486,10 +486,11 @@ public final class ExportImportService {
      * condition rows.
      *
      * <p>The ordering is a repeated-pass loop rather than a sort: each monitor
-     * has at most one parent, so "can this land yet?" is a single containment
-     * check against the names already available (everything on this server,
-     * plus everything this run has landed), and a pass that lands nothing
-     * proves the remainder is unresolvable. That also makes a circular chain —
+     * must wait for document-defined ancestors to land successfully or be
+     * unchanged, including ancestors reached through destination-only rows.
+     * An old persisted definition cannot stand in for a rejected replacement.
+     * A pass that lands nothing proves the remainder is unresolvable. That
+     * also makes a circular chain —
      * only reachable through a hand-edited document, since
      * {@code MonitorService} rejects cycles on save — terminate as a reported
      * skip instead of spinning.</p>
@@ -539,27 +540,38 @@ public final class ExportImportService {
             if (problem == null) {
                 pending.add(node);
             } else {
+                index.rejectName(name, problem);
                 entries.add(new ImportEntry(TYPE_MONITOR, name).skipped(
                         "Monitor '" + name + "' " + problem + "; this monitor was left untouched"));
             }
         }
 
+        Set<String> resolvedNames = new LinkedHashSet<>();
         while (!pending.isEmpty()) {
             List<JsonNode> deferred = new ArrayList<>();
             boolean progressed = false;
             for (JsonNode node : pending) {
                 String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
-                if (!isBlank(parentName) && !index.has(parentName)) {
+                if ((!isBlank(parentName) && !index.has(parentName))
+                        || hasUnresolvedMonitorDependency(node, index, documentNames, resolvedNames)) {
                     deferred.add(node);
                     continue;
                 }
-                entries.add(applyMonitor(node, index, userId));
+                ImportEntry entry = applyMonitor(node, index, userId);
+                entries.add(entry);
+                if (!OUTCOME_SKIPPED.equals(entry.getOutcome()) || REASON_UNCHANGED.equals(entry.getReason())) {
+                    resolvedNames.add(nameKey(entry.getName()));
+                } else if (!isBlank(entry.getName())) {
+                    index.rejectName(entry.getName(), "was rejected during this import");
+                }
                 progressed = true;
             }
             if (!progressed) {
                 for (JsonNode node : deferred) {
-                    entries.add(new ImportEntry(TYPE_MONITOR, textOrNull(node, "name"))
-                            .skipped(unresolvedParentReason(textOrNull(node, KEY_SUPPRESSED_BY_NAME), documentNames)));
+                    String name = textOrNull(node, "name");
+                    entries.add(new ImportEntry(TYPE_MONITOR, name).skipped(
+                            unresolvedParentReason(textOrNull(node, KEY_SUPPRESSED_BY_NAME), documentNames, index)));
+                    if (!isBlank(name)) index.rejectName(name, "was rejected during this import");
                 }
                 break;
             }
@@ -568,19 +580,39 @@ public final class ExportImportService {
         return index;
     }
 
+    /** Follow existing links by id, as with destination-only action escalation chains. */
+    private static boolean hasUnresolvedMonitorDependency(JsonNode node, MonitorIndex monitors,
+            Set<String> documentNames, Set<String> resolvedNames) {
+        String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
+        if (isBlank(parentName)) return false;
+        if (documentNames.contains(nameKey(parentName)) && !resolvedNames.contains(nameKey(parentName))) {
+            return true;
+        }
+        Set<Integer> visited = new LinkedHashSet<>();
+        Monitor parent = monitors.byName(parentName);
+        while (parent != null && visited.add(parent.getId())) {
+            String key = nameKey(parent.getName());
+            if (documentNames.contains(key) && !resolvedNames.contains(key)) return true;
+            parent = monitors.byId(parent.getSuppressedByMonitorId());
+        }
+        return false;
+    }
+
     /**
-     * Explains why a suppression parent could not be resolved, distinguishing
-     * the two causes the operator has to fix differently: a parent this
-     * document never defines (create it on the target, or export it too)
-     * versus a parent the document does define but could not land (its own
-     * entry was skipped, or the chain is circular).
+     * Distinguishes a missing parent from an unresolved document entry, which
+     * may be reached through a destination-only suppression chain.
      */
-    private static String unresolvedParentReason(String parentName, Set<String> documentNames) {
+    private static String unresolvedParentReason(String parentName, Set<String> documentNames, MonitorIndex index) {
         String quoted = "'" + (parentName == null ? "" : parentName) + "'";
         if (parentName != null && documentNames.contains(nameKey(parentName))) {
-            return "Suppressing monitor " + quoted + " is defined in this document but could not be created"
+            return "Suppressing monitor " + quoted + " is defined in this document but could not be imported"
                     + " (its own entry was skipped, or the suppression chain is circular);"
                     + " the dependency was not dropped, so this monitor was left untouched";
+        }
+        if (index.has(parentName)) {
+            return "Suppression chain starting at " + quoted
+                    + " could not be resolved (a referenced entry was skipped, or the chain is circular);"
+                    + " this monitor was left untouched";
         }
         return "Suppressing monitor " + quoted + " does not exist on this server and is not defined in this"
                 + " document; the dependency was not dropped, so this monitor was left untouched";
@@ -613,7 +645,7 @@ public final class ExportImportService {
         incoming.setName(incoming.getName().trim());
 
         String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
-        problem = index.unavailableReason(parentName);
+        problem = index.unavailableReferenceReason(parentName);
         if (problem != null) {
             return entry.skipped("Suppressing monitor '" + parentName + "' " + problem
                     + "; this monitor was left untouched");
@@ -801,7 +833,7 @@ public final class ExportImportService {
         List<String> ambiguousMonitors = new ArrayList<>();
         List<String> unresolved = new ArrayList<>();
         String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), value -> {
-            String problem = monitors.unavailableReason(value);
+            String problem = monitors.unavailableReferenceReason(value);
             if (problem != null) {
                 ambiguousMonitors.add("'" + value + "' " + problem);
                 return null;
@@ -1259,7 +1291,7 @@ public final class ExportImportService {
     /**
      * Preserve every persisted monitor by id for export. Names may only be
      * resolved when unique, including in the incoming document. Rejected
-     * collision dependencies remain unavailable to the later action pass.
+     * definitions and their dependencies remain unavailable to the later action pass.
      *
      * <p>Kept live through the run — every create feeds back into it — so a
      * monitor created early in a document can be a suppression parent or a
@@ -1301,6 +1333,21 @@ public final class ExportImportService {
                     : null;
         }
 
+        /** A destination-only suppression chain must not reuse a rejected document entry. */
+        String unavailableReferenceReason(String name) {
+            String problem = unavailableReason(name);
+            if (problem != null) return problem;
+            Set<Integer> visited = new LinkedHashSet<>();
+            Monitor monitor = byName(name);
+            while (monitor != null && visited.add(monitor.getId())) {
+                if (rejectedNames.containsKey(nameKey(monitor.getName()))) {
+                    return "depends on monitor '" + monitor.getName() + "' that was rejected during this import";
+                }
+                monitor = byId(monitor.getSuppressedByMonitorId());
+            }
+            return null;
+        }
+
         Set<String> unavailableNames() {
             Set<String> names = new LinkedHashSet<>(ambiguousNames);
             names.addAll(rejectedNames.keySet());
@@ -1308,10 +1355,14 @@ public final class ExportImportService {
         }
 
         boolean rejectName(String name, String reason) {
-            if (unavailableReason(name) != null) {
+            String key = nameKey(name);
+            if (rejectedNames.containsKey(key)) {
                 return false;
             }
-            rejectedNames.put(nameKey(name), reason);
+            // Record a rejected document entry even when its name was already
+            // ambiguous, so destination-only chains cannot reuse its old row.
+            String existingProblem = unavailableReason(name);
+            rejectedNames.put(key, existingProblem == null ? reason : existingProblem);
             return true;
         }
 
@@ -1321,6 +1372,10 @@ public final class ExportImportService {
 
         Monitor byName(String name) {
             return name == null || unavailableReason(name) != null ? null : byName.get(nameKey(name));
+        }
+
+        Monitor byId(Integer id) {
+            return id == null ? null : byId.get(id);
         }
 
         boolean has(String name) {
