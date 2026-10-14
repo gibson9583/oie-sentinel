@@ -581,10 +581,9 @@ public final class ActionDispatcher {
 
             for (Action action : actions) {
                 try {
-                    if (!firesOnPhase(action.getOperationMode(), false)) {
-                        continue;
-                    }
-                    if (!ActionConditionMatcher.matches(action, payload)) {
+                    ActionDecision eligibility = actionDecision(action, payload, false);
+                    if (eligibility != ActionDecision.ALLOW) {
+                        entryPassComplete &= eligibility == ActionDecision.INAPPLICABLE;
                         continue;
                     }
                     if (!maybeRepeat(action, allRows, notifiedThisPass,
@@ -1206,10 +1205,12 @@ public final class ActionDispatcher {
             boolean entryPassComplete = true;
             for (Action action : actions) {
                 try {
-                    if (!firesOnPhase(action.getOperationMode(), resolvedPhase)) {
-                        continue;
-                    }
-                    if (!ActionConditionMatcher.matches(action, payload)) {
+                    // Exclusions consume durable work too. A phase/filter edit
+                    // during an earlier send must reach a fresh pass before
+                    // this snapshot can skip it and complete the whole edge.
+                    ActionDecision eligibility = actionDecision(action, payload, resolvedPhase);
+                    if (eligibility != ActionDecision.ALLOW) {
+                        entryPassComplete &= eligibility == ActionDecision.INAPPLICABLE;
                         continue;
                     }
                     if (!resolvedPhase && hasProblemRow(priorRows, action.getId())) {
@@ -1290,9 +1291,12 @@ public final class ActionDispatcher {
         boolean complete = true;
         for (Action action : actions) {
             try {
-                if (!firesOnPhase(action.getOperationMode(), false)
-                        || !ActionConditionMatcher.matches(action, problemPayload)
-                        || hasProblemRow(priorRows, action.getId())) {
+                ActionDecision eligibility = actionDecision(action, problemPayload, false);
+                if (eligibility != ActionDecision.ALLOW) {
+                    complete &= eligibility == ActionDecision.INAPPLICABLE;
+                    continue;
+                }
+                if (hasProblemRow(priorRows, action.getId())) {
                     continue;
                 }
                 if (!gatedAttempt(action, event, effectivePayload, false)) {
