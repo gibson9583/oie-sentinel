@@ -233,7 +233,10 @@ class ActionMonitorIdentityImportPersistenceTest extends MonitorIdentityDatabase
             assertFalse(matches(existing, intended.getId()));
             ObjectNode document = ExportImportService.export();
             document.remove("monitors");
-            ((ObjectNode) document.path("actions").get(0)).put("conditionJson", condition("=", " pAgEr "));
+            ObjectNode repaired = (ObjectNode) document.path("actions").get(0);
+            repaired.put("conditionJson", condition("=", " pAgEr "));
+            // This is an explicit repair, not an unedited unresolved export.
+            repaired.remove("unresolvedMonitorIds");
 
             var result = ExportImportService.importDocument(document, 99);
             assertEquals(1, result.getUpdated());

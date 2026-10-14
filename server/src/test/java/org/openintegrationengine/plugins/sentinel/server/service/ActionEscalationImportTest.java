@@ -30,7 +30,7 @@ class ActionEscalationImportTest {
                 db.put(action(1, "Primary", 7));
                 db.put(action(7, "Pager", null));
                 ObjectNode document = ExportImportService.export();
-                assertEquals(2, document.path("schemaVersion").asInt());
+                assertEquals(3, document.path("schemaVersion").asInt());
                 JsonNode primary = document.path("actions").get(0);
                 assertFalse(primary.has("id"));
                 assertFalse(primary.has("escalateToActionId"));
