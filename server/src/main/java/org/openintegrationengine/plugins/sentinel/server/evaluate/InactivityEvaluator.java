@@ -61,6 +61,10 @@ public final class InactivityEvaluator {
      *         not covered the whole window yet
      */
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
+        return ActivityRepository.readActivitySnapshot(() -> evaluateSnapshot(monitor, channelId, now));
+    }
+
+    private static EvaluationOutcome evaluateSnapshot(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         int windowSeconds = Math.max(1, config.path("noDataForSeconds").asInt(DEFAULT_NO_DATA_FOR_SECONDS));
         Instant windowStart = now.minusSeconds(windowSeconds);

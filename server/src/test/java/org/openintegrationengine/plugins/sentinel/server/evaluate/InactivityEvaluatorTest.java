@@ -63,6 +63,8 @@ class InactivityEvaluatorTest {
         settings.when(org.openintegrationengine.plugins.sentinel.server.service.SettingsService::get)
                 .thenReturn(new org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings());
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
+        activityRepository.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
         triggerStateRepository = Mockito.mockStatic(TriggerStateRepository.class);
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
     }

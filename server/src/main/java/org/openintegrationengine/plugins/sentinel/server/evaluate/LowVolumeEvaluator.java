@@ -79,6 +79,10 @@ public final class LowVolumeEvaluator {
      *         BASELINE_RELATIVE mode has no baseline to compare against yet
      */
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
+        return ActivityRepository.readActivitySnapshot(() -> evaluateSnapshot(monitor, channelId, now));
+    }
+
+    private static EvaluationOutcome evaluateSnapshot(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         int windowSeconds = Math.max(1, config.path("windowSeconds").asInt(DEFAULT_WINDOW_SECONDS));
         String compareTo = config.path("compareTo").asText("FIXED");

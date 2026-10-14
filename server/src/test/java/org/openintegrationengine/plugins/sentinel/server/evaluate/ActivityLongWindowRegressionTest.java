@@ -41,6 +41,8 @@ class ActivityLongWindowRegressionTest {
         try (var config = mockStatic(SettingsService.class); var repo = mockStatic(ActivityRepository.class);
                 var states = mockStatic(TriggerStateRepository.class)) {
             config.when(SettingsService::get).thenReturn(settings);
+            repo.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
+                    .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             repo.when(() -> ActivityRepository.sumActivitySamplesForRange(eq(channel), any(), any()))
                     .thenReturn(new ActivityAggregate());
             repo.when(() -> ActivityRepository.listActivitySampleTimes(eq(channel), any(), any(), nullable(Instant.class), anyInt()))

@@ -81,6 +81,10 @@ public final class AnomalyEvaluator {
      *         INSUFFICIENT_DATA when no baseline tier has enough history yet
      */
     public static EvaluationOutcome evaluate(Monitor monitor, String channelId, Instant now) {
+        return ActivityRepository.readActivitySnapshot(() -> evaluateSnapshot(monitor, channelId, now));
+    }
+
+    private static EvaluationOutcome evaluateSnapshot(Monitor monitor, String channelId, Instant now) {
         JsonNode config = parseConfig(monitor.getConfigJson());
         String metric = config.path("metric").asText("RECEIVED");
         double zScoreThreshold = config.path("zScoreThreshold").asDouble(DEFAULT_Z_SCORE_THRESHOLD);

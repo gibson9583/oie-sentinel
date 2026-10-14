@@ -80,6 +80,8 @@ class LowVolumeEvaluatorTest {
         coverage.when(() -> ActivityCoverage.covers(Mockito.anyString(), Mockito.any(), Mockito.any()))
                 .thenReturn(true);
         activityRepository = Mockito.mockStatic(ActivityRepository.class);
+        activityRepository.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
         triggerStateRepository = Mockito.mockStatic(TriggerStateRepository.class);
         CollectorState.getInstance().forgetChannel(CHANNEL_ID);
     }

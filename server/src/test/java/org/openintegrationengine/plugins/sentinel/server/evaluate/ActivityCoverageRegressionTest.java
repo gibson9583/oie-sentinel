@@ -39,6 +39,8 @@ class ActivityCoverageRegressionTest {
                 var activity = mockStatic(ActivityRepository.class);
                 var baseline = mockStatic(BaselineResolver.class)) {
             settings.when(SettingsService::get).thenReturn(config);
+            activity.when(() -> ActivityRepository.readActivitySnapshot(org.mockito.ArgumentMatchers.any()))
+                    .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(0)).get());
             activity.when(() -> ActivityRepository.listActivitySampleTimes(eq(CHANNEL), any(), any(), isNull(), anyInt()))
                     .thenAnswer(call -> samples.stream().map(ActivitySample::getSampleTime).toList());
             activity.when(() -> ActivityRepository.sumActivitySamplesForRange(eq(CHANNEL), any(), any()))

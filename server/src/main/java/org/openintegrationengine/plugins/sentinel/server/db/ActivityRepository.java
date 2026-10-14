@@ -11,9 +11,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionManager;
+import org.apache.ibatis.session.TransactionIsolationLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,7 +37,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * so unlike {@code RbacRepository} this class carries no constructor-time
  * setup and needs no singleton lifecycle — plain static methods are
  * sufficient. Most statements here are a single MyBatis call and use
- * auto-commit. Two methods are not: {@link #replaceActivityTrendForHour(ActivityTrend)}
+ * auto-commit outside {@link #readActivitySnapshot(Supplier)}, which shares a
+ * managed read transaction across an evaluation's totals, coverage and baseline.
+ * Two write methods also use explicit transactions:
+ * {@link #replaceActivityTrendForHour(ActivityTrend)}
  * is a multi-statement sequence (delete-then-reinsert) and opens a
  * manual-commit session so a mid-flight failure leaves the prior bucket in
  * place rather than a deleted-but-not-reinserted gap, and
@@ -51,6 +57,44 @@ public final class ActivityRepository {
     private static final Logger log = LoggerFactory.getLogger(ActivityRepository.class);
 
     private ActivityRepository() {
+    }
+
+    /**
+     * Keeps totals, coverage pages and baseline reads in one database snapshot.
+     * A late collector insert must not certify an older aggregate, and retention
+     * must not remove measured rows between coverage and aggregation. SERIALIZABLE
+     * is supported by all five packaged databases, unlike REPEATABLE_READ on
+     * Oracle. Locking implementations may briefly delay collector/pruner writes;
+     * snapshot implementations keep this reader on one consistent version.
+     * No incident mutation or transport submission belongs inside this read scope.
+     */
+    public static <T> T readActivitySnapshot(Supplier<T> read) {
+        SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
+        if (sessions.isManagedSessionStarted()) {
+            throw new IllegalStateException("Nested activity read transaction");
+        }
+        sessions.startManagedSession(TransactionIsolationLevel.SERIALIZABLE);
+        Throwable failure = null;
+        try {
+            T result = read.get();
+            sessions.commit(true);
+            return result;
+        } catch (RuntimeException | Error error) {
+            failure = error;
+            try {
+                sessions.rollback(true);
+            } catch (RuntimeException | Error rollback) {
+                error.addSuppressed(rollback);
+            }
+            throw error;
+        } finally {
+            try {
+                sessions.close();
+            } catch (RuntimeException | Error close) {
+                if (failure == null) throw close;
+                failure.addSuppressed(close);
+            }
+        }
     }
 
     /** Qualifies a mapped-statement id with the plugin's MyBatis namespace. */
