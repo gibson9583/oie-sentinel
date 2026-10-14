@@ -15,6 +15,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import java.util.function.Consumer;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionType;
@@ -542,6 +545,8 @@ class ActionEscalationImportTest {
     private static final class Store implements AutoCloseable {
         final Map<Integer, Action> rows = new LinkedHashMap<>();
         final List<Monitor> monitorRows = new ArrayList<>();
+        final MockedStatic<AlertLifecycleTransaction> transaction = mockStatic(AlertLifecycleTransaction.class);
+        final MockedStatic<MonitorRepository> monitorRepository = mockStatic(MonitorRepository.class);
         final MockedStatic<ActionRepository> repository = mockStatic(ActionRepository.class);
         final MockedStatic<SentinelAuditLog> audit = mockStatic(SentinelAuditLog.class);
         final MockedStatic<MonitorService> monitors = mockStatic(MonitorService.class);
@@ -549,6 +554,12 @@ class ActionEscalationImportTest {
         int nextId = 1000;
         int writes;
         Store() {
+            transaction.when(() -> AlertLifecycleTransaction.execute(any(Consumer.class))).thenAnswer(i -> {
+                List<Runnable> afterCommit = new ArrayList<>();
+                i.<Consumer<List<Runnable>>>getArgument(0).accept(afterCommit);
+                afterCommit.forEach(Runnable::run);
+                return null;
+            });
             repository.when(() -> ActionRepository.listActions(null)).thenAnswer(i -> new ArrayList<>(rows.values()));
             repository.when(() -> ActionRepository.getAction(anyInt())).thenAnswer(i -> rows.get(i.getArgument(0)));
             repository.when(() -> ActionRepository.insertAction(any(Action.class))).thenAnswer(i -> {
@@ -561,6 +572,6 @@ class ActionEscalationImportTest {
         }
         void put(Action action) { rows.put(action.getId(), action); }
         Action named(String name) { return rows.values().stream().filter(a -> name.equals(a.getName())).findFirst().orElse(null); }
-        public void close() { windows.close(); monitors.close(); audit.close(); repository.close(); }
+        public void close() { transaction.close(); monitorRepository.close(); windows.close(); monitors.close(); audit.close(); repository.close(); }
     }
 }

@@ -46,6 +46,15 @@ public final class ActionRepository {
         return NAMESPACE + "." + id;
     }
 
+    /** Hold this row until the caller's managed transaction ends. */
+    public static void lockAction(int id) {
+        var sessions = SqlConfig.getInstance().getSqlSessionManager();
+        if (!sessions.isManagedSessionStarted()) {
+            throw new IllegalStateException("Import reference locks require a transaction");
+        }
+        sessions.selectOne(stmt("lockAction"), id);
+    }
+
     /**
      * Fetches one action by its database id.
      *

@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.service;
 
 import java.time.Instant;
+import java.util.function.Consumer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -132,6 +133,11 @@ public final class ActionService {
      *                                  stored value to keep)
      */
     public static Action create(Action action, int userId) {
+        return create(action, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Action create(Action action, int userId, Consumer<Runnable> afterCommit) {
         prepareSecrets(action, null);
         validate(action, null);
         Instant now = Instant.now();
@@ -141,7 +147,7 @@ public final class ActionService {
         action.setUpdatedBy(userId);
         action.setUpdatedTime(now);
         ActionRepository.insertAction(action);
-        SentinelAuditLog.actionCreated(userId, action);
+        afterCommit.accept(() -> SentinelAuditLog.actionCreated(userId, action));
         return redact(action);
     }
 
@@ -163,6 +169,11 @@ public final class ActionService {
      * @throws IllegalArgumentException if validation fails
      */
     public static Action update(int id, Action action, int userId) {
+        return update(id, action, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Action update(int id, Action action, int userId, Consumer<Runnable> afterCommit) {
         Action existing = getUnredacted(id);
         prepareSecrets(action, existing);
         validate(action, id);
@@ -172,7 +183,7 @@ public final class ActionService {
         action.setUpdatedBy(userId);
         action.setUpdatedTime(Instant.now());
         ActionRepository.updateAction(action);
-        SentinelAuditLog.actionUpdated(userId, action);
+        afterCommit.accept(() -> SentinelAuditLog.actionUpdated(userId, action));
         return redact(action);
     }
 

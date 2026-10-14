@@ -20,6 +20,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedStatic;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import java.util.function.Consumer;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionType;
@@ -30,12 +32,20 @@ class WebhookSecretLifecycleTest {
     private static final String URL = "https://203.0.113.10/hooks/PATH_SECRET?token=QUERY_SECRET";
     private static final String TEMPLATE = "{\"routing_key\":\"BODY_SECRET\",\"text\":\"${message}\"}";
     private final Map<Integer, Action> rows = new LinkedHashMap<>();
+    private MockedStatic<AlertLifecycleTransaction> transaction;
     private MockedStatic<ActionRepository> repository;
     private MockedStatic<SettingsCrypto> crypto;
     private MockedStatic<SentinelAuditLog> audit;
 
     @BeforeEach
     void isolatePersistenceAndEngineEncryption() {
+        transaction = mockStatic(AlertLifecycleTransaction.class);
+        transaction.when(() -> AlertLifecycleTransaction.execute(any(Consumer.class))).thenAnswer(i -> {
+            List<Runnable> afterCommit = new ArrayList<>();
+            i.<Consumer<List<Runnable>>>getArgument(0).accept(afterCommit);
+            afterCommit.forEach(Runnable::run);
+            return null;
+        });
         repository = mockStatic(ActionRepository.class);
         crypto = mockStatic(SettingsCrypto.class);
         audit = mockStatic(SentinelAuditLog.class);
@@ -53,7 +63,7 @@ class WebhookSecretLifecycleTest {
 
     @AfterEach
     void closeMocks() {
-        audit.close(); crypto.close(); repository.close();
+        transaction.close(); audit.close(); crypto.close(); repository.close();
     }
 
     @Test

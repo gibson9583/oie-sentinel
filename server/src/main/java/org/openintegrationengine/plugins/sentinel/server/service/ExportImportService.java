@@ -17,6 +17,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.UnaryOperator;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -26,6 +27,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
+import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
+import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
+import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -316,15 +320,15 @@ public final class ExportImportService {
      *
      * <p>An explicit JSON {@code null} is written when there is no parent, so
      * the key is always present and its absence in a document is unambiguous
-     * (a hand-written entry that omits it simply has no parent). An id that
-     * resolves to no monitor — which the foreign key makes unreachable in
-     * practice — also writes {@code null}: the source server's serial would be
-     * meaningless on the target, and import reports a genuinely missing parent
-     * from the name side.</p>
+     * (a hand-written entry that omits it simply has no parent). If a parent
+     * is missing from the export snapshot, retain its source id as an unresolved
+     * diagnostic. Import rejects it rather than silently removing suppression.</p>
      */
     private static ObjectNode monitorNode(Monitor monitor, String parentName) {
         ObjectNode node = portable(monitor);
-        node.remove(FIELD_SUPPRESSED_BY_ID);
+        if (parentName != null || monitor.getSuppressedByMonitorId() == null) {
+            node.remove(FIELD_SUPPRESSED_BY_ID);
+        }
         node.set(KEY_SUPPRESSED_BY_NAME, parentName == null ? NullNode.getInstance() : TextNode.valueOf(parentName));
         return node;
     }
@@ -486,10 +490,11 @@ public final class ExportImportService {
      * condition rows.
      *
      * <p>The ordering is a repeated-pass loop rather than a sort: each monitor
-     * has at most one parent, so "can this land yet?" is a single containment
-     * check against the names already available (everything on this server,
-     * plus everything this run has landed), and a pass that lands nothing
-     * proves the remainder is unresolvable. That also makes a circular chain —
+     * must wait for document-defined ancestors to land successfully or be
+     * unchanged, including ancestors reached through destination-only rows.
+     * An old persisted definition cannot stand in for a rejected replacement.
+     * A pass that lands nothing proves the remainder is unresolvable. That
+     * also makes a circular chain —
      * only reachable through a hand-edited document, since
      * {@code MonitorService} rejects cycles on save — terminate as a reported
      * skip instead of spinning.</p>
@@ -535,31 +540,43 @@ public final class ExportImportService {
         List<JsonNode> pending = new ArrayList<>();
         for (JsonNode node : nodes) {
             String name = textOrNull(node, "name");
-            String problem = index.unavailableReason(name);
+            String problem = monitorReferenceProblem(node);
+            if (problem == null) problem = index.unavailableReason(name);
             if (problem == null) {
                 pending.add(node);
             } else {
+                index.rejectName(name, problem);
                 entries.add(new ImportEntry(TYPE_MONITOR, name).skipped(
                         "Monitor '" + name + "' " + problem + "; this monitor was left untouched"));
             }
         }
 
+        Set<String> resolvedNames = new LinkedHashSet<>();
         while (!pending.isEmpty()) {
             List<JsonNode> deferred = new ArrayList<>();
             boolean progressed = false;
             for (JsonNode node : pending) {
                 String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
-                if (!isBlank(parentName) && !index.has(parentName)) {
+                if ((!isBlank(parentName) && !index.has(parentName))
+                        || hasUnresolvedMonitorDependency(node, index, documentNames, resolvedNames)) {
                     deferred.add(node);
                     continue;
                 }
-                entries.add(applyMonitor(node, index, userId));
+                ImportEntry entry = applyMonitor(node, index, userId);
+                entries.add(entry);
+                if (!OUTCOME_SKIPPED.equals(entry.getOutcome()) || REASON_UNCHANGED.equals(entry.getReason())) {
+                    resolvedNames.add(nameKey(entry.getName()));
+                } else if (!isBlank(entry.getName())) {
+                    index.rejectName(entry.getName(), "was rejected during this import");
+                }
                 progressed = true;
             }
             if (!progressed) {
                 for (JsonNode node : deferred) {
-                    entries.add(new ImportEntry(TYPE_MONITOR, textOrNull(node, "name"))
-                            .skipped(unresolvedParentReason(textOrNull(node, KEY_SUPPRESSED_BY_NAME), documentNames)));
+                    String name = textOrNull(node, "name");
+                    entries.add(new ImportEntry(TYPE_MONITOR, name).skipped(
+                            unresolvedParentReason(textOrNull(node, KEY_SUPPRESSED_BY_NAME), documentNames, index)));
+                    if (!isBlank(name)) index.rejectName(name, "was rejected during this import");
                 }
                 break;
             }
@@ -568,19 +585,39 @@ public final class ExportImportService {
         return index;
     }
 
+    /** Follow existing links by id, as with destination-only action escalation chains. */
+    private static boolean hasUnresolvedMonitorDependency(JsonNode node, MonitorIndex monitors,
+            Set<String> documentNames, Set<String> resolvedNames) {
+        String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
+        if (isBlank(parentName)) return false;
+        if (documentNames.contains(nameKey(parentName)) && !resolvedNames.contains(nameKey(parentName))) {
+            return true;
+        }
+        Set<Integer> visited = new LinkedHashSet<>();
+        Monitor parent = monitors.byName(parentName);
+        while (parent != null && visited.add(parent.getId())) {
+            String key = nameKey(parent.getName());
+            if (documentNames.contains(key) && !resolvedNames.contains(key)) return true;
+            parent = monitors.byId(parent.getSuppressedByMonitorId());
+        }
+        return false;
+    }
+
     /**
-     * Explains why a suppression parent could not be resolved, distinguishing
-     * the two causes the operator has to fix differently: a parent this
-     * document never defines (create it on the target, or export it too)
-     * versus a parent the document does define but could not land (its own
-     * entry was skipped, or the chain is circular).
+     * Distinguishes a missing parent from an unresolved document entry, which
+     * may be reached through a destination-only suppression chain.
      */
-    private static String unresolvedParentReason(String parentName, Set<String> documentNames) {
+    private static String unresolvedParentReason(String parentName, Set<String> documentNames, MonitorIndex index) {
         String quoted = "'" + (parentName == null ? "" : parentName) + "'";
         if (parentName != null && documentNames.contains(nameKey(parentName))) {
-            return "Suppressing monitor " + quoted + " is defined in this document but could not be created"
+            return "Suppressing monitor " + quoted + " is defined in this document but could not be imported"
                     + " (its own entry was skipped, or the suppression chain is circular);"
                     + " the dependency was not dropped, so this monitor was left untouched";
+        }
+        if (index.has(parentName)) {
+            return "Suppression chain starting at " + quoted
+                    + " could not be resolved (a referenced entry was skipped, or the chain is circular);"
+                    + " this monitor was left untouched";
         }
         return "Suppressing monitor " + quoted + " does not exist on this server and is not defined in this"
                 + " document; the dependency was not dropped, so this monitor was left untouched";
@@ -613,7 +650,7 @@ public final class ExportImportService {
         incoming.setName(incoming.getName().trim());
 
         String parentName = textOrNull(node, KEY_SUPPRESSED_BY_NAME);
-        problem = index.unavailableReason(parentName);
+        problem = index.unavailableReferenceReason(parentName);
         if (problem != null) {
             return entry.skipped("Suppressing monitor '" + parentName + "' " + problem
                     + "; this monitor was left untouched");
@@ -625,22 +662,41 @@ public final class ExportImportService {
             return entry.skipped("Suppressing monitor '" + parentName + "' could not be resolved on this server");
         }
         Monitor existing = index.byName(name);
-        if (existing != null && sameDefinition(monitorNode(incoming, parent == null ? null : parent.getName()),
-                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())))) {
-            return entry.skipped(REASON_UNCHANGED);
-        }
         incoming.setSuppressedByMonitorId(parent == null ? null : parent.getId());
-
+        boolean unchanged = existing != null && sameDefinition(
+                monitorNode(incoming, parent == null ? null : parent.getName()),
+                monitorNode(existing, index.nameOf(existing.getSuppressedByMonitorId())));
+        Map<Integer, Monitor> references = new TreeMap<>();
+        collectMonitorChain(parent, index, references);
+        if (existing != null) references.put(existing.getId(), existing);
+        Monitor[] saved = new Monitor[1];
         try {
-            if (existing == null) {
-                index.put(MonitorService.create(incoming, userId));
-                return entry.created();
-            }
-            index.put(MonitorService.update(existing.getId(), incoming, userId));
-            return entry.updated();
+            AlertLifecycleTransaction.execute(afterCommit -> {
+                lockAndValidateReferences(references, referenceIds(existing == null ? null : existing.getId(),
+                        parent == null ? null : parent.getId()), Map.of(), Set.of());
+                if (!unchanged) {
+                    saved[0] = existing == null
+                            ? MonitorService.create(incoming, userId, afterCommit::add)
+                            : MonitorService.update(existing.getId(), incoming, userId, afterCommit::add);
+                }
+            });
+            if (saved[0] != null) index.put(saved[0]);
+            return unchanged ? entry.skipped(REASON_UNCHANGED) : existing == null ? entry.created() : entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
         }
+    }
+
+    private static String monitorReferenceProblem(JsonNode node) {
+        if (node != null && node.hasNonNull(FIELD_SUPPRESSED_BY_ID)) {
+            return "Source suppressedByMonitorId cannot be resolved safely; replace it with"
+                    + " suppressedByMonitorName before importing";
+        }
+        JsonNode parent = node == null ? null : node.get(KEY_SUPPRESSED_BY_NAME);
+        if (parent != null && !parent.isNull() && (!parent.isTextual() || parent.asText().isBlank())) {
+            return "suppressedByMonitorName must be a non-blank monitor name or null";
+        }
+        return null;
     }
 
     // ========== Import: actions ==========
@@ -800,8 +856,10 @@ public final class ExportImportService {
         incoming.setEscalateToActionId(target == null ? null : target.getId());
         List<String> ambiguousMonitors = new ArrayList<>();
         List<String> unresolved = new ArrayList<>();
+        Map<Integer, Monitor> monitorReferences = new TreeMap<>();
+        Set<Integer> namedMonitors = new LinkedHashSet<>();
         String resolvedCondition = mapMonitorConditionValues(incoming.getConditionJson(), value -> {
-            String problem = monitors.unavailableReason(value);
+            String problem = monitors.unavailableReferenceReason(value);
             if (problem != null) {
                 ambiguousMonitors.add("'" + value + "' " + problem);
                 return null;
@@ -811,6 +869,8 @@ public final class ExportImportService {
                 unresolved.add(value);
                 return null;
             }
+            namedMonitors.add(id);
+            collectMonitorChain(monitors.byId(id), monitors, monitorReferences);
             return String.valueOf(id);
         });
         // Both sides now refer to destination ids. The runtime compares
@@ -846,11 +906,7 @@ public final class ExportImportService {
                     + String.join(", ", unresolved)
                     + "; the condition was not widened, so this action was left untouched");
         }
-        if (unchanged) {
-            return entry.skipped(REASON_UNCHANGED);
-        }
-
-        if (!secrets.required.isEmpty()) {
+        if (!unchanged && !secrets.required.isEmpty()) {
             // Dropping an unavailable body template can replace a carefully
             // limited payload with the full alert; dropping an auth header can
             // send it unauthenticated. Preserve the whole action until every
@@ -863,15 +919,74 @@ public final class ExportImportService {
         incoming.setConditionJson(resolvedCondition);
         incoming.setConfigJson(secrets.configJson);
 
+        Map<Integer, Action> actionReferences = new TreeMap<>();
+        for (Action next = target; next != null && !actionReferences.containsKey(next.getId());
+                next = actions.byId(next.getEscalateToActionId())) {
+            actionReferences.put(next.getId(), next);
+        }
+        if (existing != null) actionReferences.put(existing.getId(), existing);
+        Action[] saved = new Action[1];
         try {
-            if (existing == null) {
-                actions.put(ActionService.create(incoming, userId));
-                return entry.created();
-            }
-            actions.put(ActionService.update(existing.getId(), incoming, userId));
-            return entry.updated();
+            AlertLifecycleTransaction.execute(afterCommit -> {
+                lockAndValidateReferences(monitorReferences, namedMonitors, actionReferences,
+                        referenceIds(existing == null ? null : existing.getId(), target == null ? null : target.getId()));
+                if (!unchanged) {
+                    saved[0] = existing == null
+                            ? ActionService.create(incoming, userId, afterCommit::add)
+                            : ActionService.update(existing.getId(), incoming, userId, afterCommit::add);
+                }
+            });
+            if (saved[0] != null) actions.put(saved[0]);
+            return unchanged ? entry.skipped(REASON_UNCHANGED) : existing == null ? entry.created() : entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        }
+    }
+
+    private static void collectMonitorChain(Monitor monitor, MonitorIndex index, Map<Integer, Monitor> references) {
+        while (monitor != null && !references.containsKey(monitor.getId())) {
+            references.put(monitor.getId(), monitor);
+            monitor = index.byId(monitor.getSuppressedByMonitorId());
+        }
+    }
+
+    private static Set<Integer> referenceIds(Integer... ids) {
+        Set<Integer> present = new LinkedHashSet<>();
+        for (Integer id : ids) if (id != null) present.add(id);
+        return present;
+    }
+
+    /**
+     * Lock in one order, then recheck the snapshot used for prerequisite ordering
+     * and name resolution. Holding every referenced row prevents rename/delete or
+     * chain rewrites between this check and the entry's write (including unchanged
+     * entries that unlock later dependents). A changed snapshot needs a fresh retry.
+     */
+    private static void lockAndValidateReferences(Map<Integer, Monitor> monitors, Set<Integer> namedMonitors,
+            Map<Integer, Action> actions, Set<Integer> namedActions) {
+        monitors.keySet().forEach(MonitorRepository::lockMonitor);
+        actions.keySet().forEach(ActionRepository::lockAction);
+        if (!monitors.isEmpty()) {
+            MonitorIndex current = MonitorIndex.of(MonitorService.list());
+            for (Monitor expected : monitors.values()) {
+                Monitor actual = current.byId(expected.getId());
+                if (actual == null || !portable(expected).equals(portable(actual))
+                        || (namedMonitors.contains(expected.getId()) && current.byName(expected.getName()) != actual)) {
+                    throw new IllegalArgumentException("Monitor '" + expected.getName()
+                            + "' changed during import; retry with the current configuration");
+                }
+            }
+        }
+        if (!actions.isEmpty()) {
+            ActionIndex current = ActionIndex.of(ActionService.list());
+            for (Action expected : actions.values()) {
+                Action actual = current.byId(expected.getId());
+                if (actual == null || !portable(expected).equals(portable(actual))
+                        || (namedActions.contains(expected.getId()) && current.byName(expected.getName()) != actual)) {
+                    throw new IllegalArgumentException("Action '" + expected.getName()
+                            + "' changed during import; retry with the current configuration");
+                }
+            }
         }
     }
 
@@ -1259,7 +1374,7 @@ public final class ExportImportService {
     /**
      * Preserve every persisted monitor by id for export. Names may only be
      * resolved when unique, including in the incoming document. Rejected
-     * collision dependencies remain unavailable to the later action pass.
+     * definitions and their dependencies remain unavailable to the later action pass.
      *
      * <p>Kept live through the run — every create feeds back into it — so a
      * monitor created early in a document can be a suppression parent or a
@@ -1301,6 +1416,21 @@ public final class ExportImportService {
                     : null;
         }
 
+        /** A destination-only suppression chain must not reuse a rejected document entry. */
+        String unavailableReferenceReason(String name) {
+            String problem = unavailableReason(name);
+            if (problem != null) return problem;
+            Set<Integer> visited = new LinkedHashSet<>();
+            Monitor monitor = byName(name);
+            while (monitor != null && visited.add(monitor.getId())) {
+                if (rejectedNames.containsKey(nameKey(monitor.getName()))) {
+                    return "depends on monitor '" + monitor.getName() + "' that was rejected during this import";
+                }
+                monitor = byId(monitor.getSuppressedByMonitorId());
+            }
+            return null;
+        }
+
         Set<String> unavailableNames() {
             Set<String> names = new LinkedHashSet<>(ambiguousNames);
             names.addAll(rejectedNames.keySet());
@@ -1308,10 +1438,14 @@ public final class ExportImportService {
         }
 
         boolean rejectName(String name, String reason) {
-            if (unavailableReason(name) != null) {
+            String key = nameKey(name);
+            if (rejectedNames.containsKey(key)) {
                 return false;
             }
-            rejectedNames.put(nameKey(name), reason);
+            // Record a rejected document entry even when its name was already
+            // ambiguous, so destination-only chains cannot reuse its old row.
+            String existingProblem = unavailableReason(name);
+            rejectedNames.put(key, existingProblem == null ? reason : existingProblem);
             return true;
         }
 
@@ -1321,6 +1455,10 @@ public final class ExportImportService {
 
         Monitor byName(String name) {
             return name == null || unavailableReason(name) != null ? null : byName.get(nameKey(name));
+        }
+
+        Monitor byId(Integer id) {
+            return id == null ? null : byId.get(id);
         }
 
         boolean has(String name) {

@@ -31,9 +31,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.*;
 /** Only engine plumbing and audit delivery are replaced; services, repositories and Derby SQL are real. */
 abstract class MonitorIdentityDatabaseTestSupport {
     private String url;
-    private SqlSessionManager sessions;
+    protected SqlSessionManager sessions;
+    protected SqlConfig engine;
     private MockedStatic<SqlConfig> config;
-    private MockedStatic<SentinelAuditLog> audit;
+    protected MockedStatic<SentinelAuditLog> audit;
     private MockedStatic<MaintenanceWindowService> windows;
 
     @BeforeEach
@@ -59,7 +60,7 @@ abstract class MonitorIdentityDatabaseTestSupport {
             new XMLMapperBuilder(in, mapping, "derby", mapping.getSqlFragments()).parse();
         }
         sessions = SqlSessionManager.newInstance(new SqlSessionFactoryBuilder().build(mapping));
-        SqlConfig engine = mock(SqlConfig.class);
+        engine = mock(SqlConfig.class);
         when(engine.getSqlSessionManager()).thenReturn(sessions);
         config = mockStatic(SqlConfig.class);
         config.when(SqlConfig::getInstance).thenReturn(engine);
@@ -180,6 +181,8 @@ abstract class MonitorIdentityDatabaseTestSupport {
         return Json.write(Map.of("monitors", MonitorRepository.listMonitors(null, null, null, null),
                 "actions", ActionRepository.listActions(null)));
     }
+
+    Connection connection() throws SQLException { return DriverManager.getConnection(url); }
 
     void clearRows() throws Exception {
         try (Connection db = DriverManager.getConnection(url); Statement sql = db.createStatement()) {

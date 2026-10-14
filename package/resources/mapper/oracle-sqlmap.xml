@@ -202,6 +202,12 @@
 
     <!-- ========== MONITOR (sentinel_monitor) ========== -->
 
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockMonitor" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_monitor WHERE id = #{id}
+        FOR UPDATE
+    </select>
+
     <select id="getMonitor" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
                config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
@@ -717,6 +723,12 @@
     </delete>
 
     <!-- ========== ACTION (sentinel_action) ========== -->
+
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockAction" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_action WHERE id = #{id}
+        FOR UPDATE
+    </select>
 
     <select id="getAction" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,

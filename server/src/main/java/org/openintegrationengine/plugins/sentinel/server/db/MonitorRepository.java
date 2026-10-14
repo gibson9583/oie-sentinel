@@ -48,6 +48,15 @@ public final class MonitorRepository {
         return NAMESPACE + "." + id;
     }
 
+    /** Hold this row until the caller's managed transaction ends. */
+    public static void lockMonitor(int id) {
+        var sessions = SqlConfig.getInstance().getSqlSessionManager();
+        if (!sessions.isManagedSessionStarted()) {
+            throw new IllegalStateException("Import reference locks require a transaction");
+        }
+        sessions.selectOne(stmt("lockMonitor"), id);
+    }
+
     /**
      * Fetches one monitor by its database id.
      *
