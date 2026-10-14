@@ -742,13 +742,13 @@ public final class ExportImportService {
      * Creates, updates, or skips one action, classifying its secrets and
      * resolving its monitor condition rows on the way.
      *
-     * <p>Ordering inside this method matters. The unchanged comparison runs
-     * <i>before</i> either rewrite, with both sides in name space and both
-     * sides redacted, so it compares like with like. One consequence is worth
-     * stating plainly: an action whose only difference is a secret reads as
-     * unchanged, because the export never carried the secret to compare
-     * against. Secrets are re-entered on the target, never diffed from a
-     * file.</p>
+     * <p>The unchanged comparison uses resolved destination ids for monitor
+     * conditions and escalation targets. Existing monitor values are compared
+     * as trimmed text, matching the runtime without parsing them as integers:
+     * exporting them to names could disguise a dangling id as a numeric
+     * monitor name or erase a runtime-significant leading zero.
+     * Config remains untouched for comparison, so exported secret markers
+     * compare with the existing action's redacted config.</p>
      */
     private static ImportEntry applyAction(JsonNode node, ActionIndex actions, MonitorIndex monitors,
             int userId) {
@@ -792,16 +792,17 @@ public final class ExportImportService {
             }
             return String.valueOf(id);
         });
-        // Compare resolved monitor names, so aliases and names trimmed while
-        // importing monitors do not rewrite the action on every retry. Keep
-        // config untouched here: secret markers still compare like with like.
-        ObjectNode incomingPolicy = actionPolicyNode(incoming, target == null ? null : target.getName());
-        incomingPolicy.put("conditionJson", mapMonitorConditionValues(incoming.getConditionJson(), value -> {
-            Monitor monitor = monitors.byName(value);
-            return monitor == null ? null : monitor.getName();
-        }));
-        boolean unchanged = existing != null
-                && sameDefinition(incomingPolicy, actionNode(existing, monitors, actions));
+        // Both sides now refer to destination ids. The runtime compares
+        // trimmed scalar text, so JSON 1 and " 1 " match "1", but "01"
+        // does not. Never translate existing values through monitor names.
+        ObjectNode incomingPolicy = portable(incoming);
+        incomingPolicy.put("conditionJson", resolvedCondition);
+        ObjectNode existingPolicy = existing == null ? null : portable(existing);
+        if (existingPolicy != null) {
+            existingPolicy.put("conditionJson",
+                    mapMonitorConditionValues(existing.getConditionJson(), String::trim));
+        }
+        boolean unchanged = existingPolicy != null && sameDefinition(incomingPolicy, existingPolicy);
 
         // Secret classification runs even for an unchanged or about-to-be-
         // skipped action: "this action is already here and its key is already
@@ -813,10 +814,16 @@ public final class ExportImportService {
         entry.setSecretsNote(secretsNote(secrets.kept, secrets.required));
 
         // Even an apparently unchanged action must not bless an ambiguous
-        // name: escalation dependents treat "unchanged" as a resolved target.
+        // or missing name: escalation dependents treat "unchanged" as a
+        // resolved target, and unresolved numeric names can resemble old ids.
         if (!ambiguousMonitors.isEmpty()) {
             return entry.skipped("MONITOR condition references cannot be resolved safely: "
                     + String.join(", ", ambiguousMonitors) + "; this action was left untouched");
+        }
+        if (!unresolved.isEmpty()) {
+            return entry.skipped("MONITOR condition rows name monitor(s) that do not exist on this server: "
+                    + String.join(", ", unresolved)
+                    + "; the condition was not widened, so this action was left untouched");
         }
         if (unchanged) {
             return entry.skipped(REASON_UNCHANGED);
@@ -832,11 +839,6 @@ public final class ExportImportService {
                     + "; supply them in the import document or configure the action on this server before retrying");
         }
 
-        if (!unresolved.isEmpty()) {
-            return entry.skipped("MONITOR condition rows name monitor(s) that do not exist on this server: "
-                    + String.join(", ", unresolved)
-                    + "; the condition was not widened, so this action was left untouched");
-        }
         incoming.setConditionJson(resolvedCondition);
         incoming.setConfigJson(secrets.configJson);
 
