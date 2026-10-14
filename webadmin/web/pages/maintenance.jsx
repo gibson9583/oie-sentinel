@@ -15,7 +15,7 @@ import { platform } from '@oie/web-shell';
 import { errorModal, confirmDialog, promptDialog } from '@oie/web-ui';
 import {
     listMaintenanceWindows, createMaintenanceWindow, updateMaintenanceWindow, setMaintenanceWindowEnabled,
-    deleteMaintenanceWindow, activateMaintenanceWindowNow,
+    deleteMaintenanceWindow, activateMaintenanceWindowNow, hasPendingScheduleChanges, ScheduleChangeCanceled,
     getCoreChannels, getCoreChannelGroups, getCoreTags, errText,
 } from '../api.js';
 import {
@@ -287,6 +287,16 @@ function buildOptions(handlersRef) {
     };
 }
 
+// The API orders all schedule writes, including imports from Settings. Refresh
+// only after the last queued change so intermediate state cannot replace it.
+async function changeWindow(id, write, onSettled) {
+    try {
+        await write();
+    } finally {
+        if (!hasPendingScheduleChanges(id)) onSettled();
+    }
+}
+
 /* ---- editor sub-view ----------------------------------------------------- */
 
 function WindowEditor({ window: win, channels, groups, tags, manage, onClose, onChanged }) {
@@ -371,15 +381,16 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     };
 
     const save = async () => {
+        if (!canManageMaintenance()) return;
         let payload;
         try { payload = buildPayload(); }
         catch (e) { errorModal('Cannot Save Window', e.message || String(e)); return; }
         setBusy('save');
         try {
             if (isNew) await createMaintenanceWindow(payload);
-            else await updateMaintenanceWindow(win.id, payload);
+            else await changeWindow(win.id, () => updateMaintenanceWindow(win.id, payload), onChanged);
             toast(`Schedule "${payload.name}" ${isNew ? 'created' : 'saved'}.`, 'success');
-            onChanged();
+            if (isNew) onChanged();
             onClose();
         } catch (e) {
             // 400 validation messages from MaintenanceWindowService arrive here.
@@ -390,6 +401,7 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
     };
 
     const del = async () => {
+        if (!canManageMaintenance()) return;
         const ok = await confirmDialog('Delete Schedule',
             win.mode === 'ACTIVE'
                 ? `Delete "${win.name}"? Its alerting schedule is removed and alerts on its channels notify normally again.`
@@ -398,9 +410,8 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
         if (!ok) return;
         setBusy('delete');
         try {
-            await deleteMaintenanceWindow(win.id);
+            await changeWindow(win.id, () => deleteMaintenanceWindow(win.id), onChanged);
             toast(`Schedule "${win.name}" deleted.`, 'success');
-            onChanged();
             onClose();
         } catch (e) {
             errorModal('Delete Failed', errText(e), win.name);
@@ -651,16 +662,19 @@ export function MaintenancePage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     })), [windows.data, channelNames, groupNames, tagNames]); // windowList derives from windows.data
 
-    // Send the checkbox's requested state, never the stale row's definition.
+    // Send only the requested state, ordered with editor/activation/deletion
+    // writes so an older queued toggle cannot override a later explicit save.
     const toggleEnabled = async (w, enabled) => {
         if (!canManageMaintenance()) return;
         try {
-            await setMaintenanceWindowEnabled(w.id, enabled);
-            toast(`Maintenance window "${w.name}" ${enabled ? 'enabled' : 'disabled'}.`, 'success');
+            await changeWindow(w.id, async () => {
+                await setMaintenanceWindowEnabled(w.id, enabled);
+                toast(`Maintenance window "${w.name}" ${enabled ? 'enabled' : 'disabled'}.`, 'success');
+            }, windows.reload);
         } catch (e) {
-            errorModal('Enable/Disable Failed', errText(e), w.name);
+            if (e instanceof ScheduleChangeCanceled) return; // avoid repeating dialogs for queued toggles
+            errorModal('Enable/Disable Failed', `${errText(e)}\n\nQueued changes for this window were canceled. Check its saved state before trying again.`, w.name);
         }
-        windows.reload(); // re-sync the checkbox either way
     };
 
     const activateNow = async (w) => {
@@ -683,9 +697,8 @@ export function MaintenancePage() {
             return;
         }
         try {
-            await activateMaintenanceWindowNow(w.id, minutes);
+            await changeWindow(w.id, () => activateMaintenanceWindowNow(w.id, minutes), windows.reload);
             toast(`Maintenance window "${w.name}" active for ${minutes} minute${minutes === 1 ? '' : 's'}.`, 'success');
-            windows.reload();
         } catch (e) {
             errorModal('Activate Failed', errText(e), w.name);
         }

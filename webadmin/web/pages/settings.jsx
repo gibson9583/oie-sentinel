@@ -183,14 +183,13 @@ function ExportImportPanel() {
         }
     };
 
-    // The import writes as soon as it is called, so the confirm is the only
-    // step between the click and the change — it has to name the file and say
-    // plainly what is about to be touched.
+    // Confirm the file and affected entities before the API schedules the import
+    // behind any earlier changes to maintenance windows.
     const run = async () => {
         if (!doc) return;
         const ok = await confirmDialog('Import Configuration',
             `Import ${doc.name} into this server? Monitors, actions and maintenance windows are `
-            + 'created and updated here immediately — entities are matched by name, so a name '
+            + 'created and updated here — entities are matched by name, so a name '
             + 'already on this server is overwritten. Nothing is deleted.',
             { danger: true, okLabel: 'Import' });
         if (!ok) return;
