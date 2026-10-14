@@ -606,6 +606,10 @@ function WindowEditor({ window: win, channels, groups, tags, manage, onClose, on
 
 /* ---- page ---------------------------------------------------------------- */
 
+// Requests outlive a page when tabs change. Share their queues across mounts so
+// an older page cannot overwrite a newer page's choice for the same window.
+const pendingToggles = new Map();
+
 export function MaintenancePage() {
     const windows = useApi(listMaintenanceWindows, []);
     const channels = useApi(getCoreChannels, []);
@@ -613,7 +617,6 @@ export function MaintenancePage() {
     const tags = useApi(getCoreTags, []);
     const [view, setView] = React.useState(null); // null | { mode: 'new' } | { mode: 'edit', window }
     const manage = canManageMaintenance();
-    const pendingToggles = React.useRef(new Map());
 
     // Scope names silently degrade to raw ids when these fail — still surface
     // it, but as 'info': the host shows warn toasts as blocking modals, too
@@ -657,7 +660,7 @@ export function MaintenancePage() {
     const toggleEnabled = async (w, enabled) => {
         if (!canManageMaintenance()) return;
         const id = String(w.id);
-        const previous = pendingToggles.current.get(id);
+        const previous = pendingToggles.get(id);
         const request = (async () => {
             if (previous && !await previous.catch(() => false)) return false;
             // Permission can change while this update waits for its predecessor.
@@ -673,12 +676,12 @@ export function MaintenancePage() {
                 return false;
             }
         })();
-        pendingToggles.current.set(id, request);
+        pendingToggles.set(id, request);
         try {
             await request;
         } finally {
-            if (pendingToggles.current.get(id) === request) {
-                pendingToggles.current.delete(id);
+            if (pendingToggles.get(id) === request) {
+                pendingToggles.delete(id);
                 windows.reload(); // re-sync after the last queued update, including failures
             }
         }

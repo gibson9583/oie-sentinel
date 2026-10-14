@@ -213,3 +213,76 @@ test('queued updates recheck permission when they are about to be sent', async (
     assert.equal(writes, 2, 'a skipped queued request does not retain the queue');
     assert.equal(p.state[1], 2);
 });
+
+
+test('tab remounts preserve one queue and the latest explicit state', async () => {
+    const requests = [];
+    let stored = true;
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = (url, body, options) => {
+        const gate = deferred();
+        requests.push({ ...gate, enabled: options.params.enabled });
+        return gate.promise.then(() => { stored = options.params.enabled; });
+    };
+    const oldPage = page();
+    const first = oldPage.toggle(stale, false);
+    const queued = oldPage.toggle(stale, true);
+    await flush();
+    // SentinelView replaces MaintenancePage on tab changes. Its new refs must
+    // not create a second queue while the old page still has work in flight.
+    const newPage = page();
+    const latest = newPage.toggle({ ...stale, id: '7' }, false);
+    await flush();
+    const inFlight = requests.length;
+    if (inFlight === 2) {
+        // Drive the broken case to completion before asserting, so no pending
+        // work from a failing regression can leak into a subsequent test.
+        requests[1].resolve();
+        await latest;
+        requests[0].resolve();
+        await first;
+        await flush();
+        requests[2].resolve();
+        await queued;
+    } else {
+        for (const [i, completion] of [first, queued, latest].entries()) {
+            requests[i].resolve();
+            await completion;
+            await flush();
+        }
+    }
+    assert.equal(inFlight, 1, 'one window must have one in-flight write across page instances');
+    assert.deepEqual(requests.map(r => r.enabled), [false, true, false]);
+    assert.equal(stored, false, 'older work must not overwrite the latest explicit disable');
+    assert.equal(oldPage.state[1], 0, 'the old page does not refresh intermediate states');
+    assert.equal(newPage.state[1], 1, 'the latest page refreshes after its final write');
+});
+
+test('failure cancels queued toggles across remounts and a new page can retry', async () => {
+    const requests = [];
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = (url, body, options) => {
+        const gate = deferred();
+        requests.push({ ...gate, enabled: options.params.enabled });
+        return gate.promise;
+    };
+    const firstPage = page();
+    const first = firstPage.toggle(stale, false);
+    const secondPage = page();
+    const queued = secondPage.toggle(stale, true);
+    await flush();
+    const inFlight = requests.length;
+    requests[0].reject(new Error('uncertain request failure'));
+    // Release an incorrectly concurrent request too, keeping the negative
+    // control bounded without hiding the assertion below.
+    if (inFlight === 2) requests[1].resolve();
+    await Promise.all([first, queued]);
+    const afterFailure = requests.length;
+    const retry = page().toggle(stale, false);
+    await flush();
+    requests.at(-1).resolve();
+    await retry;
+    assert.equal(inFlight, 1);
+    assert.equal(afterFailure, 1, 'a new page cannot bypass an uncertain predecessor');
+    assert.equal(requests.length, 2, 'a later explicit retry starts a fresh queue');
+});
