@@ -1,7 +1,7 @@
 // OIE Sentinel — adversarial regression against the production source graph.
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
@@ -10,10 +10,14 @@ const dir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = path.join(dir, "web/pages/maintenance.jsx");
 const work = await mkdtemp(path.join(tmpdir(), 'sentinel-regression-'));
 const outfile = path.join(work, 'bundle.mjs');
+const uiStub = path.join(work, 'ui.mjs');
+await writeFile(uiStub, `export * from ${JSON.stringify(path.join(dir, 'verify/stubs.js'))};
+import { platform } from ${JSON.stringify(path.join(dir, 'verify/stubs.js'))};
+export const promptDialog = (...args) => platform.schedulePrompt(...args);`);
 after(() => rm(work, { recursive: true, force: true }));
 try {
     await build({
-        stdin: { contents: await readFile(source, 'utf8') + "\nexport { platform };",
+        stdin: { contents: await readFile(source, 'utf8') + "\nexport { platform, WindowEditor }; export { importConfiguration, createMaintenanceWindow } from '../api.js';",
             sourcefile: source, resolveDir: path.dirname(source), loader: 'jsx' },
         outfile, bundle: true, format: 'esm', target: 'es2022',
         jsxFactory: 'React.createElement', jsxFragment: 'React.Fragment',
@@ -21,7 +25,7 @@ try {
             react: path.join(dir, 'web/react-shim.js'),
             'react-dom': path.join(dir, 'web/react-dom-shim.js'),
             '@oie/web-shell': path.join(dir, 'verify/stubs.js'),
-            '@oie/web-ui': path.join(dir, 'verify/stubs.js'),
+            '@oie/web-ui': uiStub,
             '@oie/web-api': path.join(dir, 'verify/stubs.js'),
         },
     });
@@ -58,6 +62,7 @@ function page() {
     return {
         state, render,
         get toggle() { return refs.find(r => typeof r.current?.toggle === 'function').current.toggle; },
+        get activate() { return refs.find(r => typeof r.current?.activate === 'function').current.activate; },
     };
 }
 
@@ -285,4 +290,293 @@ test('failure cancels queued toggles across remounts and a new page can retry', 
     assert.equal(inFlight, 1);
     assert.equal(afterFailure, 1, 'a new page cannot bypass an uncertain predecessor');
     assert.equal(requests.length, 2, 'a later explicit retry starts a fresh queue');
+});
+
+
+function editor(window, callbacks = {}) {
+    const state = [];
+    function render() {
+        let index = 0;
+        React.useState = initial => {
+            const i = index++;
+            if (!(i in state)) state[i] = typeof initial === 'function' ? initial() : initial;
+            return [state[i], value => { state[i] = typeof value === 'function' ? value(state[i]) : value; }];
+        };
+        try {
+            return mod.WindowEditor({ window, channels: [], groups: [], tags: [], manage: true,
+                onClose() {}, onChanged() {}, ...callbacks });
+        } finally { Object.assign(React, originalHooks); }
+    }
+    return {
+        setEnabled(enabled) {
+            nodes(render()).find(n => n.type === 'input' && n.props.type === 'checkbox')
+                .props.onChange({ target: { checked: enabled } });
+        },
+        save() { return nodes(render()).find(n => n.type === 'button' && n.children.includes('Save changes')).props.onClick(); },
+        delete() { return nodes(render()).find(n => n.type === 'button' && n.children.includes('Delete')).props.onClick(); },
+    };
+}
+const editable = { ...stale, activeFrom: '2026-10-14T10:00:00Z', activeUntil: '2026-10-14T11:00:00Z' };
+
+// Commit each request as it arrives, but hold the first response. This models
+// a slow reply after a successful server write without inventing server ordering.
+function recordChanges() {
+    const firstResponse = deferred(), trace = [];
+    let stored = true, deleted = false;
+    const write = (kind, enabled) => {
+        trace.push(kind + ':' + enabled);
+        if (deleted) return Promise.reject(new Error('window was deleted'));
+        stored = enabled;
+        if (kind === 'delete') deleted = true;
+        return trace.length === 1 ? firstResponse.promise : Promise.resolve();
+    };
+    mod.platform.checkTask = () => true;
+    mod.platform.schedulePrompt = async () => '60';
+    mod.platform.api.post = (url, body, options) => url.endsWith('/_activateNow')
+        ? write('activate', true) : write('toggle', options.params.enabled);
+    mod.platform.api.put = (url, body) => write('editor', body.enabled);
+    mod.platform.api.del = () => write('delete', undefined);
+    return { firstResponse, trace, get stored() { return stored; }, get deleted() { return deleted; } };
+}
+
+for (const operation of ['editor', 'activate', 'delete']) {
+    test(`a later ${operation} waits for older toggles and owns the final state`, async () => {
+        const writes = recordChanges();
+        const p = page();
+        const first = p.toggle(stale, operation === 'editor' ? false : true);
+        const queued = p.toggle(stale, operation === 'editor' ? true : false);
+        await flush();
+        const e = editor(editable);
+        e.setEnabled(false);
+        const latest = operation === 'editor' ? e.save() : operation === 'activate' ? p.activate(stale) : e.delete();
+        await flush();
+        const beforeResponse = [...writes.trace];
+        writes.firstResponse.resolve();
+        await Promise.all([first, queued, latest]);
+        assert.equal(beforeResponse.length, 1, 'every same-window mutation waits for its predecessors');
+        assert.deepEqual(writes.trace.map(x => x.split(':')[0]), ['toggle', 'toggle', operation]);
+        if (operation === 'delete') assert.equal(writes.deleted, true);
+        else assert.equal(writes.stored, operation === 'activate');
+    });
+}
+
+for (const operation of ['editor', 'activate']) {
+    test(`toggles wait for a pending ${operation}, including across page mounts`, async () => {
+        const writes = recordChanges();
+        const e = editor(editable);
+        e.setEnabled(true);
+        const first = operation === 'editor' ? e.save() : page().activate(stale);
+        await flush();
+        const latest = page().toggle({ ...stale, id: '7' }, false);
+        await flush();
+        const beforeResponse = [...writes.trace];
+        writes.firstResponse.resolve();
+        await Promise.all([first, latest]);
+        assert.equal(beforeResponse.length, 1);
+        assert.deepEqual(writes.trace, [`${operation}:true`, 'toggle:false']);
+        assert.equal(writes.stored, false);
+    });
+}
+
+test('a failed toggle cancels a queued editor save without reporting success, then permits explicit retry', async () => {
+    const writes = recordChanges();
+    let closed = 0;
+    const first = page().toggle(stale, false);
+    const e = editor(editable, { onClose() { closed++; } });
+    const save = e.save();
+    await flush();
+    writes.firstResponse.reject(new Error('response lost'));
+    await Promise.all([first, save]);
+    const afterFailure = [...writes.trace];
+    const closedAfterFailure = closed;
+    await e.save();
+    assert.deepEqual(afterFailure, ['toggle:false']);
+    assert.equal(closedAfterFailure, 0);
+    assert.equal(closed, 1, 'only a successful explicit save closes the editor');
+    assert.deepEqual(writes.trace, ['toggle:false', 'editor:true']);
+});
+
+for (const operation of ['editor', 'activate', 'delete']) {
+    test(`a failed ${operation} cancels already queued toggles`, async () => {
+        const writes = recordChanges();
+        const e = editor(editable);
+        const p = page();
+        const first = operation === 'editor' ? e.save() : operation === 'activate' ? p.activate(stale) : e.delete();
+        await flush();
+        const later = p.toggle(stale, false);
+        await flush();
+        writes.firstResponse.reject(new Error('response lost'));
+        await Promise.all([first, later]);
+        assert.equal(writes.trace.length, 1, 'uncertain completion cancels later queued mutations');
+    });
+}
+
+test('an editor save rechecks permission after waiting for a toggle', async () => {
+    const writes = recordChanges();
+    let permitted = true, closed = 0;
+    mod.platform.checkTask = () => permitted;
+    const first = page().toggle(stale, false);
+    const e = editor(editable, { onClose() { closed++; } });
+    const save = e.save();
+    await flush();
+    permitted = false;
+    writes.firstResponse.resolve();
+    await Promise.all([first, save]);
+    assert.deepEqual(writes.trace, ['toggle:false']);
+    assert.equal(closed, 0);
+});
+
+
+function recordImportChanges() {
+    const firstResponse = deferred(), trace = [];
+    let stored = true;
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = (url, body, options) => {
+        const kind = url.endsWith('/import') ? 'import' : url.endsWith('/maintenanceWindows') ? 'create' : 'toggle';
+        const enabled = kind === 'toggle' ? options.params.enabled
+            : kind === 'import' ? body.maintenanceWindows?.[0]?.enabled : body.enabled;
+        trace.push(`${kind}:${enabled}`);
+        if (enabled !== undefined) stored = enabled;
+        const result = { created: 0, updated: 1, skipped: 0 };
+        return trace.length === 1 ? firstResponse.promise.then(() => result) : Promise.resolve(result);
+    };
+    return { firstResponse, trace, get stored() { return stored; } };
+}
+const scheduleDocument = enabled => ({ schemaVersion: 3, maintenanceWindows: [{ ...editable, enabled }] });
+
+test('a settings import waits for queued toggles before applying its later enabled state', async () => {
+    const writes = recordImportChanges();
+    const p = page();
+    const first = p.toggle(stale, false);
+    const queued = p.toggle(stale, true);
+    const imported = mod.importConfiguration(scheduleDocument(false));
+    await flush();
+    const before = [...writes.trace];
+    writes.firstResponse.resolve();
+    await Promise.all([first, queued, imported]);
+    assert.deepEqual(before, ['toggle:false']);
+    assert.deepEqual(writes.trace, ['toggle:false', 'toggle:true', 'import:false']);
+    assert.equal(writes.stored, false);
+});
+
+test('later toggles on all IDs wait for a settings import, then resume independently', async () => {
+    const writes = recordImportChanges();
+    const imported = mod.importConfiguration(scheduleDocument(true));
+    const first = page().toggle(stale, false);
+    const other = page().toggle({ ...stale, id: 8 }, false);
+    await flush();
+    const before = [...writes.trace];
+    writes.firstResponse.resolve();
+    await Promise.all([imported, first, other]);
+    assert.deepEqual(before, ['import:true']);
+    assert.deepEqual(writes.trace, ['import:true', 'toggle:false', 'toggle:false']);
+    assert.equal(writes.stored, false);
+});
+
+for (const firstKind of ['create', 'import']) {
+    test(`${firstKind} and name-matched schedule creation/import preserve call order`, async () => {
+        const writes = recordImportChanges();
+        const create = () => mod.createMaintenanceWindow({ ...editable, id: undefined, enabled: true });
+        const apply = () => mod.importConfiguration(scheduleDocument(false));
+        const first = firstKind === 'create' ? create() : apply();
+        const later = firstKind === 'create' ? apply() : create();
+        await flush();
+        const before = [...writes.trace];
+        writes.firstResponse.resolve();
+        await Promise.all([first, later]);
+        assert.equal(before.length, 1);
+        assert.deepEqual(writes.trace, firstKind === 'create' ? ['create:true', 'import:false'] : ['import:false', 'create:true']);
+        assert.equal(writes.stored, firstKind === 'import');
+    });
+}
+
+test('a failed predecessor cancels an import and a later explicit retry can apply it', async () => {
+    const writes = recordImportChanges();
+    const first = page().toggle(stale, true);
+    const imported = mod.importConfiguration(scheduleDocument(false));
+    const rejection = assert.rejects(imported, /earlier schedule change failed/);
+    await flush();
+    writes.firstResponse.reject(new Error('response lost'));
+    await Promise.all([first, rejection]);
+    assert.deepEqual(writes.trace, ['toggle:true']);
+    await mod.importConfiguration(scheduleDocument(false));
+    assert.deepEqual(writes.trace, ['toggle:true', 'import:false']);
+});
+
+test('a failed import cancels queued creates and toggles across IDs, then releases the barrier', async () => {
+    const writes = recordImportChanges();
+    const imported = mod.importConfiguration(scheduleDocument(true));
+    const rejection = assert.rejects(imported, /response lost/);
+    const first = page().toggle(stale, false);
+    const other = page().toggle({ ...stale, id: 8 }, false);
+    const create = mod.createMaintenanceWindow({ ...editable, id: undefined });
+    const canceled = assert.rejects(create, /earlier schedule change failed/);
+    await flush();
+    writes.firstResponse.reject(new Error('response lost'));
+    await Promise.all([rejection, first, other, canceled]);
+    assert.deepEqual(writes.trace, ['import:true']);
+    await page().toggle(stale, false);
+    assert.deepEqual(writes.trace, ['import:true', 'toggle:false']);
+});
+
+for (const task of ['doManageSentinel', 'doManageSentinelMaintenance']) {
+    test(`a queued schedule import rechecks ${task} permission`, async () => {
+        const writes = recordImportChanges();
+        let denied;
+        mod.platform.checkTask = (context, requested) => requested !== denied;
+        const first = page().toggle(stale, false);
+        const imported = mod.importConfiguration(scheduleDocument(true));
+        const rejection = assert.rejects(imported, /permission changed/);
+        await flush();
+        denied = task;
+        writes.firstResponse.resolve();
+        await Promise.all([first, rejection]);
+        assert.deepEqual(writes.trace, ['toggle:false']);
+    });
+}
+
+test('monitor-only imports remain independent of schedule queues and maintenance permission', async () => {
+    const writes = recordImportChanges();
+    const first = page().toggle(stale, false);
+    await flush();
+    mod.platform.checkTask = (context, task) => task === 'doManageSentinel';
+    await mod.importConfiguration({ schemaVersion: 3, monitors: [], maintenanceWindows: [] });
+    const before = [...writes.trace];
+    writes.firstResponse.resolve();
+    await first;
+    assert.deepEqual(before, ['toggle:false', 'import:undefined']);
+});
+
+
+test('a failed batch predecessor cannot release another ID while its earlier request is still running', async () => {
+    const first = deferred(), other = deferred(), requests = [];
+    let imports = 0;
+    mod.platform.checkTask = () => true;
+    mod.platform.api.post = (url, body, options) => {
+        if (url.endsWith('/import')) { imports++; return Promise.resolve({}); }
+        const id = url.match(/maintenanceWindows\/(\d+)\//)[1];
+        requests.push(id);
+        if (requests.length === 1) return first.promise;
+        if (requests.length === 2) return other.promise;
+        return Promise.resolve({});
+    };
+    const p = page();
+    const a = p.toggle(stale, false);
+    const b = p.toggle({ ...stale, id: 8 }, false);
+    await flush();
+    const imported = mod.importConfiguration(scheduleDocument(true));
+    const rejected = assert.rejects(imported, /earlier schedule change failed/);
+    const queued = p.toggle(stale, true);
+    other.reject(new Error('other schedule response failed'));
+    await flush();
+    await flush();
+    const later = p.toggle(stale, false);
+    await flush();
+    const beforeFirstCompleted = [...requests];
+    first.resolve();
+    await Promise.all([a, b, rejected, queued, later]);
+    assert.deepEqual(beforeFirstCompleted, ['7', '8'], 'same-ID ownership lasts until every inherited predecessor settles');
+    assert.equal(imports, 0);
+    await p.toggle(stale, false);
+    assert.deepEqual(requests, ['7', '8', '7'], 'explicit retry works after the entire failed chain drains');
 });
