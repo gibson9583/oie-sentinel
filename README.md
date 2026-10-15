@@ -268,27 +268,22 @@ All nodes must use the new schema and fencing protocol before monitoring resumes
    PostgreSQL, MySQL, Oracle, and SQL Server DDL included); schema upgrades run automatically on
    later versions.
 
-### Uninstalling does not delete your data
+### Uninstalling deletes Sentinel data
 
-Uninstalling the extension **renames** the `sentinel_*` tables to
-`sentinel_<table>_uninstalled_<yyyyMMdd>` on the next startup rather than dropping them, so
-monitors, actions, windows, and alert history survive an accidental uninstall — the kind of record
-an audit asks for six months later. Reinstalling creates a fresh schema alongside the renamed
-tables; it does not adopt them, so restoring old data is a manual copy.
+Explicitly uninstalling Sentinel **drops all eleven of its database tables on the next engine
+startup**, deleting monitors, actions, schedules, alert history, delivery records, and collected
+activity. This applies to Derby, PostgreSQL, MySQL, Oracle, and SQL Server. No new archive tables
+are created; Oracle also purges the dropped tables from its recycle bin. Reinstalling creates an
+empty Sentinel schema. Back up the database first if you need to recover this data later.
 
-Clean the archives up yourself when you are sure, for example:
+**Upgrades preserve existing data:** install the new version over the existing extension and
+restart. Normal upgrades run schema migrations without invoking uninstall SQL. Do not uninstall
+as an upgrade or rollback step: an explicit uninstall followed by an install still deletes the
+data, even when both operations are queued before the same restart.
 
-```sql
-DROP TABLE sentinel_alert_event_uninstalled_20260806;
--- …and the other ten, child tables first
-```
-
-> **Derby exception:** on Derby the tables are left in place under their original names and nothing
-> is renamed. Derby refuses to rename any table referenced by a foreign key, and three of the eleven
-> are; renaming only the eight it permits would leave a half-schema that the migrator would correctly
-> refuse to start against. Reinstalling on Derby cleanly adopts the existing tables.
-
-Upgrading never triggers any of this — install the new version over the old one.
+For a cluster sharing one database, coordinate removal across all nodes: uninstalling Sentinel
+on one node deletes the tables used by every node. Archived tables left by older versions are
+not part of the live schema and are not removed by this uninstall script.
 
 ## Permissions
 

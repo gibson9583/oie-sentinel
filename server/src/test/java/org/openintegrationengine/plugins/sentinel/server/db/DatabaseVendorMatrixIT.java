@@ -53,6 +53,14 @@ class DatabaseVendorMatrixIT {
                     DatabaseMatrixSupport.verifyInterruptedMigration(database, target)));
             scenarios.add(() -> MapperStatementMatrix.verifyAll(database));
             scenarios.add(() -> DatabaseMatrixSupport.verifyUninstallRestartReinstall(database));
+            IntStream.rangeClosed(0, SentinelMigrator.LATEST_VERSION)
+                    .forEach((sourceVersion) -> scenarios.add(() ->
+                            DatabaseMatrixSupport.verifyUninstallFrom(database, sourceVersion)));
+            SentinelMigrator uninstall = new SentinelMigrator();
+            uninstall.setDatabaseType(vendor);
+            IntStream.range(1, uninstall.getUninstallStatements().size())
+                    .forEach((completed) -> scenarios.add(() ->
+                            DatabaseMatrixSupport.verifyInterruptedUninstall(database, completed)));
             assertAll(vendor + " database compatibility scenarios", scenarios);
         } finally {
             java.nio.file.Path evidence = MatrixEvidenceSupport.directory(vendor);

@@ -404,7 +404,8 @@ fan out cleanly, with a verification pass (build + targeted manual checks) after
 
 - `mvn clean package` builds cleanly across all modules; `package/target/sentinel-*.zip` produced.
 - Deploy the zip to a local OIE instance (or `docker/` setup like `tls-manager-plugin/docker`);
-  confirm `SentinelMigrator` creates all 9 tables on first start, and cleanly drops them on uninstall.
+  confirm `SentinelMigrator` creates all 11 tables on first start, preserves data during upgrades,
+  and drops the tables on explicit uninstall.
 - Create a monitor (start with INACTIVITY on a real channel), confirm `ActivityCollectorJob` populates
   `sentinel_channel_activity_sample` within one interval, and `TriggerEvaluatorJob` moves
   `trigger_state` from `INSUFFICIENT_DATA` → `OK`.
