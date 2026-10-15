@@ -308,7 +308,7 @@ class ActionDispatcherEscalationActionTimeTest {
         final List<Integer> sent = new ArrayList<>();
         final List<String> sentPhases = new ArrayList<>();
         final List<Integer> blocked = new ArrayList<>();
-        final MockedStatic<ActionRepository> actions = mockStatic(ActionRepository.class);
+        final MockedStatic<ActionRepository> actions = ActionRepositoryTestSupport.mockActions();
         final MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class);
         final MockedStatic<ActionDispatchLogRepository> logs = mockStatic(ActionDispatchLogRepository.class);
         final MockedStatic<NotificationSuppression> policy = mockStatic(NotificationSuppression.class);

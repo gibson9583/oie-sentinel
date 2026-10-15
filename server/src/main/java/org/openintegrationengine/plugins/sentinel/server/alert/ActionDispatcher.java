@@ -1486,6 +1486,11 @@ public final class ActionDispatcher {
     private static NotificationSuppression.Decision currentDecision(AlertEvent event) {
         NotificationSuppression.Decision decision =
                 NotificationSuppression.decision(event, Instant.now());
+        recordSuppression(event, decision);
+        return decision;
+    }
+
+    private static void recordSuppression(AlertEvent event, NotificationSuppression.Decision decision) {
         if (decision == NotificationSuppression.Decision.SUPPRESS
                 && event != null && event.getId() != null && !event.isSuppressed()) {
             try {
@@ -1499,7 +1504,6 @@ public final class ActionDispatcher {
                         event.getId(), t);
             }
         }
-        return decision;
     }
 
     /** True when the durable suppression snapshot still needs consuming. */
@@ -1610,6 +1614,10 @@ public final class ActionDispatcher {
 
     private static final class ActionDiscardedException extends DispatchDeferredException {
         private ActionDiscardedException() { super("Action no longer subscribes to this notification"); }
+    }
+
+    private static final class DispatchSuppressedException extends DispatchDeferredException {
+        private DispatchSuppressedException() { super("Notification policy changed before delivery"); }
     }
 
     /** Local capacity/policy failure before any send; leave its durable edge pending. */
@@ -1770,22 +1778,32 @@ public final class ActionDispatcher {
                     TRANSPORT_TIMEOUT_SECONDS, TimeUnit.SECONDS, () -> {
                         dispatchFence.set(fence);
                         try {
-                            if (!lifecycleStillCurrent(event, resolvedPhase)
-                                    || currentDecision(event) != NotificationSuppression.Decision.ALLOW
-                                    || !SentinelLeadership.recheckFence(fence)) {
-                                throw new DispatchDeferredException(
-                                        "Lifecycle, notification policy, or leadership changed before delivery");
-                            }
                             // The target alone cannot authorize an escalation: any
                             // upstream link can be disabled or edited, and the
                             // originating source can cease matching while work
                             // is queued for pacing, rollup, or transport.
                             // Keep the whole decision path through the I/O handoff.
-                            for (int index = 0; index < authorizingSources.size(); index++) {
-                                verifyActionAtTransport(authorizingSources.get(index), payload, false, index == 0);
-                            }
-                            verifyActionAtTransport(action, payload, resolvedPhase, authorizingSources.isEmpty());
+                            List<Integer> actionIds = new ArrayList<>();
+                            authorizingSources.forEach(source -> actionIds.add(source.getId()));
+                            actionIds.add(action.getId());
+                            ActionRepository.validateDispatch(actionIds, () -> {
+                                for (int index = 0; index < authorizingSources.size(); index++) {
+                                    verifyActionAtTransport(authorizingSources.get(index), payload, false, index == 0);
+                                }
+                                verifyActionAtTransport(action, payload, resolvedPhase, authorizingSources.isEmpty());
+                            }, () -> requireCurrentDispatchState(event, resolvedPhase, fence));
                             receipt.transportAttempted = true;
+                        } catch (DispatchSuppressedException suppressed) {
+                            // The authorization transaction has closed. Persisting
+                            // this display/latch state now cannot nest transactions.
+                            recordSuppression(event, NotificationSuppression.Decision.SUPPRESS);
+                            throw suppressed;
+                        } catch (DispatchDeferredException deferred) {
+                            throw deferred;
+                        } catch (Throwable uncertainty) {
+                            // Lock, query and transaction cleanup failures all
+                            // precede I/O and must not consume the durable edge.
+                            throw new DispatchDeferredException("Cannot authorize delivery", uncertainty);
                         } finally {
                             dispatchFence.remove();
                         }
@@ -1820,6 +1838,26 @@ public final class ActionDispatcher {
             log.error("Failed to record dispatch log for action {} on alert event {}",
                     action.getId(), event.getId(), t);
             return false;
+        }
+    }
+
+    /**
+     * Defers the send unless the alert lifecycle, notification policy and
+     * leadership fence still allow it. Leadership is checked last so the
+     * fence is as fresh as possible when the transport starts.
+     */
+    private static void requireCurrentDispatchState(AlertEvent event, boolean resolvedPhase, LeaseFence fence) {
+        if (!lifecycleStillCurrent(event, resolvedPhase)) {
+            throw new DispatchDeferredException(
+                    "Lifecycle, notification policy, or leadership changed before delivery");
+        }
+        NotificationSuppression.Decision decision = NotificationSuppression.decision(event, Instant.now());
+        if (decision == NotificationSuppression.Decision.SUPPRESS) {
+            throw new DispatchSuppressedException();
+        }
+        if (decision != NotificationSuppression.Decision.ALLOW || !SentinelLeadership.recheckFence(fence)) {
+            throw new DispatchDeferredException(
+                    "Notification policy or leadership changed before delivery");
         }
     }
 

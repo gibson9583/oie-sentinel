@@ -58,7 +58,7 @@ class RecipientMembershipUncertaintyTest {
         Action action = action(field);
         Monitor monitor = new Monitor(); monitor.setId(7); monitor.setEnabled(true);
         try (var scope = mockStatic(ScopeResolver.class);
-                var actions = mockStatic(ActionRepository.class);
+                var actions = ActionRepositoryTestSupport.mockActions();
                 var alerts = mockStatic(AlertEventRepository.class);
                 var logs = mockStatic(ActionDispatchLogRepository.class);
                 var monitors = mockStatic(MonitorRepository.class);

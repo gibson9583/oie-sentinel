@@ -36,7 +36,7 @@ class ActionDispatcherActionTimeTest {
         List<ActionDispatchLog> rows = new ArrayList<>();
         List<String> delivered = new ArrayList<>();
         boolean[] changed = {false};
-        try (var actions = mockStatic(ActionRepository.class);
+        try (var actions = ActionRepositoryTestSupport.mockActions();
                 var alerts = mockStatic(AlertEventRepository.class);
                 var logs = mockStatic(ActionDispatchLogRepository.class);
                 var policy = mockStatic(NotificationSuppression.class);
@@ -98,7 +98,7 @@ class ActionDispatcherActionTimeTest {
         Action action = action(2, "secret");
         AlertPayload payload = new AlertPayload(1, 7, "monitor", MonitorType.INACTIVITY,
                 "channel", "channel", null, Severity.HIGH, "PROBLEM", "problem", Instant.now(), "{}");
-        try (var actions = mockStatic(ActionRepository.class)) {
+        try (var actions = ActionRepositoryTestSupport.mockActions()) {
             actions.when(() -> ActionRepository.getAction(2)).thenThrow(new IllegalStateException("database unavailable"));
             assertThrows(ActionDispatcher.DispatchDeferredException.class,
                     () -> ActionDispatcher.verifyActionAtTransport(action, payload, false));

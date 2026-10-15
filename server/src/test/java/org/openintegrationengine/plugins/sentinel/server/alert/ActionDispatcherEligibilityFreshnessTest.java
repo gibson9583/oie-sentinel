@@ -68,7 +68,7 @@ class ActionDispatcherEligibilityFreshnessTest {
         List<ActionDispatchLog> rows = new ArrayList<>();
         List<Integer> sent = new ArrayList<>();
         boolean[] lookupUnavailable = {false};
-        try (var actions = mockStatic(ActionRepository.class);
+        try (var actions = ActionRepositoryTestSupport.mockActions();
                 var alerts = mockStatic(AlertEventRepository.class);
                 var states = mockStatic(TriggerStateRepository.class);
                 var logs = mockStatic(ActionDispatchLogRepository.class);

@@ -36,7 +36,7 @@ class ActionDispatcherWorkerFreshnessTest {
         CountDownLatch allowWorkerGuard = new CountDownLatch(1);
         AtomicReference<Throwable> result = new AtomicReference<>();
         ActionDispatcher.startDispatchExecutor();
-        try (var actions = mockStatic(ActionRepository.class); var alerts = mockStatic(AlertEventRepository.class);
+        try (var actions = ActionRepositoryTestSupport.mockActions(); var alerts = mockStatic(AlertEventRepository.class);
                 var logs = mockStatic(ActionDispatchLogRepository.class); var policy = mockStatic(NotificationSuppression.class);
                 var storm = mockStatic(AlertStormControl.class); var leader = mockStatic(SentinelLeadership.class);
                 var dispatcher = mockStatic(ActionDispatcher.class, CALLS_REAL_METHODS)) {
@@ -71,7 +71,7 @@ class ActionDispatcherWorkerFreshnessTest {
                                         Thread.currentThread().interrupt();
                                         throw new AssertionError(interrupted);
                                     }
-                                    try (var workerActions = mockStatic(ActionRepository.class);
+                                    try (var workerActions = ActionRepositoryTestSupport.mockActions();
                                             var workerAlerts = mockStatic(AlertEventRepository.class);
                                             var workerPolicy = mockStatic(NotificationSuppression.class);
                                             var workerLeader = mockStatic(SentinelLeadership.class)) {
