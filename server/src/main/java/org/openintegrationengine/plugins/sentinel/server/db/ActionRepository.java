@@ -5,12 +5,15 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.db;
 
+import java.sql.Connection;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,10 +27,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.OperationMode;
 /**
  * Persistence for {@code sentinel_action}.
  *
- * <p>Every statement here is a single round trip, so each method calls
+ * <p>Most statements here are a single round trip, so each method calls
  * {@code SqlConfig.getInstance().getSqlSessionManager()} directly rather than
- * opening a manual-commit session — there is no multi-statement sequence that
- * needs a shared transaction. This class holds no state of its own, so like
+ * opening a manual-commit session. Dispatch validation shares a transaction
+ * to hold action definitions stable across its checks. This class holds no state of its own, so like
  * {@code MonitorRepository} it is a plain collection of static methods rather
  * than an init()/getInstance()/close() singleton (see {@code PermissionUtil}
  * in the role-based-access-control plugin for the same style of stateless
@@ -50,9 +53,34 @@ public final class ActionRepository {
     public static void lockAction(int id) {
         var sessions = SqlConfig.getInstance().getSqlSessionManager();
         if (!sessions.isManagedSessionStarted()) {
-            throw new IllegalStateException("Import reference locks require a transaction");
+            throw new IllegalStateException("Action row locks require a transaction");
         }
         sessions.selectOne(stmt("lockAction"), id);
+    }
+
+    /**
+     * Keeps the target and every escalation source stable through dispatch
+     * authorization. State checks stay fresh at READ_COMMITTED, including on
+     * databases whose default is REPEATABLE_READ. Both callbacks must be
+     * read-only; transport I/O starts only after this transaction has closed.
+     * Edits committed after authorization apply to subsequent deliveries.
+     */
+    public static void validateDispatch(Collection<Integer> actionIds,
+            Runnable validateActions, Runnable validateState) {
+        ReadTransaction.execute(Connection.TRANSACTION_READ_COMMITTED, () -> {
+            for (Integer id : new TreeSet<>(actionIds)) {
+                lockAction(id);
+            }
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Dispatch authorization was cancelled");
+            }
+            validateState.run();
+            validateActions.run();
+            // READ_COMMITTED alone does not invalidate MyBatis's session cache.
+            SqlConfig.getInstance().getSqlSessionManager().clearCache();
+            validateState.run();
+            return null;
+        });
     }
 
     /**

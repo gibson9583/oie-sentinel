@@ -27,7 +27,7 @@ class ActionDispatcherTransportGuardOrderTest {
         boolean[] inTransport = {false};
         boolean[] leader = {true};
         NotificationSuppression.Decision[] decision = {NotificationSuppression.Decision.ALLOW};
-        try (var actions = mockStatic(ActionRepository.class);
+        try (var actions = ActionRepositoryTestSupport.mockActions();
                 var alerts = mockStatic(AlertEventRepository.class);
                 var logs = mockStatic(ActionDispatchLogRepository.class);
                 var policy = mockStatic(NotificationSuppression.class);

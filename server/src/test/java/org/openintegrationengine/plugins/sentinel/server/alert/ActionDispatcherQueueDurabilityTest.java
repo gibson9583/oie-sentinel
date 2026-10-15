@@ -77,7 +77,7 @@ class ActionDispatcherQueueDurabilityTest {
     void setUp() {
         ActionDispatcher.startDispatchExecutor();
 
-        actions = Mockito.mockStatic(ActionRepository.class);
+        actions = ActionRepositoryTestSupport.mockActions();
         actions.when(() -> ActionRepository.getAction(Mockito.anyInt())).thenAnswer(call ->
                 ActionRepository.listActions(Boolean.TRUE).stream()
                         .filter(candidate -> candidate.getId().equals(call.getArgument(0)))
@@ -405,7 +405,7 @@ class ActionDispatcherQueueDurabilityTest {
     private static Thread blockedDecision(String phase, CountDownLatch entered,
             CountDownLatch release, AtomicReference<Throwable> failure) {
         return new Thread(() -> {
-            try (MockedStatic<ActionRepository> workerActions = Mockito.mockStatic(ActionRepository.class);
+            try (MockedStatic<ActionRepository> workerActions = ActionRepositoryTestSupport.mockActions();
                     MockedStatic<AlertEventRepository> workerAlerts = Mockito.mockStatic(AlertEventRepository.class);
                     MockedStatic<SentinelLeadership> workerLeadership = Mockito.mockStatic(SentinelLeadership.class)) {
                 workerActions.when(() -> ActionRepository.getAction(Mockito.anyInt()))
