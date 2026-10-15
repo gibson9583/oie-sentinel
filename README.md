@@ -255,8 +255,10 @@ leader's first collector tick records zero deltas rather than counting each chan
 total as one interval, so one tick of sampling is lost on failover by design. Leadership changes
 are logged at INFO, naming the node — the first thing to check during an HA incident.
 
-For a clustered upgrade from 1.1.0, stop Sentinel on every node before starting the updated plugin.
-All nodes must use the new schema and fencing protocol before monitoring resumes.
+For a clustered upgrade to 1.2.0, stop Sentinel on every node before starting the updated plugin.
+All nodes must use the new version before monitoring resumes. New webhook writes use a secret
+encoding that older senders cannot read; a rolling mixed-version upgrade is not supported.
+See the [upgrade and rollback procedure](docs/releases/1.2.0.md#upgrading).
 
 ## Install
 
@@ -356,10 +358,10 @@ oie-sentinel/
 
 ## Releasing
 
-See the [1.1.1 release notes](docs/releases/1.1.1.md), including the cluster upgrade instructions.
+See the [1.2.0 release notes](docs/releases/1.2.0.md), including the cluster upgrade and rollback instructions.
 
 ```bash
-git tag v1.1.2 && git push origin v1.1.2
+git tag v1.2.0 && git push origin v1.2.0
 ```
 
 The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
