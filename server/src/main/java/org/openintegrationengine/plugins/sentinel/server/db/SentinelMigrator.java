@@ -10,11 +10,7 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.time.LocalDate;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -140,14 +136,13 @@ public class SentinelMigrator extends Migrator {
      * aligns the stored {@code schema_version} property before running the
      * version loop. Detecting on every call (rather than only when the
      * property is null) makes us robust to operational quirks: pre-versioning
-     * installs, manual edits to {@code CONFIGURATION}, and — since
-     * {@link #getUninstallStatements()} stopped dropping tables — reinstalling
-     * over a schema a previous uninstall left in place. On uninstall the engine
-     * clears every CONFIGURATION property under the plugin's group name,
-     * including {@code schema_version}, so after a reinstall the stored version
-     * is always null while the tables may be anywhere from absent (they were
-     * renamed aside) to fully at {@link #LATEST_VERSION} (the rename was not
-     * possible on this vendor). Detection is what tells those two apart.</p>
+     * installs, manual edits to {@code CONFIGURATION}, and reinstalling after
+     * an uninstall. On uninstall the engine drops Sentinel's tables and clears
+     * every CONFIGURATION property under the plugin's group name, including
+     * {@code schema_version}. Detection also supports schemas retained by older
+     * releases: a fresh install creates absent tables, while an upgrade or a
+     * reinstall over a complete retained schema applies only missing migrations.
+     * A partial schema is rejected instead of being silently overwritten.</p>
      */
     @Override
     public void migrate() throws MigrationException {
@@ -688,7 +683,7 @@ public class SentinelMigrator extends Migrator {
     /**
      * {@inheritDoc}
      * <p>Sentinel has no legacy serialized data to migrate — its data is
-     * normalized across nine tables, not stored as blobs.</p>
+     * normalized across relational tables, not stored as blobs.</p>
      */
     @Override
     public void migrateSerializedData() throws MigrationException {
@@ -698,14 +693,15 @@ public class SentinelMigrator extends Migrator {
     // ========== Uninstall ==========
 
     /**
-     * The plugin's tables, child-first. Order is irrelevant to a rename (unlike
-     * the DROP TABLE list this replaced, where a parent had to go last), but is
-     * kept so the emitted script still reads in dependency order.
+     * All live Sentinel tables, with foreign-key dependents before their parents.
+     * In particular, trigger state references both monitor and alert event, and
+     * dispatch log references alert event and action. Dropping a table also
+     * removes its indexes, constraints, and owned identity/serial sequences.
      */
     private static final String[] UNINSTALL_TABLES = {
             "sentinel_action_dispatch_log",
-            "sentinel_alert_event",
             "sentinel_trigger_state",
+            "sentinel_alert_event",
             "sentinel_connector_status_event",
             "sentinel_channel_presence",
             "sentinel_channel_activity_trend",
@@ -716,579 +712,40 @@ public class SentinelMigrator extends Migrator {
             "sentinel_node_lease"};
 
     /**
-     * Explicit secondary indexes created by Sentinel. The naming convention is
-     * {@code idx_sentinel_<short-entity>_<purpose>}; names are kept short enough
-     * for Oracle and for the archive suffix. Constraint names use the analogous
-     * {@code pk_}, {@code uq_}, {@code fk_}, and {@code df_} prefixes.
-     */
-    private static final NamedObject[] UNINSTALL_INDEXES = {
-            object("sentinel_monitor", "idx_sentinel_monitor_scope"),
-            object("sentinel_monitor", "idx_sentinel_monitor_enabled"),
-            object("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel"),
-            object("sentinel_alert_event", "idx_sentinel_alert_event_status"),
-            object("sentinel_alert_event", "idx_sentinel_alert_event_opened"),
-            object("sentinel_alert_event", "idx_sentinel_alert_event_resolved"),
-            object("sentinel_alert_event", "idx_sentinel_alert_resolution"),
-            object("sentinel_alert_event", "idx_sentinel_alert_problem"),
-            object("sentinel_trigger_state", "idx_sentinel_trigger_state_monitor"),
-            object("sentinel_channel_activity_sample", "idx_sentinel_activity_sample_channel_time"),
-            object("sentinel_channel_activity_sample", "idx_sentinel_activity_sample_time"),
-            object("sentinel_channel_activity_trend", "idx_sentinel_activity_trend_channel_hour"),
-            object("sentinel_channel_activity_trend", "idx_sentinel_activity_trend_hour"),
-            object("sentinel_connector_status_event", "idx_sentinel_connector_status_event_channel"),
-            object("sentinel_connector_status_event", "idx_sentinel_connector_status_time"),
-            object("sentinel_connector_status_event", "idx_sentinel_conn_node_id"),
-            object("sentinel_action", "idx_sentinel_action_enabled"),
-            object("sentinel_action_dispatch_log", "idx_sentinel_action_dispatch_log_event"),
-            object("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time"),
-            object("sentinel_maintenance_window", "idx_sentinel_maintenance_window_scope")};
-
-    /** PostgreSQL SERIAL sequences do not follow their table through a rename. */
-    private static final NamedObject[] POSTGRES_SEQUENCES = {
-            object("sentinel_monitor", "sentinel_monitor_id_seq"),
-            object("sentinel_alert_event", "sentinel_alert_event_id_seq"),
-            object("sentinel_trigger_state", "sentinel_trigger_state_id_seq"),
-            object("sentinel_channel_activity_sample", "sentinel_channel_activity_sample_id_seq"),
-            object("sentinel_channel_activity_trend", "sentinel_channel_activity_trend_id_seq"),
-            object("sentinel_connector_status_event", "sentinel_connector_status_event_id_seq"),
-            object("sentinel_action", "sentinel_action_id_seq"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_id_seq"),
-            object("sentinel_maintenance_window", "sentinel_maintenance_window_id_seq")};
-
-    /**
-     * PostgreSQL's generated names are deterministic and its PK/UNIQUE names
-     * also name schema-global backing indexes. Archive all of them, plus the
-     * one explicitly named FK, so a fresh v1 script cannot collide.
-     */
-    private static final NamedObject[] POSTGRES_CONSTRAINTS = {
-            object("sentinel_monitor", "sentinel_monitor_pkey"),
-            object("sentinel_monitor", "sentinel_monitor_name_key"),
-            object("sentinel_monitor", "sentinel_monitor_suppressed_by_monitor_id_fkey"),
-            object("sentinel_alert_event", "sentinel_alert_event_pkey"),
-            object("sentinel_alert_event", "sentinel_alert_event_monitor_id_fkey"),
-            object("sentinel_trigger_state", "sentinel_trigger_state_pkey"),
-            object("sentinel_trigger_state", "sentinel_trigger_state_monitor_id_fkey"),
-            object("sentinel_trigger_state", "sentinel_trigger_state_monitor_id_channel_id_metadata_id_key"),
-            object("sentinel_trigger_state", "fk_sentinel_trigger_state_alert_event"),
-            object("sentinel_channel_activity_sample", "sentinel_channel_activity_sample_pkey"),
-            object("sentinel_channel_activity_trend", "sentinel_channel_activity_trend_pkey"),
-            object("sentinel_channel_activity_trend", "sentinel_channel_activity_trend_channel_id_hour_bucket_key"),
-            object("sentinel_connector_status_event", "sentinel_connector_status_event_pkey"),
-            object("sentinel_channel_presence", "sentinel_channel_presence_pkey"),
-            object("sentinel_action", "sentinel_action_pkey"),
-            object("sentinel_action", "sentinel_action_name_key"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_pkey"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_alert_event_id_fkey"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_action_id_fkey"),
-            object("sentinel_maintenance_window", "sentinel_maintenance_window_pkey"),
-            object("sentinel_node_lease", "sentinel_node_lease_pkey")};
-
-    /** Oracle constraints that were explicitly named by shipped scripts. */
-    private static final NamedObject[] ORACLE_CONSTRAINTS = {
-            object("sentinel_trigger_state", "uq_sentinel_trigger_state"),
-            object("sentinel_trigger_state", "fk_sentinel_trigger_state_alert_event"),
-            object("sentinel_channel_activity_trend", "uq_sentinel_activity_trend")};
-
-    /** SQL Server schema-global constraint names introduced by v7/v8. */
-    private static final NamedObject[] SQLSERVER_CONSTRAINTS = {
-            object("sentinel_node_lease", "df_sentinel_node_lease_epoch"),
-            object("sentinel_connector_status_event", "df_sentinel_connector_node_id")};
-
-    /**
-     * MySQL cannot rename a foreign-key constraint. Drop both the names emitted
-     * by historical inline DDL and Sentinel's explicit name, then recreate the
-     * relationships on the archived tables under archived names.
-     */
-    private static final NamedObject[] MYSQL_FOREIGN_KEYS_TO_DROP = {
-            object("sentinel_monitor", "sentinel_monitor_ibfk_1"),
-            object("sentinel_alert_event", "sentinel_alert_event_ibfk_1"),
-            object("sentinel_trigger_state", "sentinel_trigger_state_ibfk_1"),
-            object("sentinel_trigger_state", "fk_sentinel_trigger_state_alert_event"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_ibfk_1"),
-            object("sentinel_action_dispatch_log", "sentinel_action_dispatch_log_ibfk_2")};
-
-    private static final ForeignKey[] MYSQL_ARCHIVE_FOREIGN_KEYS = {
-            foreignKey("sentinel_monitor", "fk_sentinel_monitor_parent", "suppressed_by_monitor_id",
-                    "sentinel_monitor", "ON DELETE SET NULL"),
-            foreignKey("sentinel_alert_event", "fk_sentinel_alert_monitor", "monitor_id",
-                    "sentinel_monitor", "ON DELETE CASCADE"),
-            foreignKey("sentinel_trigger_state", "fk_sentinel_trigger_monitor", "monitor_id",
-                    "sentinel_monitor", "ON DELETE CASCADE"),
-            foreignKey("sentinel_trigger_state", "fk_sentinel_trigger_alert", "open_alert_event_id",
-                    "sentinel_alert_event", "ON DELETE SET NULL"),
-            foreignKey("sentinel_action_dispatch_log", "fk_sentinel_dispatch_alert", "alert_event_id",
-                    "sentinel_alert_event", "ON DELETE CASCADE"),
-            foreignKey("sentinel_action_dispatch_log", "fk_sentinel_dispatch_action", "action_id",
-                    "sentinel_action", "ON DELETE SET NULL")};
-
-    /**
-     * How many same-day archive targets to offer per table: the bare
-     * {@code _u<yyyyMMdd>} name plus {@code _2} and {@code _3}. See
-     * {@link #getUninstallStatements()} for why a counter has to be expressed
-     * as alternatives rather than computed by probing the database.
-     */
-    private static final int RENAME_ATTEMPTS = 3;
-
-    private record NamedObject(String table, String name) {
-    }
-
-    private record ForeignKey(String table, String name, String column, String parentTable, String deleteRule) {
-    }
-
-    private static NamedObject object(String table, String name) {
-        return new NamedObject(table, name);
-    }
-
-    private static ForeignKey foreignKey(
-            String table, String name, String column, String parentTable, String deleteRule) {
-        return new ForeignKey(table, name, column, parentTable, deleteRule);
-    }
-
-    /**
      * {@inheritDoc}
      *
-     * <p>Renames the plugin's tables to an archive name ending in
-     * {@code _u<yyyyMMdd>} instead of dropping them. Names that would exceed a
-     * vendor's identifier limit are shortened with a stable hash, and repeat
-     * uninstalls use {@code _2} and {@code _3} variants.
-     * Uninstall is a routine operator gesture with no undo, and alert history
-     * is exactly the kind of record an audit asks for six months later, so the
-     * data survives and cleanup becomes an explicit operator decision. The
-     * README carries the manual DROP statements.</p>
+     * <p>Explicit uninstall permanently removes Sentinel configuration and
+     * history. Normal installation and upgrade use {@link #migrate()} and do
+     * not call this hook. The engine queues these statements for the next
+     * startup; uninstall followed by install before that startup still deletes
+     * the old schema before installing a fresh one.</p>
      *
-     * <h3>Why this method branches on the vendor</h3>
+     * <p>The uninstall path supplies the database type but no connection, so
+     * this method only emits SQL. {@code DROP TABLE} works on every supported
+     * database, including Derby. Oracle additionally uses {@code PURGE} so the
+     * tables are not retained in its recycle bin. No cascading drop is used:
+     * only the named live Sentinel tables are targets. Archives produced by
+     * older releases are outside this list.</p>
      *
-     * <p>{@code DROP TABLE} is portable across all five supported databases;
-     * renaming is not. The engine constructs a <em>fresh</em> migrator for the
-     * uninstall path and calls {@code setDatabaseType(...)} on it before
-     * calling this method (see
-     * {@code DefaultExtensionController.prepareExtensionForUninstallation}), so
-     * {@link #getDatabaseType()} is populated here and vendor branching is
-     * safe. {@link #getConnection()} is <b>not</b>: that path never calls
-     * {@code setConnection(...)}, so the field is null and the accessor
-     * dereferences it. Nothing in this method may touch the database — which is
-     * why the same-day counter below is expressed as a chain of alternative
-     * statements rather than a "does this name already exist?" probe.</p>
+     * <p>The engine executes each statement independently with errors ignored
+     * ({@code DatabaseUtil.executeScript(script, true)}). Missing tables after
+     * a partial or repeated uninstall therefore do not prevent the remaining
+     * tables from being removed. The engine also removes CONFIGURATION
+     * properties under {@link #PLUGIN_NAME}, including {@code schema_version}.
+     * Errors such as insufficient privileges or external foreign keys still
+     * require operator attention; there is no automatic retry after startup.</p>
      *
-     * <p>The engine executes the returned statements once, on the next startup,
-     * each in its own transaction and with errors ignored
-     * ({@code DatabaseUtil.executeScript(script, true)}). That is what makes
-     * the alternatives work: each vendor gets one complete-table-set move for
-     * the plain dated name, then {@code _2} and {@code _3}. MySQL moves the set
-     * with atomic {@code RENAME TABLE}; PostgreSQL and SQL Server use one
-     * transactional block; Oracle preflights every target and compensates
-     * successful moves in reverse if its auto-committing DDL fails midway. On
-     * a first uninstall the first set succeeds and the other two fail
-     * harmlessly because the source tables no longer exist; on a repeat
-     * uninstall the first fails because a target exists and the next free set
-     * takes over.
-     * Expect a handful of ignored errors in the startup log after any
-     * uninstall — they are the mechanism, not a fault. Each successful table
-     * set move is followed by independently retried vendor-specific renames for the indexes,
-     * constraints, and PostgreSQL sequences that otherwise retain live schema
-     * names and make reinstall fail. MySQL has no FK rename operation, so only
-     * archived-table candidates have their old/generated FKs dropped and
-     * recreated under archive names; exhausting all targets cannot alter the
-     * still-live schema.</p>
-     *
-     * <h3>Derby returns nothing at all</h3>
-     *
-     * <p>Derby cannot rename a table that another table's foreign key
-     * references (SQLSTATE X0Y25), and three of ours are referenced:
-     * {@code sentinel_monitor}, {@code sentinel_alert_event} and
-     * {@code sentinel_action}. The blocking constraints were created inline via
-     * {@code REFERENCES} and therefore carry system-generated names
-     * ({@code SQL240806...}) that a statically emitted script cannot drop.
-     * Renaming only the seven that Derby permits would be actively harmful: the
-     * next install would find {@code sentinel_monitor} present but its siblings
-     * missing and {@link #detectFromState()} would — correctly — refuse to
-     * start with "schema is partially applied". So on Derby this returns an
-     * empty list: every table keeps its name and its data, which satisfies the
-     * non-destructive goal completely. The visible difference is that a
-     * reinstall on Derby adopts the existing tables (detection reports
-     * {@link #LATEST_VERSION} and the version loop does nothing) rather than
-     * building fresh ones.</p>
-     *
-     * <p>Independently of what this returns, the engine records the plugin name
-     * in {@code extension_uninstall.properties} and, on the next startup,
-     * {@code removePropertiesForUninstalledExtensions()} DELETES every
-     * CONFIGURATION property under the plugin's group name — which includes
-     * {@code schema_version} (persisted under {@link #PLUGIN_NAME}), the ONLY
-     * property the plugin writes. The stored version is therefore always absent
-     * after a reinstall, and {@link #detectAndAlignSchemaVersion()} is what
-     * establishes the truth.</p>
-     *
-     * @return archive statements in the current vendor's dialect, or an empty
-     *         list on Derby and for an unrecognized vendor — never DROP
+     * @return table drops in foreign-key dependency order
      */
     @Override
     public List<String> getUninstallStatements() {
-        String databaseType = getDatabaseType();
-        if (databaseType == null || "derby".equalsIgnoreCase(databaseType)) {
-            log.info("Sentinel uninstall: leaving all tables in place under their current names "
-                    + "(database type '{}' cannot rename them safely); drop them manually if the data is not wanted",
-                    databaseType);
-            return new ArrayList<>();
+        boolean oracle = "oracle".equalsIgnoreCase(getDatabaseType());
+        List<String> statements = new ArrayList<>(UNINSTALL_TABLES.length);
+        for (String table : UNINSTALL_TABLES) {
+            statements.add("DROP TABLE " + table + (oracle ? " PURGE" : ""));
         }
-
-        String vendor = databaseType.toLowerCase(Locale.ROOT);
-        if (!Arrays.asList("postgres", "mysql", "oracle", "sqlserver").contains(vendor)) {
-            log.info("Sentinel uninstall: leaving all tables in place under their current names "
-                    + "(unrecognized database type '{}'); drop them manually if the data is not wanted",
-                    databaseType);
-            return new ArrayList<>();
-        }
-
-        LocalDate archiveDate = LocalDate.now(ZoneId.systemDefault());
-        int identifierLimit = identifierLimit(vendor);
-
-        List<String> statements = new ArrayList<>();
-        // Each suffix moves the complete related table set or none of it. This
-        // prevents unevenly cleaned archives from producing a partial live
-        // schema that reinstall would correctly reject.
-        for (int attempt = 1; attempt <= RENAME_ATTEMPTS; attempt++) {
-            statements.add(tableSetArchiveStatement(
-                    vendor, archiveDate, attempt, identifierLimit));
-        }
-
-        addObjectArchiveStatements(
-                statements, vendor, archiveDate, identifierLimit);
-        if ("mysql".equals(vendor)) {
-            addMySqlArchiveForeignKeys(
-                    statements, archiveDate, identifierLimit);
-        }
-
-        log.info("Sentinel uninstall: archiving {} tables and their named schema objects with date {}; "
-                + "drop them manually once the data is no longer needed",
-                UNINSTALL_TABLES.length, archiveDate.format(DateTimeFormatter.BASIC_ISO_DATE));
-        for (int i = RENAME_ATTEMPTS; i < statements.size(); i++) {
-            String statement = statements.get(i);
-            if (statement.startsWith("ALTER INDEX ") || statement.startsWith("ALTER SEQUENCE ")
-                    || statement.startsWith("DECLARE @sentinel_object")) {
-                statements.set(i, guardArchivedObjects(vendor, statement));
-            }
-        }
+        log.info("Sentinel uninstall: queued removal of all {} live tables and their data on next startup",
+                UNINSTALL_TABLES.length);
         return statements;
-    }
-
-    private static String guardArchivedObjects(String vendor, String statement) {
-        String quoted = statement.replace("'", "''");
-        return switch (vendor) {
-            case "postgres" -> "DO $sentinel$ BEGIN IF to_regclass('sentinel_monitor') IS NULL THEN "
-                    + "EXECUTE '" + quoted + "'; END IF; END $sentinel$";
-            case "oracle" -> "DECLARE sentinel_live PLS_INTEGER; BEGIN SELECT COUNT(*) INTO sentinel_live "
-                    + "FROM user_tables WHERE table_name = 'SENTINEL_MONITOR'; IF sentinel_live = 0 THEN "
-                    + "EXECUTE IMMEDIATE '" + quoted + "'; END IF; END;";
-            case "sqlserver" -> "IF OBJECT_ID(N'sentinel_monitor', N'U') IS NULL BEGIN " + statement + "; END";
-            default -> throw new IllegalArgumentException("Unsupported global object guard: " + vendor);
-        };
-    }
-
-    private static String tableSetArchiveStatement(
-            String vendor, LocalDate date, int attempt, int identifierLimit) {
-        switch (vendor) {
-            case "mysql":
-                return mysqlTableSetArchiveStatement(date, attempt, identifierLimit);
-            case "postgres":
-                return postgresTableSetArchiveStatement(date, attempt, identifierLimit);
-            case "sqlserver":
-                return sqlServerTableSetArchiveStatement(date, attempt, identifierLimit);
-            case "oracle":
-                return oracleTableSetArchiveStatement(date, attempt, identifierLimit);
-            default:
-                throw new IllegalArgumentException("Unsupported database type: " + vendor);
-        }
-    }
-
-    private static String mysqlTableSetArchiveStatement(
-            LocalDate date, int attempt, int identifierLimit) {
-        List<String> renames = new ArrayList<>();
-        for (String table : UNINSTALL_TABLES) {
-            renames.add(table + " TO " + archiveName(table, date, attempt, identifierLimit));
-        }
-        // RENAME TABLE is atomic when it contains multiple rename pairs.
-        return "RENAME TABLE " + String.join(", ", renames);
-    }
-
-    private static String postgresTableSetArchiveStatement(
-            LocalDate date, int attempt, int identifierLimit) {
-        StringBuilder sql = new StringBuilder("DO $sentinel$ BEGIN ");
-        sql.append("IF ");
-        for (int i = 0; i < UNINSTALL_TABLES.length; i++) {
-            if (i > 0) {
-                sql.append(" OR ");
-            }
-            sql.append("to_regclass('")
-                    .append(archiveName(UNINSTALL_TABLES[i], date, attempt, identifierLimit))
-                    .append("') IS NOT NULL");
-        }
-        sql.append(" THEN RAISE EXCEPTION 'Sentinel archive target set is occupied'; END IF; ");
-        for (String table : UNINSTALL_TABLES) {
-            sql.append("ALTER TABLE ").append(table).append(" RENAME TO ")
-                    .append(archiveName(table, date, attempt, identifierLimit)).append("; ");
-        }
-        // PostgreSQL DDL is transactional, so any source/target race rolls the
-        // complete block back before DatabaseUtil tries the next suffix.
-        return sql.append("END $sentinel$").toString();
-    }
-
-    private static String sqlServerTableSetArchiveStatement(
-            LocalDate date, int attempt, int identifierLimit) {
-        StringBuilder sql = new StringBuilder("SET XACT_ABORT ON; IF ");
-        for (int i = 0; i < UNINSTALL_TABLES.length; i++) {
-            if (i > 0) {
-                sql.append(" OR ");
-            }
-            sql.append("OBJECT_ID(N'")
-                    .append(archiveName(UNINSTALL_TABLES[i], date, attempt, identifierLimit))
-                    .append("', N'U') IS NOT NULL");
-        }
-        sql.append(" BEGIN THROW 51000, 'Sentinel archive target set is occupied', 1; END; ");
-        for (String table : UNINSTALL_TABLES) {
-            sql.append(renameStatement("sqlserver", table,
-                    archiveName(table, date, attempt, identifierLimit))).append("; ");
-        }
-        // sp_rename participates in the surrounding JDBC transaction. XACT_ABORT
-        // ensures an unexpected mid-batch error cannot leave a partial set.
-        return sql.toString().trim();
-    }
-
-    private static String oracleTableSetArchiveStatement(
-            LocalDate date, int attempt, int identifierLimit) {
-        StringBuilder sql = new StringBuilder(
-                "DECLARE sentinel_conflicts PLS_INTEGER; sentinel_step PLS_INTEGER := 0; BEGIN ");
-        sql.append("SELECT COUNT(*) INTO sentinel_conflicts FROM user_tables WHERE table_name IN (");
-        for (int i = 0; i < UNINSTALL_TABLES.length; i++) {
-            if (i > 0) {
-                sql.append(", ");
-            }
-            sql.append("'")
-                    .append(archiveName(UNINSTALL_TABLES[i], date, attempt, identifierLimit)
-                            .toUpperCase(Locale.ROOT))
-                    .append("'");
-        }
-        sql.append("); IF sentinel_conflicts > 0 THEN "
-                + "RAISE_APPLICATION_ERROR(-20068, 'Sentinel archive target set is occupied'); END IF; ");
-        for (int i = 0; i < UNINSTALL_TABLES.length; i++) {
-            String table = UNINSTALL_TABLES[i];
-            sql.append("EXECUTE IMMEDIATE 'ALTER TABLE ").append(table).append(" RENAME TO ")
-                    .append(archiveName(table, date, attempt, identifierLimit))
-                    .append("'; sentinel_step := ").append(i + 1).append("; ");
-        }
-        // Oracle DDL auto-commits, so transaction rollback cannot protect the
-        // set. Preflight all targets and compensate successful moves in reverse
-        // order if a source disappears or another unexpected DDL error occurs.
-        sql.append("EXCEPTION WHEN OTHERS THEN ");
-        for (int i = UNINSTALL_TABLES.length - 1; i >= 0; i--) {
-            String table = UNINSTALL_TABLES[i];
-            sql.append("IF sentinel_step >= ").append(i + 1).append(" THEN BEGIN EXECUTE IMMEDIATE '")
-                    .append("ALTER TABLE ")
-                    .append(archiveName(table, date, attempt, identifierLimit))
-                    .append(" RENAME TO ").append(table)
-                    .append("'; EXCEPTION WHEN OTHERS THEN NULL; END; END IF; ");
-        }
-        return sql.append("RAISE; END;").toString();
-    }
-
-    private static void addObjectArchiveStatements(List<String> statements, String vendor,
-            LocalDate date, int identifierLimit) {
-        for (NamedObject index : UNINSTALL_INDEXES) {
-            switch (vendor) {
-                case "postgres":
-                case "oracle":
-                    addGlobalRenameAlternatives(statements, "ALTER INDEX " + index.name()
-                            + " RENAME TO ", index.name(), date, identifierLimit);
-                    break;
-                case "mysql":
-                    addTableIndexRenameAlternatives(
-                            statements, vendor, index, date, identifierLimit);
-                    break;
-                case "sqlserver":
-                    addTableIndexRenameAlternatives(
-                            statements, vendor, index, date, identifierLimit);
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        if ("postgres".equals(vendor)) {
-            addConstraintArchiveStatements(
-                    statements, POSTGRES_CONSTRAINTS, date, identifierLimit, true);
-            for (NamedObject sequence : POSTGRES_SEQUENCES) {
-                addGlobalRenameAlternatives(statements, "ALTER SEQUENCE " + sequence.name()
-                        + " RENAME TO ", sequence.name(), date, identifierLimit);
-            }
-        } else if ("oracle".equals(vendor)) {
-            addConstraintArchiveStatements(
-                    statements, ORACLE_CONSTRAINTS, date, identifierLimit, true);
-        } else if ("sqlserver".equals(vendor)) {
-            for (NamedObject constraint : SQLSERVER_CONSTRAINTS) {
-                for (int objectAttempt = 1; objectAttempt <= RENAME_ATTEMPTS; objectAttempt++) {
-                    String target = archiveName(
-                            constraint.name(), date, objectAttempt, identifierLimit);
-                    // Constraints are schema objects in SQL Server. Qualifying
-                    // them as table.constraint is invalid; resolve the current
-                    // user's default schema explicitly for installations that
-                    // do not use dbo.
-                    statements.add("DECLARE @sentinel_object NVARCHAR(776) = "
-                            + "QUOTENAME(SCHEMA_NAME()) + N'.' + QUOTENAME(N'"
-                            + constraint.name() + "'); EXEC sp_rename @sentinel_object, N'"
-                            + target + "', N'OBJECT'");
-                }
-            }
-        }
-    }
-
-    private static void addConstraintArchiveStatements(List<String> statements, NamedObject[] constraints,
-            LocalDate date, int identifierLimit, boolean renameBackingIndex) {
-        for (NamedObject constraint : constraints) {
-            for (int tableAttempt = 1; tableAttempt <= RENAME_ATTEMPTS; tableAttempt++) {
-                String archivedTable = archiveName(
-                        constraint.table(), date, tableAttempt, identifierLimit);
-                for (int objectAttempt = 1; objectAttempt <= RENAME_ATTEMPTS; objectAttempt++) {
-                    statements.add("ALTER TABLE " + archivedTable + " RENAME CONSTRAINT "
-                            + constraint.name() + " TO "
-                            + archiveName(constraint.name(), date, objectAttempt, identifierLimit));
-                }
-            }
-            if (renameBackingIndex) {
-                // Only PK/UNIQUE constraints have a backing index. Trying this
-                // for an FK is harmless because uninstall scripts ignore errors.
-                addGlobalRenameAlternatives(statements, "ALTER INDEX " + constraint.name()
-                        + " RENAME TO ", constraint.name(), date, identifierLimit);
-            }
-        }
-    }
-
-    private static void addTableIndexRenameAlternatives(List<String> statements, String vendor,
-            NamedObject index, LocalDate date, int identifierLimit) {
-        for (int tableAttempt = 1; tableAttempt <= RENAME_ATTEMPTS; tableAttempt++) {
-            String archivedTable = archiveName(index.table(), date, tableAttempt, identifierLimit);
-            for (int objectAttempt = 1; objectAttempt <= RENAME_ATTEMPTS; objectAttempt++) {
-                String target = archiveName(index.name(), date, objectAttempt, identifierLimit);
-                if ("mysql".equals(vendor)) {
-                    statements.add("ALTER TABLE " + archivedTable + " RENAME INDEX "
-                            + index.name() + " TO " + target);
-                } else {
-                    statements.add("EXEC sp_rename '" + archivedTable + "." + index.name()
-                            + "', '" + target + "', 'INDEX'");
-                }
-            }
-        }
-    }
-
-    private static void addGlobalRenameAlternatives(List<String> statements, String prefix,
-            String objectName, LocalDate date, int identifierLimit) {
-        for (int objectAttempt = 1; objectAttempt <= RENAME_ATTEMPTS; objectAttempt++) {
-            statements.add(prefix + archiveName(objectName, date, objectAttempt, identifierLimit));
-        }
-    }
-
-    private static void addMySqlArchiveForeignKeys(List<String> statements,
-            LocalDate date, int identifierLimit) {
-        for (int tableAttempt = 1; tableAttempt <= RENAME_ATTEMPTS; tableAttempt++) {
-            Map<String, String> tables = new HashMap<>();
-            for (String table : UNINSTALL_TABLES) {
-                tables.put(table, archiveName(table, date, tableAttempt, identifierLimit));
-            }
-
-            // These statements address archived candidates only. If all three
-            // table targets are occupied the still-live schema is never altered.
-            for (NamedObject foreignKey : MYSQL_FOREIGN_KEYS_TO_DROP) {
-                statements.add("ALTER TABLE " + tables.get(foreignKey.table())
-                        + " DROP FOREIGN KEY " + foreignKey.name());
-                String generatedPrefix = foreignKey.table() + "_ibfk_";
-                if (foreignKey.name().startsWith(generatedPrefix)) {
-                    String ordinal = foreignKey.name().substring(foreignKey.table().length());
-                    statements.add("ALTER TABLE " + tables.get(foreignKey.table())
-                            + " DROP FOREIGN KEY " + tables.get(foreignKey.table()) + ordinal);
-                }
-            }
-            for (ForeignKey foreignKey : MYSQL_ARCHIVE_FOREIGN_KEYS) {
-                statements.add("ALTER TABLE " + tables.get(foreignKey.table())
-                        + " ADD CONSTRAINT "
-                        + archiveName(foreignKey.name(), date, tableAttempt, identifierLimit)
-                        + " FOREIGN KEY (" + foreignKey.column() + ") REFERENCES "
-                        + tables.get(foreignKey.parentTable()) + "(id) " + foreignKey.deleteRule());
-            }
-        }
-    }
-
-    private static int identifierLimit(String vendor) {
-        switch (vendor) {
-            case "oracle":
-                // Compatible with pre-12.2 Oracle as well as current releases.
-                return 30;
-            case "postgres":
-                return 63;
-            case "mysql":
-                return 64;
-            case "sqlserver":
-                return 128;
-            default:
-                throw new IllegalArgumentException("Unsupported database type: " + vendor);
-        }
-    }
-
-    /**
-     * Builds an archive identifier without relying on vendor truncation. The
-     * stable hash prevents two long names with the same prefix from collapsing
-     * to one identifier under Oracle's 30-character limit.
-     */
-    static String archiveName(String original, LocalDate date, int attempt, int maxLength) {
-        if (attempt < 1 || maxLength < 16) {
-            throw new IllegalArgumentException("Invalid archive naming bounds");
-        }
-        String marker = "_u" + date.format(DateTimeFormatter.BASIC_ISO_DATE)
-                + (attempt == 1 ? "" : "_" + attempt);
-        int available = maxLength - marker.length();
-        if (original.length() <= available) {
-            return original + marker;
-        }
-        String hash = String.format(Locale.ROOT, "%08x", original.hashCode());
-        int prefixLength = available - hash.length() - 1;
-        if (prefixLength < 1) {
-            throw new IllegalArgumentException("Identifier limit too small for archive name");
-        }
-        return original.substring(0, prefixLength) + "_" + hash + marker;
-    }
-
-    /**
-     * Renders one "rename {@code from} to {@code to}" statement in the given
-     * vendor's dialect.
-     *
-     * <p>The dialects genuinely differ in shape, not just in keywords:
-     * PostgreSQL and Oracle spell it as an {@code ALTER TABLE} sub-command,
-     * Derby and MySQL as a top-level {@code RENAME TABLE} statement, and SQL
-     * Server has no rename DDL at all — it exposes the operation as the
-     * {@code sp_rename} system stored procedure, whose second argument is a
-     * bare name (schema-qualifying it is an error). Derby's {@code RENAME
-     * TABLE} exists but is unusable for us; see
-     * {@link #getUninstallStatements()}.</p>
-     *
-     * @param databaseType the engine's configured database type
-     * @param from         the current table name
-     * @param to           the target table name
-     * @return the statement, or {@code null} when this vendor cannot be renamed
-     *         safely (Derby) or is not recognized
-     */
-    private static String renameStatement(String databaseType, String from, String to) {
-        if (databaseType == null) {
-            return null;
-        }
-        switch (databaseType.toLowerCase(Locale.ROOT)) {
-            case "postgres":
-            case "oracle":
-                return "ALTER TABLE " + from + " RENAME TO " + to;
-            case "mysql":
-                return "RENAME TABLE " + from + " TO " + to;
-            case "sqlserver":
-                return "EXEC sp_rename '" + from + "', '" + to + "'";
-            default:
-                // Derby (cannot rename FK-referenced tables) and anything unrecognized:
-                // change nothing rather than risk a half-renamed schema.
-                return null;
-        }
     }
 }

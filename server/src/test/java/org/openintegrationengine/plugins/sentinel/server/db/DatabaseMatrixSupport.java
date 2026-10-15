@@ -20,9 +20,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.LocalDate;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -98,6 +95,9 @@ final class DatabaseMatrixSupport {
                             database.vendor() + " empty fixture was not empty");
                 }
 
+                if (sourceVersion > 0) {
+                    insertLifecycleMarkers(connection, database.vendor(), sourceVersion);
+                }
                 if (sourceVersion == 11) {
                     execute(connection, "INSERT INTO sentinel_connector_status_event "
                             + "(channel_id, metadata_id, node_id, previous_state, new_state, changed_time) VALUES "
@@ -125,77 +125,147 @@ final class DatabaseMatrixSupport {
                 assertLatestSchema(connection, database.vendor());
                 assertEquals(1, version.writes().get(), database.vendor()
                         + " restart realigned the version before writing its final value");
+                if (sourceVersion > 0) {
+                    assertLifecycleMarkers(connection, sourceVersion);
+                }
                 MatrixEvidenceSupport.database(connection, database.vendor(), "upgrade-from-" + sourceVersion);
             }
         });
     }
 
-    /** Runs the real non-destructive uninstall scripts, restart and reinstall. */
+    /** Runs the queued uninstall SQL with the engine's per-statement commit/rollback behavior. */
     static void verifyUninstallRestartReinstall(MatrixDatabase database) throws Exception {
         withVersionProperty((version) -> {
             try (Connection connection = database.open()) {
                 resetDatabase(connection, database.vendor());
-                SentinelMigrator installed = migrator(connection, database.vendor());
-                installed.migrate();
-                insertUninstallMarker(connection, database.vendor());
-
-                SentinelMigrator uninstall = new SentinelMigrator();
-                uninstall.setDatabaseType(database.vendor());
-                List<String> statements = uninstall.getUninstallStatements();
-                executeIgnoringFailures(connection, statements);
-
-                if ("derby".equals(database.vendor())) {
-                    assertTrue(tableExists(connection, "sentinel_monitor"),
-                            "Derby uninstall must preserve the live schema");
-                    assertEquals(1, markerCount(connection, "sentinel_monitor"));
-                } else {
-                    assertFalse(tableExists(connection, "sentinel_monitor"),
-                            database.vendor() + " uninstall left the live schema in place");
-                    String archivedMonitor = archivedMonitorTable(connection, 1);
-                    assertNotNull(archivedMonitor,
-                            database.vendor() + " uninstall created no monitor archive");
-                    assertEquals(1, markerCount(connection, archivedMonitor),
-                            database.vendor() + " uninstall did not preserve archived data");
-                }
-
-                // The engine removes the extension's CONFIGURATION group on
-                // uninstall. A fresh migrator must therefore detect tables (or
-                // their absence) without relying on the old property.
-                version.clear();
                 migrator(connection, database.vendor()).migrate();
-                assertLatestSchema(connection, database.vendor());
-                assertEquals(String.valueOf(SentinelMigrator.LATEST_VERSION), version.get());
-
-                if (!"derby".equals(database.vendor())) {
-                    for (int cycle = 2; cycle <= 3; cycle++) {
-                        insertUninstallMarker(connection, database.vendor());
-                        executeIgnoringFailures(connection, uninstall.getUninstallStatements());
-                        assertFalse(tableExists(connection, "sentinel_monitor"), database.vendor() + " archive cycle " + cycle);
-                        String archive = archivedMonitorTable(connection, cycle);
-                        assertNotNull(archive);
-                        assertEquals(1, markerCount(connection, archive));
-                        version.clear();
-                        migrator(connection, database.vendor()).migrate();
-                        assertLatestSchema(connection, database.vendor());
-                    }
-                    insertUninstallMarker(connection, database.vendor());
-                    List<String> liveIndexes = indexNames(connection, "sentinel_monitor");
-                    executeIgnoringFailures(connection, uninstall.getUninstallStatements());
-                    assertTrue(tableExists(connection, "sentinel_monitor"), "Exhausted archive targets moved live schema");
-                    assertEquals(1, markerCount(connection, "sentinel_monitor"));
-                    assertEquals(liveIndexes, indexNames(connection, "sentinel_monitor"),
-                            "Exhausted archive targets renamed live indexes");
-                    version.clear();
-                    migrator(connection, database.vendor()).migrate();
-                    assertLatestSchema(connection, database.vendor());
+                createUnrelatedTable(connection);
+                try {
                     for (int cycle = 1; cycle <= 3; cycle++) {
-                        assertEquals(1, markerCount(connection, archivedMonitorTable(connection, cycle)));
+                        insertLifecycleMarkers(connection, database.vendor(), SentinelMigrator.LATEST_VERSION);
+                        assertLifecycleMarkers(connection, SentinelMigrator.LATEST_VERSION);
+                        MatrixEvidenceSupport.database(connection, database.vendor(), "before-uninstall-" + cycle);
+                        assertEquals(List.of(), executeIgnoringFailures(connection, uninstallStatements(database.vendor())),
+                                "Complete schema uninstall failed; check foreign-key dependency order");
+                        assertRemovedAndReinstall(connection, database.vendor(), version, "uninstall-cycle-" + cycle);
                     }
-                    System.out.println(database.vendor() + " archive cycles=3 retained markers=4 exhausted-target live indexes preserved");
+                } finally {
+                    dropUnrelatedTable(connection, database.vendor());
                 }
-                MatrixEvidenceSupport.database(connection, database.vendor(), "final-reinstall-state");
             }
         });
+    }
+
+    /** Missing tables in an old or never-installed schema must not prevent later drops. */
+    static void verifyUninstallFrom(MatrixDatabase database, int sourceVersion) throws Exception {
+        withVersionProperty((version) -> {
+            try (Connection connection = database.open()) {
+                resetDatabase(connection, database.vendor());
+                if (sourceVersion > 0) {
+                    migrator(connection, database.vendor()).migrateTo(sourceVersion);
+                    insertLifecycleMarkers(connection, database.vendor(), sourceVersion);
+                }
+                createUnrelatedTable(connection);
+                try {
+                    executeIgnoringFailures(connection, uninstallStatements(database.vendor()));
+                    assertRemovedAndReinstall(connection, database.vendor(), version, "uninstall-from-" + sourceVersion);
+                } finally {
+                    dropUnrelatedTable(connection, database.vendor());
+                }
+            }
+        });
+    }
+
+    /** A restart can find any committed prefix of the queued uninstall already applied. */
+    static void verifyInterruptedUninstall(MatrixDatabase database, int completedStatements) throws Exception {
+        withVersionProperty((version) -> {
+            try (Connection connection = database.open()) {
+                resetDatabase(connection, database.vendor());
+                migrator(connection, database.vendor()).migrate();
+                insertLifecycleMarkers(connection, database.vendor(), SentinelMigrator.LATEST_VERSION);
+                createUnrelatedTable(connection);
+                try {
+                    List<String> statements = uninstallStatements(database.vendor());
+                    assertEquals(List.of(), executeIgnoringFailures(connection,
+                            statements.subList(0, completedStatements)));
+                    executeIgnoringFailures(connection, statements);
+                    assertRemovedAndReinstall(connection, database.vendor(), version,
+                            "uninstall-interrupted-after-" + completedStatements);
+                } finally {
+                    dropUnrelatedTable(connection, database.vendor());
+                }
+            }
+        });
+    }
+
+    private static List<String> uninstallStatements(String vendor) {
+        // DefaultExtensionController does not give this callback a connection.
+        SentinelMigrator migrator = new SentinelMigrator();
+        migrator.setDatabaseType(vendor);
+        return migrator.getUninstallStatements();
+    }
+
+    private static void assertRemovedAndReinstall(Connection connection, String vendor,
+            VersionState version, String label) throws Exception {
+        assertNoSentinelTables(connection, vendor);
+        assertEquals(1, rowCount(connection, "matrix_unrelated"), "Uninstall affected another extension's data");
+        MatrixEvidenceSupport.database(connection, vendor, label + "-removed");
+        MatrixEvidenceSupport.observation(vendor, label + "-unrelated", "matrix_unrelated rows=1 marker=keep");
+
+        // Replay uses the same ignore-errors policy as the engine; already
+        // absent tables are harmless and must not prevent later statements.
+        executeIgnoringFailures(connection, uninstallStatements(vendor));
+        assertNoSentinelTables(connection, vendor);
+        assertEquals(1, rowCount(connection, "matrix_unrelated"));
+
+        // Explicit uninstall clears the plugin's version property. Reinstall
+        // must create an empty schema, with no archived or retained user data.
+        version.clear();
+        migrator(connection, vendor).migrate();
+        migrator(connection, vendor).migrate();
+        assertLatestSchema(connection, vendor);
+        assertEquals(String.valueOf(SentinelMigrator.LATEST_VERSION), version.get());
+        for (String table : LIVE_TABLES) {
+            assertEquals(0, rowCount(connection, table), "Reinstall retained rows in " + table);
+        }
+        assertEquals(LIVE_TABLES.length + 2, sentinelTables(connection).stream()
+                .filter((table) -> table.toLowerCase(Locale.ROOT).startsWith("sentinel_")).count());
+        MatrixEvidenceSupport.database(connection, vendor, label + "-reinstalled");
+    }
+
+    private static void assertNoSentinelTables(Connection connection, String vendor) throws Exception {
+        assertEquals(List.of(), sentinelTables(connection).stream()
+                .filter((table) -> table.toLowerCase(Locale.ROOT).startsWith("sentinel_"))
+                .filter((table) -> !table.equalsIgnoreCase("sentinel_unrelated_extension")
+                        && !table.equalsIgnoreCase("sentinel_monitor_u20250101")).toList(),
+                vendor + " uninstall left live or newly archived Sentinel tables");
+        assertEquals(1, rowCount(connection, "sentinel_unrelated_extension"),
+                "Uninstall swept up another extension's table sharing the prefix");
+        assertEquals(1, rowCount(connection, "sentinel_monitor_u20250101"),
+                "Uninstall swept up a pre-existing legacy archive");
+        if ("oracle".equals(vendor)) {
+            try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                    "SELECT COUNT(*) FROM user_recyclebin WHERE original_name LIKE 'SENTINEL_%'")) {
+                assertTrue(rows.next());
+                assertEquals(0, rows.getInt(1), "Oracle retained uninstalled tables in its recycle bin");
+            }
+        }
+    }
+
+    private static void createUnrelatedTable(Connection connection) throws Exception {
+        execute(connection, "CREATE TABLE matrix_unrelated (marker VARCHAR(16) NOT NULL)");
+        execute(connection, "INSERT INTO matrix_unrelated (marker) VALUES ('keep')");
+        execute(connection, "CREATE TABLE sentinel_unrelated_extension (marker VARCHAR(16) NOT NULL)");
+        execute(connection, "INSERT INTO sentinel_unrelated_extension (marker) VALUES ('keep')");
+        execute(connection, "CREATE TABLE sentinel_monitor_u20250101 (id INTEGER NOT NULL, name VARCHAR(255))");
+        execute(connection, "INSERT INTO sentinel_monitor_u20250101 (id, name) VALUES (1, 'existing-archive')");
+    }
+
+    private static void dropUnrelatedTable(Connection connection, String vendor) throws Exception {
+        String suffix = "oracle".equals(vendor) ? " PURGE" : "";
+        execute(connection, "DROP TABLE matrix_unrelated" + suffix);
+        execute(connection, "DROP TABLE sentinel_unrelated_extension" + suffix);
+        execute(connection, "DROP TABLE sentinel_monitor_u20250101" + suffix);
     }
 
     /** Simulates auto-committed ALTER followed by failure before its completion index. */
@@ -354,9 +424,9 @@ final class DatabaseMatrixSupport {
         String booleanTrue = vendor.equals("oracle") || vendor.equals("sqlserver") ? "1" : "TRUE";
         String sql = "INSERT INTO sentinel_monitor (name, description, monitor_type, scope_type, "
                 + "scope_id, enabled, severity, config_json, min_consecutive_breaches, "
-                + "suppressed_by_monitor_id, runbook_url, created_by, created_time, updated_by, updated_time) "
+                + "suppressed_by_monitor_id, created_by, created_time, updated_by, updated_time) "
                 + "VALUES (?, NULL, 'INACTIVITY', 'ALL', NULL, " + booleanTrue
-                + ", 'HIGH', '{}', 1, NULL, NULL, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)";
+                + ", 'HIGH', '{}', 1, NULL, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, "matrix-uninstall-marker");
             assertEquals(1, statement.executeUpdate());
@@ -372,17 +442,83 @@ final class DatabaseMatrixSupport {
         }
     }
 
-    private static String archivedMonitorTable(Connection connection, int ordinal) throws Exception {
-        String suffix = "_u" + LocalDate.now(ZoneId.systemDefault())
-                .format(DateTimeFormatter.BASIC_ISO_DATE)
-                + (ordinal == 1 ? "" : "_" + ordinal);
-        return sentinelTables(connection).stream()
-                .filter((name) -> name.equalsIgnoreCase("sentinel_monitor" + suffix))
-                .findFirst().orElse(null);
+    /** Data common to v1 onward, plus later tables only when that schema includes them. */
+    private static void insertLifecycleMarkers(Connection connection, String vendor, int schemaVersion)
+            throws Exception {
+        insertUninstallMarker(connection, vendor);
+        String trueLiteral = "oracle".equals(vendor) || "sqlserver".equals(vendor) ? "1" : "TRUE";
+        execute(connection, "INSERT INTO sentinel_monitor (name, monitor_type, scope_type, config_json, "
+                + "suppressed_by_monitor_id, created_time) SELECT 'matrix-dependent-monitor', 'INACTIVITY', "
+                + "'ALL', '{}', id, CURRENT_TIMESTAMP FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
+        execute(connection, "INSERT INTO sentinel_alert_event (monitor_id, channel_id, severity, status, "
+                + "message, opened_time) SELECT id, 'matrix-channel', 'HIGH', 'PROBLEM', "
+                + "'matrix-history-marker', CURRENT_TIMESTAMP FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
+        execute(connection, "INSERT INTO sentinel_trigger_state (monitor_id, channel_id, open_alert_event_id) "
+                + "SELECT monitor_id, channel_id, id FROM sentinel_alert_event");
+        execute(connection, "INSERT INTO sentinel_action (name, action_type, condition_json, config_json, created_time) "
+                + "VALUES ('matrix-action', 'EMAIL', '{}', '{}', CURRENT_TIMESTAMP)");
+        execute(connection, "INSERT INTO sentinel_action_dispatch_log (alert_event_id, action_id, dispatch_time, success) "
+                + "SELECT e.id, a.id, CURRENT_TIMESTAMP, " + trueLiteral
+                + " FROM sentinel_alert_event e CROSS JOIN sentinel_action a");
+        execute(connection, "INSERT INTO sentinel_channel_activity_sample (channel_id, sample_time, received_delta) "
+                + "VALUES ('matrix-channel', CURRENT_TIMESTAMP, 42)");
+        execute(connection, "INSERT INTO sentinel_channel_activity_trend (channel_id, hour_bucket, received_sum) "
+                + "VALUES ('matrix-channel', CURRENT_TIMESTAMP, 84)");
+        String nodeColumn = schemaVersion >= 8 ? ", node_id" : "";
+        String nodeValue = schemaVersion >= 8 ? ", 'matrix-node'" : "";
+        execute(connection, "INSERT INTO sentinel_connector_status_event "
+                + "(channel_id, metadata_id, new_state, changed_time" + nodeColumn + ") "
+                + "VALUES ('matrix-channel', 0, 'STARTED', CURRENT_TIMESTAMP" + nodeValue + ")");
+        execute(connection, "INSERT INTO sentinel_maintenance_window "
+                + "(name, scope_type, active_from, active_until, created_time) "
+                + "VALUES ('matrix-window', 'ALL', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+        if (schemaVersion >= 4) {
+            execute(connection, "INSERT INTO sentinel_node_lease (lease_name, node_id, acquired_time, expires_time) "
+                    + "VALUES ('matrix-lease', 'matrix-node', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+        }
+        if (schemaVersion >= 11) {
+            execute(connection, "INSERT INTO sentinel_channel_presence (channel_id, node_id, metadata_id, deployed_time) "
+                    + "VALUES ('matrix-channel', 'matrix-node', 0, CURRENT_TIMESTAMP)");
+        }
     }
 
-    private static void executeIgnoringFailures(Connection connection, List<String> statements)
+    private static void assertLifecycleMarkers(Connection connection, int sourceVersion) throws Exception {
+        assertEquals(1, markerCount(connection, "sentinel_monitor"), "Upgrade lost monitor configuration");
+        assertEquals(2, rowCount(connection, "sentinel_monitor"));
+        for (String table : LIVE_TABLES) {
+            if ("sentinel_monitor".equals(table)) continue;
+            int expected = "sentinel_node_lease".equals(table) && sourceVersion < 4
+                    || "sentinel_channel_presence".equals(table) && sourceVersion < 11 ? 0
+                    : "sentinel_connector_status_event".equals(table) && sourceVersion == 11 ? 2 : 1;
+            assertEquals(expected, rowCount(connection, table), "Upgrade lost existing data in " + table);
+        }
+        try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                "SELECT COUNT(*) FROM sentinel_monitor child JOIN sentinel_monitor parent "
+                        + "ON child.suppressed_by_monitor_id = parent.id WHERE child.name = 'matrix-dependent-monitor' "
+                        + "AND parent.name = 'matrix-uninstall-marker'")) {
+            assertTrue(rows.next());
+            assertEquals(1, rows.getInt(1), "Upgrade changed monitor suppression configuration");
+        }
+        try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                "SELECT COUNT(*) FROM sentinel_action_dispatch_log dispatch "
+                        + "JOIN sentinel_alert_event event ON dispatch.alert_event_id = event.id "
+                        + "JOIN sentinel_action action ON dispatch.action_id = action.id "
+                        + "WHERE event.message = 'matrix-history-marker' AND action.name = 'matrix-action'")) {
+            assertTrue(rows.next());
+            assertEquals(1, rows.getInt(1), "Upgrade changed linked notification history");
+        }
+    }
+
+    private static long rowCount(Connection connection, String table) throws Exception {
+        try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery("SELECT COUNT(*) FROM " + table)) {
+            assertTrue(rows.next());
+            return rows.getLong(1);
+        }
+    }
+
+    private static List<String> executeIgnoringFailures(Connection connection, List<String> statements)
             throws Exception {
+        List<String> failures = new ArrayList<>();
         boolean autoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try {
@@ -390,13 +526,15 @@ final class DatabaseMatrixSupport {
                 try {
                     execute(connection, sql);
                     connection.commit();
-                } catch (SQLException expectedAlternativeFailure) {
+                } catch (SQLException failure) {
                     connection.rollback();
+                    failures.add(sql + " SQLState=" + failure.getSQLState());
                 }
             }
         } finally {
             connection.setAutoCommit(autoCommit);
         }
+        return failures;
     }
 
     private static List<String> sentinelTables(Connection connection) throws Exception {
@@ -497,20 +635,6 @@ final class DatabaseMatrixSupport {
             }
         }
         return false;
-    }
-
-    private static List<String> indexNames(Connection connection, String table) throws Exception {
-        List<String> names = new ArrayList<>();
-        for (String tableName : candidates(table)) {
-            try (ResultSet rows = connection.getMetaData().getIndexInfo(
-                    connection.getCatalog(), null, tableName, false, true)) {
-                while (rows.next()) {
-                    String found = rows.getString("INDEX_NAME");
-                    if (found != null && !names.contains(found)) names.add(found);
-                }
-            }
-        }
-        return names;
     }
 
     private static List<String> candidates(String name) {

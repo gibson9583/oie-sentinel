@@ -5,14 +5,22 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.db;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import java.time.LocalDate;
-import java.time.ZoneId;
+
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class SentinelMigratorTest {
 
@@ -21,113 +29,70 @@ class SentinelMigratorTest {
         assertEquals(13, SentinelMigrator.LATEST_VERSION);
     }
 
-    @Test
-    void archiveNamesRespectLegacyOracleLimitAndRemainDistinct() {
-        LocalDate date = LocalDate.of(2026, 8, 30);
-        String first = SentinelMigrator.archiveName(
-                "idx_sentinel_action_dispatch_log_event", date, 1, 30);
-        String repeat = SentinelMigrator.archiveName(
-                "idx_sentinel_action_dispatch_log_event", date, 2, 30);
-        String other = SentinelMigrator.archiveName(
-                "idx_sentinel_action_dispatch_log_action", date, 1, 30);
-
-        assertTrue(first.length() <= 30);
-        assertTrue(repeat.length() <= 30);
-        assertTrue(first.endsWith("_u20260830"));
-        assertTrue(repeat.endsWith("_u20260830_2"));
-        assertFalse(first.equals(repeat));
-        assertFalse(first.equals(other));
-        assertEquals(first, SentinelMigrator.archiveName(
-                "idx_sentinel_action_dispatch_log_event", date, 1, 30));
-    }
-
-    @Test
-    void postgresArchiveMovesTablesIndexesConstraintsAndSequences() {
+    @ParameterizedTest
+    @ValueSource(strings = {"derby", "postgres", "mysql", "sqlserver", "oracle"})
+    void uninstallWithoutConnectionDropsExactlyTheTablesCreatedByPackagedMigrations(String vendor)
+            throws Exception {
+        // The engine constructs the migrator without a JDBC connection when
+        // requesting uninstall statements, then executes the result on restart.
         SentinelMigrator migrator = new SentinelMigrator();
-        migrator.setDatabaseType("postgres");
+        migrator.setDatabaseType(vendor);
         List<String> statements = migrator.getUninstallStatements();
-        LocalDate date = LocalDate.now(ZoneId.systemDefault());
-        String archivedTable = SentinelMigrator.archiveName(
-                "sentinel_trigger_state", date, 1, 63);
+        Set<String> dropped = new HashSet<>();
+        String suffix = "oracle".equals(vendor) ? " PURGE" : "";
+        Pattern drop = Pattern.compile("DROP TABLE (sentinel_[a-z_]+)" + suffix);
+        for (String statement : statements) {
+            Matcher matcher = drop.matcher(statement);
+            assertTrue(matcher.matches(), "Uninstall must drop only its own table: " + statement);
+            assertTrue(dropped.add(matcher.group(1)), "Duplicate drop: " + statement);
+        }
+        assertFalse(dropped.isEmpty());
+        assertEquals(packagedTables(vendor), dropped,
+                "Uninstall must cover all schema generations without affecting unrelated tables");
 
-        int tableRename = indexOfContaining(statements,
-                "ALTER TABLE sentinel_trigger_state RENAME TO " + archivedTable);
-        int indexRename = indexOfContaining(statements,
-                "ALTER INDEX idx_sentinel_monitor_scope RENAME TO "
-                        + SentinelMigrator.archiveName(
-                                "idx_sentinel_monitor_scope", date, 1, 63));
-        assertTrue(tableRename >= 0);
-        assertEquals(0, tableRename);
-        assertTrue(statements.get(0).contains("Sentinel archive target set is occupied"));
-        assertTrue(statements.get(0).contains("ALTER TABLE sentinel_monitor RENAME TO "));
-        assertTrue(indexRename > tableRename);
-        assertTrue(statements.contains("ALTER TABLE " + archivedTable
-                + " RENAME CONSTRAINT sentinel_trigger_state_pkey TO "
-                + SentinelMigrator.archiveName("sentinel_trigger_state_pkey", date, 1, 63)));
-        assertTrue(indexOfContaining(statements, "ALTER SEQUENCE sentinel_trigger_state_id_seq RENAME TO "
-                + SentinelMigrator.archiveName("sentinel_trigger_state_id_seq", date, 1, 63)) >= 0);
-        assertFalse(statements.stream().anyMatch(statement -> statement.startsWith("DROP TABLE")));
+        // Derby does not declare every FK that other dialects enforce (notably
+        // trigger_state -> alert_event), so inspect each packaged dialect too.
+        List<String> order = statements.stream().map((sql) -> sql.split(" ")[2]).toList();
+        Pattern create = Pattern.compile("(?s)CREATE TABLE (?:IF NOT EXISTS )?(sentinel_[a-z_]+)\\s*\\((.*?)\\n\\)");
+        Pattern alter = Pattern.compile("(?s)ALTER TABLE (sentinel_[a-z_]+)\\s+(.*?)(?:\\n\\n|$)");
+        Pattern reference = Pattern.compile("REFERENCES (sentinel_[a-z_]+)");
+        for (String sql : packagedSql(vendor)) {
+            for (Pattern declaration : List.of(create, alter)) {
+                Matcher declared = declaration.matcher(sql);
+                while (declared.find()) {
+                    String child = declared.group(1);
+                    Matcher referenced = reference.matcher(declared.group(2));
+                    while (referenced.find()) {
+                        String parent = referenced.group(1);
+                        if (child.equals(parent)) continue; // A table can drop its own self-reference.
+                        assertTrue(order.indexOf(child) < order.indexOf(parent),
+                                vendor + " must drop " + child + " before referenced table " + parent);
+                    }
+                }
+            }
+        }
     }
 
-    @Test
-    void vendorArchiveScriptsHandleTheirSchemaNamespaces() {
-        LocalDate date = LocalDate.now(ZoneId.systemDefault());
-
-        SentinelMigrator oracle = new SentinelMigrator();
-        oracle.setDatabaseType("oracle");
-        List<String> oracleStatements = oracle.getUninstallStatements();
-        String oracleTrigger = SentinelMigrator.archiveName("sentinel_trigger_state", date, 1, 30);
-        assertTrue(indexOfContaining(oracleStatements,
-                "ALTER TABLE sentinel_trigger_state RENAME TO " + oracleTrigger) >= 0);
-        assertTrue(oracleStatements.get(0).contains("SELECT COUNT(*) INTO sentinel_conflicts"));
-        assertTrue(oracleStatements.get(0).contains("EXCEPTION WHEN OTHERS THEN"));
-        assertTrue(oracleStatements.get(0).contains(
-                "ALTER TABLE " + oracleTrigger + " RENAME TO sentinel_trigger_state"));
-        assertTrue(oracleStatements.contains("ALTER TABLE " + oracleTrigger
-                + " RENAME CONSTRAINT uq_sentinel_trigger_state TO "
-                + SentinelMigrator.archiveName("uq_sentinel_trigger_state", date, 1, 30)));
-        assertTrue(oracleStatements.contains("ALTER TABLE " + oracleTrigger
-                + " RENAME CONSTRAINT uq_sentinel_trigger_state TO "
-                + SentinelMigrator.archiveName("uq_sentinel_trigger_state", date, 2, 30)));
-
-        SentinelMigrator sqlServer = new SentinelMigrator();
-        sqlServer.setDatabaseType("sqlserver");
-        List<String> sqlServerStatements = sqlServer.getUninstallStatements();
-        assertTrue(sqlServerStatements.get(0).startsWith("SET XACT_ABORT ON; IF "));
-        assertTrue(sqlServerStatements.get(0).contains(
-                "EXEC sp_rename 'sentinel_monitor', 'sentinel_monitor_u"));
-        assertTrue(indexOfContaining(sqlServerStatements, "DECLARE @sentinel_object NVARCHAR(776) = "
-                + "QUOTENAME(SCHEMA_NAME()) + N'.' + QUOTENAME(N'df_sentinel_node_lease_epoch'); "
-                + "EXEC sp_rename @sentinel_object, N'"
-                + SentinelMigrator.archiveName("df_sentinel_node_lease_epoch", date, 1, 128)
-                + "', N'OBJECT'") >= 0);
-
-        SentinelMigrator mysql = new SentinelMigrator();
-        mysql.setDatabaseType("mysql");
-        List<String> mysqlStatements = mysql.getUninstallStatements();
-        String archivedDispatch = SentinelMigrator.archiveName(
-                "sentinel_action_dispatch_log", date, 1, 64);
-        String archivedAction = SentinelMigrator.archiveName("sentinel_action", date, 1, 64);
-        assertTrue(mysqlStatements.get(0).startsWith("RENAME TABLE sentinel_action_dispatch_log TO "
-                + archivedDispatch + ", "));
-        assertFalse(mysqlStatements.contains("ALTER TABLE sentinel_action_dispatch_log "
-                + "DROP FOREIGN KEY sentinel_action_dispatch_log_ibfk_2"));
-        assertTrue(mysqlStatements.contains("ALTER TABLE " + archivedDispatch
-                + " DROP FOREIGN KEY sentinel_action_dispatch_log_ibfk_2"));
-        assertTrue(mysqlStatements.contains("ALTER TABLE " + archivedDispatch
-                + " DROP FOREIGN KEY " + archivedDispatch + "_ibfk_2"));
-        assertTrue(mysqlStatements.contains("ALTER TABLE " + archivedDispatch
-                + " ADD CONSTRAINT "
-                + SentinelMigrator.archiveName("fk_sentinel_dispatch_action", date, 1, 64)
-                + " FOREIGN KEY (action_id) REFERENCES " + archivedAction + "(id) ON DELETE SET NULL"));
-
-        SentinelMigrator derby = new SentinelMigrator();
-        derby.setDatabaseType("derby");
-        assertTrue(derby.getUninstallStatements().isEmpty());
+    private static Set<String> packagedTables(String vendor) throws Exception {
+        Set<String> tables = new HashSet<>();
+        Pattern create = Pattern.compile("CREATE TABLE (?:IF NOT EXISTS )?(sentinel_[a-z_]+)");
+        for (String sql : packagedSql(vendor)) {
+            Matcher matcher = create.matcher(sql);
+            while (matcher.find()) tables.add(matcher.group(1));
+        }
+        return tables;
     }
 
-    private static int indexOfContaining(List<String> statements, String fragment) {
-        for (int i = 0; i < statements.size(); i++) if (statements.get(i).contains(fragment)) return i;
-        return -1;
+    private static List<String> packagedSql(String vendor) throws Exception {
+        List<String> scripts = new ArrayList<>();
+        for (int version = 1; version <= SentinelMigrator.LATEST_VERSION; version++) {
+            String suffix = version == 1 ? "tables" : "v" + version;
+            try (InputStream resource = SentinelMigratorTest.class.getResourceAsStream(
+                    "/" + vendor + "-sentinel-" + suffix + ".sql")) {
+                if (resource == null) continue; // Some migrations are implemented in Java.
+                scripts.add(new String(resource.readAllBytes(), StandardCharsets.UTF_8));
+            }
+        }
+        return scripts;
     }
 }

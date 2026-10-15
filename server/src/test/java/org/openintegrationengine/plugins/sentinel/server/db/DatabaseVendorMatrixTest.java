@@ -34,6 +34,7 @@ class DatabaseVendorMatrixTest {
                 DriverManager.getConnection("jdbc:derby:memory:" + name + ";drop=true");
             } catch (SQLException e) {
                 if (!"08006".equals(e.getSQLState()) && !"XJ004".equals(e.getSQLState())) throw e;
+                System.out.println("Removed isolated Derby database " + name + " SQLState=" + e.getSQLState());
             }
         }
     }
@@ -63,6 +64,38 @@ class DatabaseVendorMatrixTest {
     @Test
     void survivesUninstallRestartAndReinstall() throws Exception {
         DatabaseMatrixSupport.verifyUninstallRestartReinstall(derbyDatabase("reinstall"));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> uninstallsEveryHistoricalSchemaIncludingMissingTables() {
+        return IntStream.rangeClosed(0, SentinelMigrator.LATEST_VERSION)
+                .mapToObj((sourceVersion) -> dynamicTest("Uninstall Derby schema v" + sourceVersion,
+                        () -> {
+                            try {
+                                DatabaseMatrixSupport.verifyUninstallFrom(
+                                        derbyDatabase("uninstall-v" + sourceVersion), sourceVersion);
+                            } finally {
+                                cleanup();
+                                databases.clear();
+                            }
+                        }));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> resumesEveryPartiallyCommittedUninstall() {
+        SentinelMigrator migrator = new SentinelMigrator();
+        migrator.setDatabaseType("derby");
+        return IntStream.range(1, migrator.getUninstallStatements().size())
+                .mapToObj((completed) -> dynamicTest("Resume uninstall after " + completed + " committed drops",
+                        () -> {
+                            try {
+                                DatabaseMatrixSupport.verifyInterruptedUninstall(
+                                        derbyDatabase("partial-uninstall-" + completed), completed);
+                            } finally {
+                                cleanup();
+                                databases.clear();
+                            }
+                        }));
     }
 
     @Test
