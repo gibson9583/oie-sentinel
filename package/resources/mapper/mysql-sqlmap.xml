@@ -7,7 +7,7 @@
 <!--
      MySQL mapper for the Sentinel plugin. Every statement here binds a
      java.util.Map parameter (parameterType="map") and returns row(s) as
-     java.util.Map (resultType="map") — never a Java bean — matching the
+     java.util.Map (resultType="map" or a map resultMap) — never a Java bean — matching the
      shared cross-vendor contract. Map keys are the exact strings called out
      by that contract (camelCase for filter/lookup parameters such as
      monitorId/channelId/sortColumn, the literal DB column name for full-row
@@ -17,7 +17,30 @@
 -->
 <mapper namespace="Sentinel">
 
+    <!-- Connector/J returns DATETIME through getObject as LocalDateTime, while
+         the shared repositories expect Timestamp. Explicit temporal mappings use
+         getTimestamp without changing the engine-wide JDBC URL or other vendors. -->
+
     <!-- ========== MONITOR (table sentinel_monitor) ========== -->
+
+    <resultMap id="monitorResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="description" column="description" />
+        <result property="monitor_type" column="monitor_type" />
+        <result property="scope_type" column="scope_type" />
+        <result property="scope_id" column="scope_id" />
+        <result property="enabled" column="enabled" />
+        <result property="severity" column="severity" />
+        <result property="config_json" column="config_json" />
+        <result property="min_consecutive_breaches" column="min_consecutive_breaches" />
+        <result property="suppressed_by_monitor_id" column="suppressed_by_monitor_id" />
+        <result property="runbook_url" column="runbook_url" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" javaType="java.sql.Timestamp" />
+        <result property="updated_by" column="updated_by" />
+        <result property="updated_time" column="updated_time" javaType="java.sql.Timestamp" />
+    </resultMap>
 
     <!-- Import holds identity stable through validation and the final write. -->
     <select id="lockMonitor" parameterType="int" resultType="int" useCache="false" flushCache="true">
@@ -25,7 +48,7 @@
         FOR UPDATE
     </select>
 
-    <select id="getMonitor" parameterType="map" resultType="map">
+    <select id="getMonitor" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
                config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
                created_by, created_time, updated_by, updated_time
@@ -33,7 +56,7 @@
         WHERE id = #{id}
     </select>
 
-    <select id="listMonitors" parameterType="map" resultType="map">
+    <select id="listMonitors" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
                config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
                created_by, created_time, updated_by, updated_time
@@ -95,6 +118,25 @@
 
     <!-- ========== ALERT_EVENT (table sentinel_alert_event) ========== -->
 
+    <resultMap id="alertEventResult" type="map">
+        <result property="id" column="id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="metadata_id" column="metadata_id" />
+        <result property="severity" column="severity" />
+        <result property="status" column="status" />
+        <result property="message" column="message" />
+        <result property="opened_time" column="opened_time" javaType="java.sql.Timestamp" />
+        <result property="resolved_time" column="resolved_time" javaType="java.sql.Timestamp" />
+        <result property="acknowledged_by" column="acknowledged_by" />
+        <result property="acknowledged_time" column="acknowledged_time" javaType="java.sql.Timestamp" />
+        <result property="ack_comment" column="ack_comment" />
+        <result property="details_json" column="details_json" />
+        <result property="suppressed" column="suppressed" />
+        <result property="problem_pending" column="problem_pending" />
+        <result property="resolution_pending" column="resolution_pending" />
+    </resultMap>
+
     <insert id="insertAlertEvent" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_alert_event
             (monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
@@ -141,7 +183,7 @@
         UPDATE sentinel_alert_event SET resolution_pending = #{resolutionPending} WHERE id = #{id}
     </update>
 
-    <select id="listPendingProblemAlertEvents" resultType="map">
+    <select id="listPendingProblemAlertEvents" resultMap="alertEventResult">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
                problem_pending, resolution_pending
@@ -150,7 +192,7 @@
         ORDER BY opened_time ASC, id ASC
     </select>
 
-    <select id="listPendingResolvedAlertEvents" resultType="map">
+    <select id="listPendingResolvedAlertEvents" resultMap="alertEventResult">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
                problem_pending, resolution_pending
@@ -159,14 +201,14 @@
         ORDER BY resolved_time ASC, id ASC
     </select>
 
-    <select id="getAlertEvent" parameterType="map" resultType="map">
+    <select id="getAlertEvent" parameterType="map" resultMap="alertEventResult">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         WHERE id = #{id}
     </select>
 
-    <select id="listAlertEvents" parameterType="map" resultType="map">
+    <select id="listAlertEvents" parameterType="map" resultMap="alertEventResult">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
@@ -275,7 +317,7 @@
         </if>
     </select>
 
-    <select id="listRecentAlertEvents" parameterType="map" resultType="map">
+    <select id="listRecentAlertEvents" parameterType="map" resultMap="alertEventResult">
         SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
@@ -323,7 +365,20 @@
 
     <!-- ========== TRIGGER_STATE (table sentinel_trigger_state) ========== -->
 
-    <select id="getTriggerState" parameterType="map" resultType="map">
+    <resultMap id="triggerStateResult" type="map">
+        <result property="id" column="id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="metadata_id" column="metadata_id" />
+        <result property="state" column="state" />
+        <result property="consecutive_breach_count" column="consecutive_breach_count" />
+        <result property="last_value_json" column="last_value_json" />
+        <result property="open_alert_event_id" column="open_alert_event_id" />
+        <result property="last_change_time" column="last_change_time" javaType="java.sql.Timestamp" />
+        <result property="last_evaluated_time" column="last_evaluated_time" javaType="java.sql.Timestamp" />
+    </resultMap>
+
+    <select id="getTriggerState" parameterType="map" resultMap="triggerStateResult">
         SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
                last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
         FROM sentinel_trigger_state
@@ -361,7 +416,7 @@
         WHERE open_alert_event_id = #{alertId,jdbcType=BIGINT}
     </update>
 
-    <select id="listTriggerStatesByMonitor" parameterType="map" resultType="map">
+    <select id="listTriggerStatesByMonitor" parameterType="map" resultMap="triggerStateResult">
         SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
                last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
         FROM sentinel_trigger_state
@@ -370,6 +425,17 @@
     </select>
 
     <!-- ========== ACTIVITY_SAMPLE (table sentinel_channel_activity_sample) ========== -->
+
+    <resultMap id="activitySampleResult" type="map">
+        <result property="id" column="id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="sample_time" column="sample_time" javaType="java.sql.Timestamp" />
+        <result property="received_delta" column="received_delta" />
+        <result property="sent_delta" column="sent_delta" />
+        <result property="error_delta" column="error_delta" />
+        <result property="filtered_delta" column="filtered_delta" />
+        <result property="queued_snapshot" column="queued_snapshot" />
+    </resultMap>
 
     <!--
          Driven two ways: ActivityRepository.insertActivitySample for a one-off row,
@@ -393,7 +459,7 @@
             (#{channel_id}, #{sample_time}, #{received_delta}, #{sent_delta}, #{error_delta}, #{filtered_delta}, #{queued_snapshot})
     </insert>
 
-    <select id="listActivitySamples" parameterType="map" resultType="map">
+    <select id="listActivitySamples" parameterType="map" resultMap="activitySampleResult">
         SELECT id, channel_id, sample_time, received_delta, sent_delta, error_delta, filtered_delta, queued_snapshot
         FROM sentinel_channel_activity_sample
         WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
@@ -432,6 +498,18 @@
 
     <!-- ========== ACTIVITY_TREND (table sentinel_channel_activity_trend) ========== -->
 
+    <resultMap id="activityTrendResult" type="map">
+        <result property="id" column="id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="hour_bucket" column="hour_bucket" javaType="java.sql.Timestamp" />
+        <result property="received_sum" column="received_sum" />
+        <result property="sent_sum" column="sent_sum" />
+        <result property="error_sum" column="error_sum" />
+        <result property="avg_queued" column="avg_queued" />
+        <result property="min_queued" column="min_queued" />
+        <result property="max_queued" column="max_queued" />
+    </resultMap>
+
     <delete id="deleteActivityTrendForHour" parameterType="map">
         DELETE FROM sentinel_channel_activity_trend
         WHERE channel_id = #{channelId} AND hour_bucket = #{hourBucket}
@@ -446,7 +524,7 @@
 
     <!-- Deliberately NOT filtered by hour-of-day/weekend here — that bucketing happens in Java
          where date functions are portable. -->
-    <select id="listActivityTrendSince" parameterType="map" resultType="map">
+    <select id="listActivityTrendSince" parameterType="map" resultMap="activityTrendResult">
         SELECT id, channel_id, hour_bucket, received_sum, sent_sum, error_sum, avg_queued, min_queued, max_queued
         FROM sentinel_channel_activity_trend
         WHERE channel_id = #{channelId} AND hour_bucket &gt;= #{sinceHourBucket}
@@ -546,13 +624,34 @@
 
     <!-- ========== ACTION (table sentinel_action) ========== -->
 
+    <resultMap id="actionResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="description" column="description" />
+        <result property="enabled" column="enabled" />
+        <result property="action_type" column="action_type" />
+        <result property="condition_json" column="condition_json" />
+        <result property="operation_mode" column="operation_mode" />
+        <result property="repeat_interval_seconds" column="repeat_interval_seconds" />
+        <result property="max_repeats" column="max_repeats" />
+        <result property="max_notifications_per_window" column="max_notifications_per_window" />
+        <result property="rollup_window_seconds" column="rollup_window_seconds" />
+        <result property="escalate_after_seconds" column="escalate_after_seconds" />
+        <result property="escalate_to_action_id" column="escalate_to_action_id" />
+        <result property="config_json" column="config_json" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" javaType="java.sql.Timestamp" />
+        <result property="updated_by" column="updated_by" />
+        <result property="updated_time" column="updated_time" javaType="java.sql.Timestamp" />
+    </resultMap>
+
     <!-- Import holds identity stable through validation and the final write. -->
     <select id="lockAction" parameterType="int" resultType="int" useCache="false" flushCache="true">
         SELECT id FROM sentinel_action WHERE id = #{id}
         FOR UPDATE
     </select>
 
-    <select id="getAction" parameterType="map" resultType="map">
+    <select id="getAction" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
                repeat_interval_seconds, max_repeats, max_notifications_per_window, rollup_window_seconds,
                escalate_after_seconds, escalate_to_action_id,
@@ -561,7 +660,7 @@
         WHERE id = #{id}
     </select>
 
-    <select id="listActions" parameterType="map" resultType="map">
+    <select id="listActions" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
                repeat_interval_seconds, max_repeats, max_notifications_per_window, rollup_window_seconds,
                escalate_after_seconds, escalate_to_action_id,
@@ -614,6 +713,15 @@
 
     <!-- ========== ACTION_DISPATCH_LOG (table sentinel_action_dispatch_log) ========== -->
 
+    <resultMap id="actionDispatchLogResult" type="map">
+        <result property="id" column="id" />
+        <result property="alert_event_id" column="alert_event_id" />
+        <result property="action_id" column="action_id" />
+        <result property="dispatch_time" column="dispatch_time" javaType="java.sql.Timestamp" />
+        <result property="success" column="success" />
+        <result property="error_message" column="error_message" />
+    </resultMap>
+
     <insert id="insertActionDispatchLog" parameterType="map">
         INSERT INTO sentinel_action_dispatch_log
             (alert_event_id, action_id, dispatch_time, success, error_message)
@@ -621,14 +729,14 @@
             (#{alert_event_id}, #{action_id,jdbcType=INTEGER}, #{dispatch_time}, #{success}, #{error_message})
     </insert>
 
-    <select id="listActionDispatchLogsForEvent" parameterType="map" resultType="map">
+    <select id="listActionDispatchLogsForEvent" parameterType="map" resultMap="actionDispatchLogResult">
         SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
         FROM sentinel_action_dispatch_log
         WHERE alert_event_id = #{alertEventId}
         ORDER BY dispatch_time
     </select>
 
-    <select id="listActionDispatchLogsInRange" parameterType="map" resultType="map">
+    <select id="listActionDispatchLogsInRange" parameterType="map" resultMap="actionDispatchLogResult">
         SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
         FROM sentinel_action_dispatch_log
         WHERE dispatch_time &gt;= #{from} AND dispatch_time &lt;= #{to}
@@ -637,14 +745,33 @@
 
     <!-- ========== MAINTENANCE_WINDOW (table sentinel_maintenance_window) ========== -->
 
-    <select id="getMaintenanceWindow" parameterType="map" resultType="map">
+    <resultMap id="maintenanceWindowResult" type="map">
+        <result property="id" column="id" />
+        <result property="name" column="name" />
+        <result property="scope_type" column="scope_type" />
+        <result property="scope_id" column="scope_id" />
+        <result property="window_mode" column="window_mode" />
+        <result property="repeat_type" column="repeat_type" />
+        <result property="days_of_week" column="days_of_week" />
+        <result property="days_of_month" column="days_of_month" />
+        <result property="start_time" column="start_time" />
+        <result property="end_time" column="end_time" />
+        <result property="timezone" column="timezone" />
+        <result property="active_from" column="active_from" javaType="java.sql.Timestamp" />
+        <result property="active_until" column="active_until" javaType="java.sql.Timestamp" />
+        <result property="enabled" column="enabled" />
+        <result property="created_by" column="created_by" />
+        <result property="created_time" column="created_time" javaType="java.sql.Timestamp" />
+    </resultMap>
+
+    <select id="getMaintenanceWindow" parameterType="map" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
             start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
         WHERE id = #{id}
     </select>
 
-    <select id="listMaintenanceWindows" parameterType="map" resultType="map">
+    <select id="listMaintenanceWindows" parameterType="map" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
             start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
@@ -653,7 +780,7 @@
 
     <!-- Java filters the returned rows by schedule (WindowSchedule) and by scope match against the specific channel/monitor being
          checked — scope matching is deliberately not attempted in SQL. -->
-    <select id="listEnabledMaintenanceWindows" resultType="map">
+    <select id="listEnabledMaintenanceWindows" resultMap="maintenanceWindowResult">
         SELECT id, name, scope_type, scope_id, window_mode, repeat_type, days_of_week, days_of_month,
             start_time, end_time, timezone, active_from, active_until, enabled, created_by, created_time
         FROM sentinel_maintenance_window
@@ -715,7 +842,15 @@
          expires_time therefore still reports 1, which is what the caller needs.
     -->
 
-    <select id="getNodeLease" parameterType="map" resultType="map">
+    <resultMap id="nodeLeaseResult" type="map">
+        <result property="lease_name" column="lease_name" />
+        <result property="node_id" column="node_id" />
+        <result property="acquired_time" column="acquired_time" javaType="java.sql.Timestamp" />
+        <result property="expires_time" column="expires_time" javaType="java.sql.Timestamp" />
+        <result property="lease_epoch" column="lease_epoch" />
+    </resultMap>
+
+    <select id="getNodeLease" parameterType="map" resultMap="nodeLeaseResult">
         SELECT lease_name, node_id, acquired_time, expires_time, lease_epoch
         FROM sentinel_node_lease
         WHERE lease_name = #{leaseName}

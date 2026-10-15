@@ -21,6 +21,10 @@ final class ReadTransaction {
     private ReadTransaction() { }
 
     static <T> T execute(int isolation, Supplier<T> read) {
+        return execute(isolation, read, null);
+    }
+
+    static <T> T execute(int isolation, Supplier<T> read, DeadlockRetry.Attempt attempt) {
         SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
         if (sessions.isManagedSessionStarted()) {
             throw new IllegalStateException("Nested read transaction");
@@ -32,6 +36,8 @@ final class ReadTransaction {
         Integer originalIsolation = null;
         Throwable failure = null;
         boolean discard = false;
+        boolean committed = false;
+        boolean cleanupFailed = false;
         T result = null;
         try {
             connection = sessions.getConnection();
@@ -39,6 +45,7 @@ final class ReadTransaction {
             connection.setTransactionIsolation(isolation);
             result = read.get();
             sessions.commit(true);
+            committed = true;
         } catch (SQLException error) {
             failure = new RepositoryException(error);
         } catch (RuntimeException | Error error) {
@@ -48,8 +55,9 @@ final class ReadTransaction {
             try {
                 sessions.rollback(true);
             } catch (RuntimeException | Error rollback) {
-                failure.addSuppressed(rollback);
+                if (failure != rollback) failure.addSuppressed(rollback);
                 discard = true;
+                cleanupFailed = true;
             }
         }
         // Finish the transaction before restoring isolation: some drivers commit
@@ -60,28 +68,36 @@ final class ReadTransaction {
             } catch (SQLException | RuntimeException | Error reset) {
                 failure = transactionFailure(failure, reset);
                 discard = true;
+                cleanupFailed = true;
             }
         }
         if (connection != null && discard) {
-            try {
-                connection.abort(Runnable::run);
-            } catch (SQLException | RuntimeException | Error abort) {
-                failure.addSuppressed(abort);
-                try {
-                    discardConnection(sessions, connection, failure);
-                } catch (SQLException | RuntimeException | Error discardFailure) {
-                    failure.addSuppressed(discardFailure);
-                }
-            }
+            abortConnection(sessions, connection, failure);
         }
         try {
             sessions.close();
         } catch (RuntimeException | Error close) {
             failure = transactionFailure(failure, close);
+            cleanupFailed = true;
         }
         if (failure instanceof Error) throw (Error) failure;
+        if (failure != null && !committed && !cleanupFailed && attempt != null) attempt.allowRetry();
         if (failure != null) throw (RuntimeException) failure;
         return result;
+    }
+
+    /** Discard an uncertain transaction before MyBatis close can reset auto-commit. */
+    static void abortConnection(SqlSessionManager sessions, Connection connection, Throwable failure) {
+        try {
+            connection.abort(Runnable::run);
+        } catch (SQLException | RuntimeException | Error abort) {
+            if (failure != abort) failure.addSuppressed(abort);
+            try {
+                discardConnection(sessions, connection, failure);
+            } catch (SQLException | RuntimeException | Error discardFailure) {
+                if (failure != discardFailure) failure.addSuppressed(discardFailure);
+            }
+        }
     }
 
     private static void discardConnection(SqlSessionManager sessions, Connection connection,
@@ -94,7 +110,7 @@ final class ReadTransaction {
         try {
             physical.rollback();
         } catch (SQLException | RuntimeException | Error rollback) {
-            failure.addSuppressed(rollback);
+            if (failure != rollback) failure.addSuppressed(rollback);
         }
         if (pooled != null) {
             // Close the delegate, not the pool wrapper. DBCP marks this delegate
@@ -105,7 +121,7 @@ final class ReadTransaction {
             try {
                 discarded.close();
             } catch (SQLException | RuntimeException | Error close) {
-                failure.addSuppressed(close);
+                if (failure != close) failure.addSuppressed(close);
             }
             pooled.close();
         } else {
@@ -119,7 +135,7 @@ final class ReadTransaction {
         if (failure == null) {
             return cleanup instanceof SQLException ? new RepositoryException(cleanup) : cleanup;
         }
-        failure.addSuppressed(cleanup);
+        if (failure != cleanup) failure.addSuppressed(cleanup);
         return failure;
     }
 }

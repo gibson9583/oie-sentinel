@@ -16,6 +16,7 @@ import java.util.function.Supplier;
 
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,9 +67,13 @@ public final class ActivityRepository {
      * Oracle. Locking implementations may briefly delay collector/pruner writes;
      * snapshot implementations keep this reader on one consistent version.
      * No incident mutation or transport submission belongs inside this read scope.
+     * The callback may run twice after a confirmed deadlock rollback; it must
+     * recompute all reads without publishing state or performing external I/O.
      */
     public static <T> T readActivitySnapshot(Supplier<T> read) {
-        return ReadTransaction.execute(Connection.TRANSACTION_SERIALIZABLE, read);
+        var sessions = SqlConfig.getInstance().getSqlSessionManager();
+        return DeadlockRetry.execute(sessions, "activity snapshot",
+                attempt -> ReadTransaction.execute(Connection.TRANSACTION_SERIALIZABLE, read, attempt));
     }
 
     /** Qualifies a mapped-statement id with the plugin's MyBatis namespace. */
@@ -160,10 +165,10 @@ public final class ActivityRepository {
      *                {@code id} field is ignored. A {@code null} or empty
      *                list is a no-op — a tick with no deployed channels must
      *                not open a session
-     * @throws RepositoryException on persistence failure. The transaction is
-     *                             rolled back, so no sample in the batch is
-     *                             persisted; callers must treat the whole
-     *                             tick as unwritten
+     * @throws RepositoryException on persistence failure. Confirmed deadlock
+     *                             victims are rolled back and retried once.
+     *                             Other failures, including uncertain commit
+     *                             outcomes, are propagated without replay.
      */
     public static void insertActivitySamples(List<ActivitySample> samples) {
         insertActivitySamples(samples, LeaseFence.unmanaged());
@@ -174,28 +179,72 @@ public final class ActivityRepository {
             return;
         }
 
-        SqlSession session = null;
         try {
-            session = SqlConfig.getInstance().getSqlSessionManager().openSession(ExecutorType.BATCH, false);
+            // Freeze the original observation values once. A retry must not
+            // re-read counters, choose another timestamp or acquire a new epoch.
+            List<Map<String, Object>> rows = new ArrayList<>(samples.size());
+            for (ActivitySample sample : samples) rows.add(toSampleColumnMap(sample));
+            SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
+            DeadlockRetry.execute(sessions, "activity sample batch", attempt -> {
+                insertActivitySampleBatch(sessions, rows, fence, attempt);
+                return null;
+            });
+        } catch (Exception e) {
+            log.error("Failed to insert batch of {} activity samples", samples.size(), e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    private static void insertActivitySampleBatch(SqlSessionManager sessions, List<Map<String, Object>> rows,
+            LeaseFence fence, DeadlockRetry.Attempt attempt) {
+        SqlSession session = null;
+        Connection connection = null;
+        Throwable failure = null;
+        boolean committed = false;
+        boolean cleanupFailed = false;
+        try {
+            session = sessions.openSession(ExecutorType.BATCH, false);
+            connection = session.getConnection();
             if (!NodeLeaseRepository.lockFence(session, fence)) {
                 throw new IllegalStateException("Sentinel leadership fence changed before sample batch");
             }
 
-            for (ActivitySample sample : samples) {
-                session.insert(stmt("insertActivitySample"), toSampleColumnMap(sample));
+            for (Map<String, Object> row : rows) {
+                session.insert(stmt("insertActivitySample"), row);
             }
 
-            // Flushes the accumulated batch and commits it; under BATCH
-            // nothing has reached the driver before this point.
+            // The fence SELECT flushes BATCH before checking expiry; commit
+            // flushes it for an unmanaged fence. Revalidate on every attempt.
             NodeLeaseRepository.requireFence(session, fence);
             session.commit();
-        } catch (Exception e) {
-            log.error("Failed to insert batch of {} activity samples", samples.size(), e);
-            throw new RepositoryException(e);
-        } finally {
-            if (session != null) {
-                session.close();
+            committed = true;
+        } catch (RuntimeException | Error error) {
+            failure = error;
+        }
+        if (session != null && failure != null) {
+            try {
+                // MyBatis 3.1.1 close can swallow a JDBC rollback exception.
+                // Force rollback explicitly before considering any retry.
+                session.rollback(true);
+            } catch (RuntimeException | Error rollback) {
+                if (failure != rollback) failure.addSuppressed(rollback);
+                cleanupFailed = true;
+                if (connection != null) ReadTransaction.abortConnection(sessions, connection, failure);
             }
+        }
+        if (session != null) {
+            try {
+                session.close();
+            } catch (RuntimeException | Error close) {
+                if (failure == null) failure = close;
+                else if (failure != close) failure.addSuppressed(close);
+                cleanupFailed = true;
+            }
+        }
+        if (failure instanceof Error) throw (Error) failure;
+        if (failure != null) {
+            if (!committed && !cleanupFailed && session != null) attempt.allowRetry();
+            throw (RuntimeException) failure;
         }
     }
 

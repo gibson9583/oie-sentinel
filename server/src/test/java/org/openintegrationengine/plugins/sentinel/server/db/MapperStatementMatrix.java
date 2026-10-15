@@ -55,12 +55,170 @@ final class MapperStatementMatrix {
         verifyPendingOutboxValues(database, sessions, seed);
         verifyActiveDeploymentInventory(database, sessions, seed);
         verifyActivityTimestampPages(database, sessions, seed);
+        if (database.vendor().equals("mysql")) verifyMysqlTemporalResultValues(database, sessions, seed);
+    }
+
+    /** Default Connector/J returns DATETIME as LocalDateTime unless the mapper asks for Timestamp. */
+    private static void verifyMysqlTemporalResultValues(DatabaseMatrixSupport.MatrixDatabase database,
+            SqlSessionFactory sessions, Seed seed) throws Exception {
+        Timestamp time = Timestamp.from(Instant.parse("2026-08-31T12:34:56Z"));
+        try (Connection connection = database.open()) {
+            connection.setAutoCommit(false);
+            SqlSession session = sessions.openSession(connection);
+            try {
+                Map<String, Object> values = parameters(seed);
+                values.put("channel_id", "matrix-temporal");
+                values.put("channelId", "matrix-temporal");
+                // MyBatis 3.1.1 OGNL reflects isEmpty(); Java 21 hides List.of's implementation class.
+                values.put("channelIdIn", new ArrayList<>(List.of("matrix-temporal")));
+                values.put("from", Timestamp.from(time.toInstant().minusSeconds(3600)));
+                values.put("to", Timestamp.from(time.toInstant().plusSeconds(3600)));
+                for (String column : List.of("created_time", "updated_time", "opened_time", "resolved_time",
+                        "acknowledged_time", "last_change_time", "last_evaluated_time", "sample_time",
+                        "hour_bucket", "dispatch_time", "active_from", "active_until")) values.put(column, time);
+
+                session.update("Sentinel.updateMonitor", values);
+                // This fails if a URL compatibility flag masks the original production trigger.
+                try (Statement sql = connection.createStatement(); ResultSet row = sql.executeQuery(
+                        "SELECT created_time FROM sentinel_monitor WHERE id = " + seed.monitorId())) {
+                    assertTrue(row.next());
+                    org.junit.jupiter.api.Assertions.assertInstanceOf(java.time.LocalDateTime.class, row.getObject(1),
+                            "MySQL matrix must exercise default DATETIME getObject behavior without a compatibility flag");
+                    assertEquals(time, row.getTimestamp(1));
+                }
+                for (String query : List.of("getMonitor", "listMonitors")) {
+                    Map<String, Object> row = rowWithId(session, query, values, seed.monitorId());
+                    assertTimes(row, time, "created_time", "updated_time");
+                    assertEquals("matrix-exercise-row", row.get("name"));
+                }
+                values.put("updated_time", null);
+                session.update("Sentinel.updateMonitor", values);
+                assertNullTime(rowWithId(session, "getMonitor", values, seed.monitorId()), "updated_time");
+
+                values.put("updated_time", time);
+                values.put("id", seed.actionId());
+                session.update("Sentinel.updateAction", values);
+                for (String query : List.of("getAction", "listActions")) {
+                    Map<String, Object> row = rowWithId(session, query, values, seed.actionId());
+                    assertTimes(row, time, "created_time", "updated_time");
+                    assertEquals("EMAIL", row.get("action_type"));
+                }
+                values.put("updated_time", null);
+                session.update("Sentinel.updateAction", values);
+                assertNullTime(rowWithId(session, "getAction", values, seed.actionId()), "updated_time");
+
+                values.put("status", "RESOLVED");
+                session.insert("Sentinel.insertAlertEvent", values);
+                long alertId = ((Number) values.get("id")).longValue();
+                for (String query : List.of("getAlertEvent", "listAlertEvents", "listRecentAlertEvents",
+                        "listPendingProblemAlertEvents", "listPendingResolvedAlertEvents")) {
+                    Map<String, Object> row = rowWithId(session, query, values, alertId);
+                    assertTimes(row, time, "opened_time", "resolved_time", "acknowledged_time");
+                    assertEquals("matrix exercise alert", row.get("message"));
+                }
+                try (Statement sql = connection.createStatement()) {
+                    sql.executeUpdate("UPDATE sentinel_alert_event SET resolved_time=NULL, acknowledged_time=NULL WHERE id=" + alertId);
+                }
+                session.clearCache();
+                Map<String, Object> alert = rowWithId(session, "getAlertEvent", values, alertId);
+                assertTimes(alert, time, "opened_time");
+                assertNullTime(alert, "resolved_time", "acknowledged_time");
+
+                values.put("open_alert_event_id", alertId);
+                session.insert("Sentinel.insertTriggerState", values);
+                long triggerId = ((Number) values.get("id")).longValue();
+                for (String query : List.of("getTriggerState", "listTriggerStatesByMonitor")) {
+                    Map<String, Object> row = rowWithId(session, query, values, triggerId);
+                    assertTimes(row, time, "last_change_time", "last_evaluated_time");
+                    assertEquals(alertId, ((Number) row.get("open_alert_event_id")).longValue());
+                }
+                try (Statement sql = connection.createStatement()) {
+                    sql.executeUpdate("UPDATE sentinel_trigger_state SET last_change_time=NULL, last_evaluated_time=NULL WHERE id=" + triggerId);
+                }
+                session.clearCache();
+                assertNullTime(rowWithId(session, "getTriggerState", values, triggerId), "last_change_time", "last_evaluated_time");
+
+                values.put("received_delta", 3_000_000_001L);
+                session.insert("Sentinel.insertActivitySample", values);
+                Map<String, Object> sample = session.selectOne("Sentinel.listActivitySamples", values);
+                assertTimes(sample, time, "sample_time");
+                assertEquals(3_000_000_001L, ((Number) sample.get("received_delta")).longValue());
+                values.put("received_sum", 3_000_000_002L);
+                values.put("avg_queued", 1.25d);
+                session.insert("Sentinel.insertActivityTrend", values);
+                Map<String, Object> trend = session.selectOne("Sentinel.listActivityTrendSince", values);
+                assertTimes(trend, time, "hour_bucket");
+                assertEquals(3_000_000_002L, ((Number) trend.get("received_sum")).longValue());
+                assertEquals(1.25d, ((Number) trend.get("avg_queued")).doubleValue());
+
+                values.put("alert_event_id", alertId);
+                values.put("alertEventId", alertId);
+                session.insert("Sentinel.insertActionDispatchLog", values);
+                for (String query : List.of("listActionDispatchLogsForEvent", "listActionDispatchLogsInRange")) {
+                    Map<String, Object> row = session.selectOne("Sentinel." + query, values);
+                    assertTimes(row, time, "dispatch_time");
+                    assertEquals(alertId, ((Number) row.get("alert_event_id")).longValue());
+                }
+
+                session.insert("Sentinel.insertMaintenanceWindow", values);
+                long windowId = ((Number) values.get("id")).longValue();
+                for (String query : List.of("getMaintenanceWindow", "listMaintenanceWindows", "listEnabledMaintenanceWindows")) {
+                    Map<String, Object> row = rowWithId(session, query, values, windowId);
+                    assertTimes(row, time, "active_from", "active_until", "created_time");
+                    assertEquals("08:00", row.get("start_time"));
+                }
+                values.put("active_from", null);
+                values.put("active_until", null);
+                session.update("Sentinel.updateMaintenanceWindow", values);
+                Map<String, Object> window = rowWithId(session, "getMaintenanceWindow", values, windowId);
+                assertNullTime(window, "active_from", "active_until");
+                assertTimes(window, time, "created_time");
+
+                Timestamp before = session.selectOne("Sentinel.getDatabaseTime");
+                session.insert("Sentinel.insertNodeLease", values);
+                values.put("leaseName", values.get("lease_name"));
+                Map<String, Object> lease = session.selectOne("Sentinel.getNodeLease", values);
+                Timestamp acquired = org.junit.jupiter.api.Assertions.assertInstanceOf(Timestamp.class, lease.get("acquired_time"));
+                Timestamp expires = org.junit.jupiter.api.Assertions.assertInstanceOf(Timestamp.class, lease.get("expires_time"));
+                assertTrue(!acquired.before(before));
+                assertEquals(60, java.time.Duration.between(acquired.toInstant(), expires.toInstant()).getSeconds());
+                assertEquals("matrix-node", lease.get("node_id"));
+                MatrixEvidenceSupport.observation(database.vendor(), "mysql-default-datetime-result-maps",
+                        Map.of("sample", sample, "trend", trend, "alertWithNulls", alert, "windowWithNulls", window, "lease", lease));
+            } finally {
+                session.rollback();
+                connection.rollback();
+                session.close();
+            }
+        }
+    }
+
+    private static Map<String, Object> rowWithId(SqlSession session, String statement,
+            Map<String, Object> parameters, long id) {
+        List<Map<String, Object>> rows = session.selectList("Sentinel." + statement, parameters);
+        return rows.stream().filter(row -> ((Number) row.get("id")).longValue() == id).findFirst()
+                .orElseThrow(() -> new AssertionError(statement + " lost row " + id));
+    }
+
+    private static void assertTimes(Map<String, Object> row, Timestamp expected, String... columns) {
+        assertNotNull(row);
+        for (String column : columns) {
+            assertEquals(expected, org.junit.jupiter.api.Assertions.assertInstanceOf(Timestamp.class, row.get(column)), column);
+        }
+    }
+
+    private static void assertNullTime(Map<String, Object> row, String... columns) {
+        for (String column : columns) org.junit.jupiter.api.Assertions.assertNull(row.get(column), column);
     }
 
     /** Bounded keyset reads preserve endpoints and collapse duplicate observations. */
     private static void verifyActivityTimestampPages(DatabaseMatrixSupport.MatrixDatabase database,
             SqlSessionFactory sessions, Seed seed) throws Exception {
-        Timestamp start = Timestamp.from(Instant.parse("2026-08-30T12:00:00.123Z"));
+        // The shipped MySQL sample_time is DATETIME(0). A .123 query bound
+        // excludes the fixture's first row after the server rounds it to .000.
+        // Keep fractional endpoint coverage for schemas that preserve it.
+        Timestamp start = Timestamp.from(Instant.parse(database.vendor().equals("mysql")
+                ? "2026-08-30T12:00:00Z" : "2026-08-30T12:00:00.123Z"));
         Timestamp end = Timestamp.from(start.toInstant().plusSeconds(4));
         try (Connection connection = database.open()) {
             connection.setAutoCommit(false);
@@ -76,6 +234,16 @@ final class MapperStatementMatrix {
                     sample.put("channel_id", "different-channel");
                     sample.put("sample_time", Timestamp.from(start.toInstant().plusMillis(500)));
                     session.insert("Sentinel.insertActivitySample", sample);
+                    List<Timestamp> stored = new ArrayList<>();
+                    try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                            "SELECT DISTINCT sample_time FROM sentinel_channel_activity_sample "
+                                    + "WHERE channel_id = 'coverage-pages' ORDER BY sample_time")) {
+                        while (rows.next()) stored.add(rows.getTimestamp(1));
+                    }
+                    assertEquals(java.util.stream.IntStream.rangeClosed(-1, 5)
+                                    .mapToObj(second -> Timestamp.from(start.toInstant().plusSeconds(second))).toList(), stored,
+                            database.vendor() + " stored fixture precision must match the paging bounds");
+                    MatrixEvidenceSupport.observation(database.vendor(), "activity-timestamp-page-fixture", stored);
                     Map<String, Object> query = new HashMap<>();
                     query.put("channelId", "coverage-pages");
                     query.put("from", start);
