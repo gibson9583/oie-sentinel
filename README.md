@@ -1,5 +1,7 @@
 # OIE Sentinel
 
+Release 1.2.2 is being prepared with engine compatibility limited to OIE **4.6.0 and 4.7.0**. Runtime validation on the final 4.7.0 release is pending; see the [release preparation notes](docs/oie-4.6-4.7-release.md).
+
 Zabbix-inspired monitoring and alerting for [Open Integration Engine](https://openintegrationengine.org)
 channel activity — inactivity, low-volume, anomaly, connection-status, error-rate and queue-depth
 monitors, with email, channel (VM Router), AWS SNS and webhook alert delivery, storm control and
