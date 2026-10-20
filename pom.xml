@@ -48,7 +48,7 @@
              + BOM convention this plugin follows for its SNS alert action. -->
         <aws-sdk.version>2.15.28</aws-sdk.version>
         <junit5.version>5.10.2</junit5.version>
-        <mockito.version>5.11.0</mockito.version>
+        <mockito.version>5.24.0</mockito.version>
 
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
