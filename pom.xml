@@ -14,7 +14,7 @@
     <packaging>pom</packaging>
 
     <properties>
-        <revision>1.2.1</revision>
+        <revision>1.2.2</revision>
 
         <!-- The engine's compatibility check (ExtensionLoader.isExtensionCompatible)
              splits plugin.xml's <mirthVersion> on commas and compares each entry to
@@ -24,7 +24,7 @@
              release (build against its jars, run the engine-jar drift guard, smoke
              test), append it here: e.g. 4.6.0,4.6.1. Keep oie.json's
              min/maxEngineVersion and the README compatibility line in step. -->
-        <plugin.supported.mc.versions>${mc.version}</plugin.supported.mc.versions>
+        <plugin.supported.mc.versions>4.6.0,4.7.0</plugin.supported.mc.versions>
 
         <mc.version>4.6.0</mc.version>
         <javax-servlet.version>4.0.1</javax-servlet.version>
