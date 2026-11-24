@@ -5,10 +5,12 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Locale;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -62,6 +64,9 @@ public final class SnsAlertSender implements AlertSender {
      */
     private static final int MAX_SUBJECT_LENGTH = 100;
 
+    /** SNS's message size limit, in bytes of UTF-8. */
+    static final int MAX_MESSAGE_BYTES = 256 * 1024;
+
     /**
      * Wall-clock ceiling for one publish/assume-role call including retries,
      * and for each individual attempt. Without these the only bound is the
@@ -105,7 +110,7 @@ public final class SnsAlertSender implements AlertSender {
                 : null;
 
         String subject = buildSubject(payload);
-        String body = Json.write(payload);
+        String body = buildMessage(payload);
 
         // Declaration order is the close-order contract: try-with-resources
         // closes in reverse, so the client closes before the credentials it
@@ -143,6 +148,20 @@ public final class SnsAlertSender implements AlertSender {
             builder.region(Region.of(region));
         }
         return builder.build();
+    }
+
+    /**
+     * The payload as JSON. Only when a Log alert's matches, carried twice, push
+     * it past {@link #MAX_MESSAGE_BYTES} is the array left out; valueJson keeps them.
+     */
+    static String buildMessage(AlertPayload payload) {
+        String body = Json.write(payload);
+        if (payload.getMatches() == null || body.getBytes(StandardCharsets.UTF_8).length <= MAX_MESSAGE_BYTES) {
+            return body;
+        }
+        ObjectNode trimmed = Json.mapper().valueToTree(payload);
+        trimmed.remove("matches");
+        return Json.write(trimmed);
     }
 
     /**

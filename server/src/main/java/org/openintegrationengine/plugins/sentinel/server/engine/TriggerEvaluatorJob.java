@@ -20,6 +20,7 @@ import org.quartz.JobExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.mirth.connect.server.controllers.ConfigurationController;
 
 import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
 import org.openintegrationengine.plugins.sentinel.server.alert.AlertPayload;
@@ -37,10 +38,14 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutc
 import org.openintegrationengine.plugins.sentinel.server.evaluate.InactivityEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.log.LogNotifications;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
+import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
 
@@ -65,7 +70,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
  *   <li>Run the type-specific evaluator: one outcome per channel, except
  *       CONNECTION_STATUS which yields one per connector
  *       ({@code metadataId}) unless the monitor's {@code rollup} config
- *       collapses the channel to a single {@code null}-metadata outcome.</li>
+ *       collapses the channel to a single {@code null}-metadata outcome.
+ *       A Log monitor skips scope resolution; {@link LogMonitorEvaluation}
+ *       decides its outcome, for the server subject.</li>
  *   <li>Apply each outcome to its trigger state (see
  *       {@link #applyOutcome}).</li>
  *   <li>Auto-resolve open problems whose subject left the monitored set —
@@ -131,12 +138,28 @@ public class TriggerEvaluatorJob implements Job {
             "Channel is no longer in this monitor's scope (deleted, or removed from the group/tag)";
 
     /**
+     * Message used when a problem is auto-resolved because its subject kind
+     * no longer matches its monitor's type. MonitorService refuses that type
+     * change, so only a direct database edit gets here.
+     */
+    private static final String SUBJECT_KIND_CHANGED_MESSAGE =
+            "Monitor kind changed between Log and Channel; this problem is no longer evaluated";
+
+    /**
      * Quartz entry point. Catches {@link Throwable} deliberately: an
      * evaluator tick must never propagate anything into the scheduler
      * thread, and the next tick gets a fresh chance anyway.
      */
     @Override
     public void execute(JobExecutionContext context) {
+        // The scheduler's first tick fires inside the plugin's start(), before
+        // the engine deploys its channels. A tick then would send Channel
+        // actions to channels that are not deployed yet, a failure that
+        // completes the pending notification for good, and would judge every
+        // channel as undeployed. The next tick tries again.
+        if (!engineStarted()) {
+            return;
+        }
         // Every node schedules this job; only the lease holder runs it. Two
         // evaluators against one database would race read-modify-write on the
         // same trigger rows and can both open an alert for the same breach.
@@ -151,6 +174,22 @@ public class TriggerEvaluatorJob implements Job {
             runTick(Instant.now(), fence);
         } catch (Throwable t) {
             log.error("Sentinel trigger evaluator tick failed", t);
+        }
+    }
+
+    /**
+     * Whether the engine has finished starting. Mirth.startup() sets
+     * STATUS_ENGINE_STARTING, starts the plugins, sets STATUS_INITIAL_DEPLOY
+     * while it deploys the channels, and sets STATUS_OK after that deploy,
+     * also when the deploy failed. getStatus(false) skips the engine's
+     * database check and reports UNAVAILABLE once the engine has stopped.
+     */
+    private static boolean engineStarted() {
+        try {
+            return ConfigurationController.getInstance().getStatus(false) == ConfigurationController.STATUS_OK;
+        } catch (Throwable t) {
+            log.error("Could not read the engine's status; this Sentinel evaluator tick is skipped", t);
+            return false;
         }
     }
 
@@ -189,7 +228,9 @@ public class TriggerEvaluatorJob implements Job {
             }
             try {
                 Monitor monitor = MonitorRepository.getMonitor(event.getMonitorId());
-                if (event.getStatus() == AlertStatus.PROBLEM) {
+                if (event.getKind() == AlertKind.NOTIFICATION) {
+                    ActionDispatcher.onAlertOpened(event, AlertPayload.of(event, monitor, LogNotifications.EVENT_TYPE));
+                } else if (event.getStatus() == AlertStatus.PROBLEM) {
                     ActionDispatcher.onRepeatCheck(
                             event, AlertPayload.of(event, monitor, "PROBLEM"));
                 }
@@ -301,6 +342,14 @@ public class TriggerEvaluatorJob implements Job {
     }
 
     private static void evaluateMonitor(Monitor monitor, Instant now, LeaseFence fence) {
+        // A Log monitor has one subject and no channel scope; the sweep then
+        // closes only rows of the wrong kind.
+        if (monitor.getMonitorType().kind() == MonitorKind.LOG) {
+            if (!SentinelLeadership.holdsFence(fence)) return;
+            LogMonitorEvaluation.evaluate(monitor, now, fence);
+            autoResolveDepartedTriggers(monitor, Set.of(), null, Map.of(), now, fence);
+            return;
+        }
         // State monitors include undeployed channels. Connector monitors use
         // the shared deployment inventory, including paused and remote-only
         // channels. Activity monitors retain their started-channel gate.
@@ -495,14 +544,27 @@ public class TriggerEvaluatorJob implements Job {
                 applyOutcomeInTransaction(monitor, channelId, metadataId, outcome, now, afterCommit));
     }
 
+    /** The same state machine for any subject; the server subject has no channel or metadata id. */
+    static void applyOutcome(Monitor monitor, ProblemSubject subject, Integer metadataId,
+            EvaluationOutcome outcome, Instant now, LeaseFence fence) {
+        AlertLifecycleTransaction.execute(fence, afterCommit ->
+                applyOutcomeInTransaction(monitor, subject, metadataId, outcome, now, afterCommit));
+    }
+
     private static void applyOutcomeInTransaction(Monitor monitor, String channelId, Integer metadataId,
             EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
-        TriggerState state = TriggerStateRepository.getTriggerState(monitor.getId(), channelId, metadataId);
+        applyOutcomeInTransaction(monitor, ProblemSubject.channel(channelId), metadataId, outcome, now, afterCommit);
+    }
+
+    private static void applyOutcomeInTransaction(Monitor monitor, ProblemSubject subject, Integer metadataId,
+            EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
+        TriggerState state = subject.loadTriggerState(monitor.getId(), metadataId);
         boolean isNew = state == null;
         if (isNew) {
             state = new TriggerState();
             state.setMonitorId(monitor.getId());
-            state.setChannelId(channelId);
+            state.setSubjectType(subject.type());
+            state.setChannelId(subject.channelId());
             state.setMetadataId(metadataId);
             state.setState(TriggerStatus.INSUFFICIENT_DATA);
             state.setConsecutiveBreachCount(0);
@@ -511,12 +573,19 @@ public class TriggerEvaluatorJob implements Job {
 
         switch (outcome.getResult()) {
             case BREACH:
-                onBreach(monitor, state, channelId, metadataId, outcome, now, afterCommit);
+                onBreach(monitor, state, subject, metadataId, outcome, now, afterCommit);
                 break;
             case OK:
-                onOk(monitor, state, now, afterCommit);
+                if (LogMonitorEvaluation.keepsOpen(monitor, state, now)) {
+                    onHeldOpen(monitor, state, now, afterCommit);
+                } else {
+                    onOk(monitor, state, now, afterCommit);
+                }
                 break;
             case INSUFFICIENT_DATA:
+                if (LogMonitorEvaluation.timedOut(monitor, state, now)) {
+                    resolveOpenAlert(monitor, state, null, now, afterCommit);
+                }
                 onInsufficientData(monitor, state, now, afterCommit);
                 break;
         }
@@ -531,13 +600,14 @@ public class TriggerEvaluatorJob implements Job {
     }
 
     /** BREACH branch of {@link #applyOutcome} — see its Javadoc. */
-    private static void onBreach(Monitor monitor, TriggerState state, String channelId,
+    private static void onBreach(Monitor monitor, TriggerState state, ProblemSubject subject,
             Integer metadataId, EvaluationOutcome outcome, Instant now, List<Runnable> afterCommit) {
         int required = Math.max(1, monitor.getMinConsecutiveBreaches());
         if (state.getState() == TriggerStatus.PROBLEM) {
             AlertEvent open = state.getOpenAlertEventId() == null ? null
                     : AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
             if (open != null && open.getStatus() == AlertStatus.PROBLEM) {
+                LogMonitorEvaluation.addTo(monitor, state, outcome);
                 stillOpenPass(monitor, state, afterCommit);
                 return;
             }
@@ -567,6 +637,7 @@ public class TriggerEvaluatorJob implements Job {
             if (retained != null && retained.getStatus() == AlertStatus.PROBLEM) {
                 state.setState(TriggerStatus.PROBLEM);
                 state.setLastChangeTime(now);
+                LogMonitorEvaluation.addTo(monitor, state, outcome);
                 stillOpenPass(monitor, state, afterCommit);
                 return;
             }
@@ -574,11 +645,12 @@ public class TriggerEvaluatorJob implements Job {
 
         // Persist the opening edge with its trigger. Current notification
         // policy is rechecked by the worker, including after maintenance ends.
-        boolean suppressed = NotificationSuppression.isSuppressed(monitor, channelId, now);
+        boolean suppressed = NotificationSuppression.isSuppressed(monitor, subject, now);
 
         AlertEvent event = new AlertEvent();
         event.setMonitorId(monitor.getId());
-        event.setChannelId(channelId);
+        event.setSubjectType(subject.type());
+        event.setChannelId(subject.channelId());
         event.setMetadataId(metadataId);
         event.setSeverity(monitor.getSeverity());
         event.setStatus(AlertStatus.PROBLEM);
@@ -606,6 +678,16 @@ public class TriggerEvaluatorJob implements Job {
         }
         state.setState(TriggerStatus.OK);
         state.setConsecutiveBreachCount(0);
+    }
+
+    /** OK, but a Log problem a person or a timeout clears stays open and keeps its still-open pass. */
+    private static void onHeldOpen(Monitor monitor, TriggerState state, Instant now, List<Runnable> afterCommit) {
+        if (state.getState() != TriggerStatus.OK) {
+            state.setLastChangeTime(now);
+        }
+        state.setState(TriggerStatus.OK);
+        state.setConsecutiveBreachCount(0);
+        stillOpenPass(monitor, state, afterCommit);
     }
 
     /**
@@ -669,7 +751,7 @@ public class TriggerEvaluatorJob implements Job {
      * statement does not touch the message column), which is what the
      * problem history should show.
      */
-    private static void resolveOpenAlert(Monitor monitor, TriggerState state,
+    static void resolveOpenAlert(Monitor monitor, TriggerState state,
             String overrideMessage, Instant now, List<Runnable> afterCommit) {
         AlertEvent event = AlertEventRepository.getAlertEvent(state.getOpenAlertEventId());
         if (event != null && event.getStatus() == AlertStatus.PROBLEM) {
@@ -730,6 +812,11 @@ public class TriggerEvaluatorJob implements Job {
      * channel absent from {@code evaluatedTriggers} was never judged, so none
      * of its rows are pruned — see {@link #evaluateMonitor}.</p>
      *
+     * <p>First, a row whose subject kind differs from the monitor's is closed
+     * with {@link #SUBJECT_KIND_CHANGED_MESSAGE}, and a server row on a server
+     * monitor never departs. Each row is judged on its own, so the listing's
+     * order (NULL channel ids sort differently by vendor) does not matter.</p>
+     *
      * @param evaluatedTriggers channel id to the metadata ids conclusively
      *                          evaluated for it this tick
      */
@@ -750,6 +837,7 @@ public class TriggerEvaluatorJob implements Job {
         boolean watchesConnections = monitor.getMonitorType() == MonitorType.CONNECTION_STATUS;
         Set<String> deployedChannels = watchesConnections
                 ? NodeLeaseRepository.listActiveDeployedChannelIds() : Set.of();
+        SubjectType monitorKind = ProblemSubject.forMonitor(monitor, null).type();
 
         for (TriggerState state : states) {
             if (!SentinelLeadership.holdsFence(fence)) return;
@@ -758,9 +846,16 @@ public class TriggerEvaluatorJob implements Job {
             if (state.getOpenAlertEventId() == null) {
                 continue;
             }
+            ProblemSubject subject = ProblemSubject.of(state);
+            boolean kindChanged = subject.type() != monitorKind;
+            if (!kindChanged && subject.isServer()) {
+                continue; // evaluated every tick; the server cannot leave its monitor
+            }
 
             boolean channelDeparted;
-            if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS) {
+            if (kindChanged) {
+                channelDeparted = false; // not asked: the message below says why it closes
+            } else if (monitor.getMonitorType() == MonitorType.CONNECTION_STATUS) {
                 channelDeparted = (scopedChannelIds != null && !scopedChannelIds.contains(state.getChannelId()))
                         || !deployedChannels.contains(state.getChannelId());
             } else {
@@ -768,7 +863,9 @@ public class TriggerEvaluatorJob implements Job {
             }
 
             String message;
-            if (channelDeparted) {
+            if (kindChanged) {
+                message = SUBJECT_KIND_CHANGED_MESSAGE;
+            } else if (channelDeparted) {
                 // "No longer started" is the right words for every type whose
                 // targets are the started channels. For CHANNEL_STATE it would
                 // be exactly backwards — not started is what that monitor is
@@ -803,15 +900,14 @@ public class TriggerEvaluatorJob implements Job {
             }
 
             AlertLifecycleTransaction.execute(fence, afterCommit -> {
-                TriggerState current = TriggerStateRepository.getTriggerState(
-                        monitor.getId(), state.getChannelId(), state.getMetadataId());
+                TriggerState current = subject.loadTriggerState(monitor.getId(), state.getMetadataId());
                 if (current == null || !java.util.Objects.equals(
                         current.getOpenAlertEventId(), state.getOpenAlertEventId())) {
                     return;
                 }
                 // Deployment inventory may have changed since target discovery.
                 // Recheck a proposed undeployment inside the fenced transaction.
-                if (watchesConnections && !deployedChannels.contains(state.getChannelId())
+                if (watchesConnections && !kindChanged && !deployedChannels.contains(state.getChannelId())
                         && NodeLeaseRepository.listActiveDeployedChannelIds().contains(state.getChannelId())) {
                     return;
                 }

@@ -51,10 +51,19 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  *       resolved live via {@link ScopeResolver#strictTagChannelIds(String)}, same
  *       live-resolution contract as CHANNEL_GROUP)</li>
  *   <li>{@code EVENT_TYPE} — {@code =} only ({@code PROBLEM} or
- *       {@code RESOLVED}; lifecycle gating normally belongs to
+ *       {@code RESOLVED}, or {@code NOTIFICATION} for a Log monitor's
+ *       notifications; lifecycle gating normally belongs to
  *       {@code operationMode}, this exists for BOTH-mode actions that still
  *       want one condition row to differ)</li>
  * </ul>
+ *
+ * <p>A server problem (a LOG_EVENTS alert) belongs to no channel, so
+ * {@code CHANNEL}, {@code CHANNEL_GROUP} and {@code CHANNEL_TAG} rows never
+ * match it, whatever the operator. That includes {@code !=}: "not channel X"
+ * is a statement about a channel, and an action filtered to channels must
+ * not start receiving server alerts because the server is not channel X. An
+ * action that wants server alerts says so with {@code MONITOR_TYPE} or
+ * {@code MONITOR}, or with no channel rows at all.</p>
  *
  * <p>{@code value} is a string, or an array of strings for {@code IN}.
  * Error policy is fail-closed per row: an unknown field, unknown operator,
@@ -143,11 +152,11 @@ public final class ActionConditionMatcher {
                 return nameMatches(operator, value, String.valueOf(payload.getMonitorId()),
                         action, "MONITOR");
             case "CHANNEL":
-                return channelMatches(operator, value, payload.getChannelId(), action);
+                return !isServer(payload) && channelMatches(operator, value, payload.getChannelId(), action);
             case "CHANNEL_GROUP":
-                return groupMatches(operator, value, payload.getChannelId(), action);
+                return !isServer(payload) && groupMatches(operator, value, payload.getChannelId(), action);
             case "CHANNEL_TAG":
-                return tagMatches(operator, value, payload.getChannelId(), action);
+                return !isServer(payload) && tagMatches(operator, value, payload.getChannelId(), action);
             case "EVENT_TYPE":
                 if (isOp(operator, "=")) {
                     String expected = single(value, action, "EVENT_TYPE");
@@ -160,6 +169,11 @@ public final class ActionConditionMatcher {
                         label(action), field);
                 return false;
         }
+    }
+
+    /** Whether the payload is about the server rather than a channel (see class Javadoc). */
+    private static boolean isServer(AlertPayload payload) {
+        return payload.subject() != null && payload.subject().isServer();
     }
 
     /**

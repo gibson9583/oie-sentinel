@@ -18,11 +18,16 @@ import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.openintegrationengine.plugins.sentinel.server.alert.MatchedLines;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
+import org.openintegrationengine.plugins.sentinel.server.log.LogPipeline;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.DashboardSummary;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -115,6 +120,10 @@ public final class DashboardService {
         summary.setLastCollectorRun(collectorState.getLastCollectorRun());
         summary.setLastEvaluatorRun(collectorState.getLastEvaluatorRun());
         summary.setLastConnectorEvent(collectorState.getLastConnectorEvent());
+        // Server-wide, like Log monitors themselves, so only for unrestricted callers.
+        if (visibleChannelIds == null) {
+            summary.setLogPipeline(LogPipeline.get().status(SentinelLeadership.nodeId()));
+        }
         return summary;
     }
 
@@ -130,6 +139,7 @@ public final class DashboardService {
         }
         AlertEventFilter filter = new AlertEventFilter();
         filter.setStatus(AlertStatus.PROBLEM);
+        filter.setKind(AlertKind.PROBLEM);
         if (visibleChannelIds != null) {
             filter.setChannelIdIn(new ArrayList<>(visibleChannelIds));
         }
@@ -144,16 +154,19 @@ public final class DashboardService {
      * feed below {@value #RECENT_PROBLEM_LIMIT} entries for restricted
      * callers — accepted: the repository's recent query has no channel
      * filter in its contract, and a sparse feed is correct where a full one
-     * would leak.
+     * would leak. A server problem stays in an unrestricted caller's feed and
+     * leaves a restricted caller's, by {@link ProblemSubject#visibleTo(Set)}.
+     * Its stored matches are hidden as in {@link MatchedLines#visibleDetails}.
      */
     private static List<AlertEvent> recentProblems(Set<String> visibleChannelIds) {
-        List<AlertEvent> recent = AlertEventRepository.listRecentAlertEvents(RECENT_PROBLEM_LIMIT);
+        List<AlertEvent> recent = AlertEventRepository.listRecentAlertEvents(RECENT_PROBLEM_LIMIT, AlertKind.PROBLEM);
         if (visibleChannelIds == null) {
+            MatchedLines.applyVisibleDetails(recent);
             return recent;
         }
         List<AlertEvent> visible = new ArrayList<>();
         for (AlertEvent event : recent) {
-            if (event.getChannelId() != null && visibleChannelIds.contains(event.getChannelId())) {
+            if (ProblemSubject.of(event).visibleTo(visibleChannelIds)) {
                 visible.add(event);
             }
         }
@@ -201,13 +214,15 @@ public final class DashboardService {
      * severity, so the more urgent channel wins the last slot) and keeps the
      * top {@value #TOP_CHANNEL_LIMIT}. Severity comparison is by enum
      * ordinal — the {@code Severity} declaration order is ascending badness
-     * by contract.
+     * by contract. Server problems are counted in the severity totals but
+     * are not a channel, so they never take a slot here.
      */
     private static List<TopChannel> topChannels(List<AlertEvent> openItems) {
         Map<String, TopChannel> byChannel = new HashMap<>();
         for (AlertEvent event : openItems) {
-            String channelId = event.getChannelId();
-            if (channelId == null) {
+            ProblemSubject subject = ProblemSubject.of(event);
+            String channelId = subject.channelId();
+            if (subject.isServer() || channelId == null) {
                 continue;
             }
             TopChannel entry = byChannel.get(channelId);
@@ -246,7 +261,8 @@ public final class DashboardService {
      * running interface estate is actually being watched?". Each monitor's
      * scope resolution is individually guarded: one monitor pointing at a
      * deleted group must cost its own contribution, not the whole
-     * dashboard.
+     * dashboard. A server-wide monitor (LOG_EVENTS) watches no channel, and
+     * {@code ScopeResolver} resolves it to none.
      */
     private static int countWatchedChannels(List<Monitor> monitors, Set<String> visibleChannelIds) {
         Set<String> watched = new HashSet<>();
@@ -272,7 +288,10 @@ public final class DashboardService {
         boolean coversAll = false;
         Set<String> covered = new TreeSet<>();
         for (Monitor monitor : MonitorService.list()) {
-            if (!monitor.isEnabled() || monitor.getScopeType() == null) {
+            // A LOG_EVENTS monitor's ALL scope marks it server-wide; it
+            // covers no channel and must not light every host badge.
+            if (!monitor.isEnabled() || monitor.getScopeType() == null
+                    || ProblemSubject.forMonitor(monitor, null).isServer()) {
                 continue;
             }
             switch (monitor.getScopeType()) {

@@ -97,6 +97,10 @@ public final class ChannelAlertSender implements AlertSender {
         // receiving channel's filter can test presence rather than emptiness.
         put(sourceMap, "sentinelRunbookUrl", payload.getRunbookUrl());
         put(sourceMap, "sentinelAlertEventId", String.valueOf(payload.getAlertEventId()));
+        // Only for a Log alert with matches: the text the mail body shows. The
+        // body's matches array has the same lines as fields.
+        String matches = payload.matchesText();
+        put(sourceMap, "sentinelMatches", matches.isEmpty() ? null : matches);
         return sourceMap;
     }
 

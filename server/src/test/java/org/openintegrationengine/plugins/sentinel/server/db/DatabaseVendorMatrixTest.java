@@ -105,6 +105,11 @@ class DatabaseVendorMatrixTest {
         }
     }
 
+    @Test
+    void retriesInterruptedServerSubjectMigration() throws Exception {
+        DatabaseMatrixSupport.verifyInterruptedSubjectMigration(derbyDatabase("interrupted-v14"));
+    }
+
     private DatabaseMatrixSupport.MatrixDatabase derbyDatabase(String purpose) {
         String name = "sentinelMatrix" + DATABASE_SEQUENCE.incrementAndGet()
                 + purpose.replaceAll("[^A-Za-z0-9]", "");

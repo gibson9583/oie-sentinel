@@ -22,15 +22,19 @@ import org.openintegrationengine.plugins.sentinel.server.db.SentinelMigrator;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelConnectorStatusListener;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
+import org.openintegrationengine.plugins.sentinel.server.log.LogPipeline;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
+import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 /**
  * Sentinel's engine lifecycle hook — the {@code <serverClasses>} entry in
- * plugin.xml. Owns exactly four runtime resources: the connector-status
+ * plugin.xml. Owns exactly five runtime resources: the connector-status
  * {@code EventListener}, the leader-lease heartbeat, the private Quartz
- * scheduler, and the alert dispatch thread pool, wired up in {@link #start()}
- * and torn down in {@link #stop()}. Everything else in the plugin is
+ * scheduler, the alert dispatch thread pool, and the log pipeline for Log
+ * monitors (an appender on the engine's root logger and a matcher thread),
+ * wired up in {@link #start()} and torn down in {@link #stop()}. Everything
+ * else in the plugin is
  * stateless (static services/repositories) or a self-managing singleton, so
  * there is deliberately nothing else to manage here.
  *
@@ -115,11 +119,17 @@ public class SentinelServicePlugin implements ServicePlugin {
     }
 
     /**
-     * Starts the four runtime resources: the alert dispatch pool first (the
+     * Starts the five runtime resources: the alert dispatch pool first (the
      * scheduler's evaluator hands every notification to it), then the
      * connector-status listener (so no state transitions are missed while the
-     * scheduler spins up), then the leader-lease heartbeat, then the scheduler
-     * with the persisted settings.
+     * scheduler spins up), then the leader-lease heartbeat, then the log
+     * pipeline, then the scheduler with the persisted settings.
+     *
+     * <p>The log pipeline starts before the scheduler, whose first log match
+     * flush loads the monitors, and only past the schema gate, because that
+     * flush writes its counts. Its failure, a linkage error included, is
+     * logged and the rest of Sentinel starts: channel monitoring does not
+     * depend on it, and the engine does not guard plugin start.</p>
      *
      * <p>The heartbeat must precede the scheduler, and not merely by
      * convention: the job bodies ask {@link SentinelLeadership} whether this
@@ -160,7 +170,14 @@ public class SentinelServicePlugin implements ServicePlugin {
             // whether this node is the one that does the work.
             SentinelLeadership.startHeartbeat();
 
-            SentinelScheduler.getInstance().start(SettingsService.get());
+            SentinelSettings settings = SettingsService.get();
+            try {
+                LogPipeline.get().start(settings.getLogQueueCapacity());
+            } catch (Throwable t) {
+                log.error("Sentinel could not start its log capture; Log monitors get no counts from this node", t);
+            }
+
+            SentinelScheduler.getInstance().start(settings);
 
             log.info("OIE Sentinel started");
         } catch (Exception e) {
@@ -227,7 +244,10 @@ public class SentinelServicePlugin implements ServicePlugin {
 
     /**
      * Tears down in reverse start order: scheduler first so no job tick can
-     * race the listener removal, then the leader-lease heartbeat, then the
+     * race the listener removal or the log pipeline's final flush, then the
+     * log pipeline (it writes what it matched since the last flush, then its
+     * counts go with it, so a later start does not write old matches with a
+     * new time), then the leader-lease heartbeat, then the
      * listener ({@code removeListener} also shuts down its consumer thread),
      * then the alert dispatch pool. The pool goes last on purpose — with the
      * evaluator already stopped nothing is producing notifications any more,
@@ -249,6 +269,12 @@ public class SentinelServicePlugin implements ServicePlugin {
             SentinelScheduler.getInstance().shutdown();
         } catch (Exception e) {
             log.warn("Failed to shut down the Sentinel scheduler", e);
+        }
+
+        try {
+            LogPipeline.get().stop();
+        } catch (Throwable t) {
+            log.warn("Failed to stop Sentinel's log capture", t);
         }
 
         try {

@@ -201,7 +201,7 @@ class RestrictedMonitorReadTest {
                 assertEquals(ALLOWED, new HashSet<>(filter.getChannelIdIn()));
                 return new PagedResult<>(List.of(), 0L, 0, 1000);
             });
-            events.when(() -> AlertEventRepository.listRecentAlertEvents(10)).thenReturn(List.of());
+            events.when(() -> AlertEventRepository.listRecentAlertEvents(10, AlertKind.PROBLEM)).thenReturn(List.of());
             DashboardSummary dashboard = DashboardService.build(ALLOWED);
             assertEquals(2, dashboard.getMonitorsTotal());
             assertEquals(1, dashboard.getMonitorsEnabled());

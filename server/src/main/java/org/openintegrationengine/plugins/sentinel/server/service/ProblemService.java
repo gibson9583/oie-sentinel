@@ -20,12 +20,14 @@ import org.slf4j.LoggerFactory;
 
 import com.mirth.connect.server.controllers.ChannelController;
 
+import org.openintegrationengine.plugins.sentinel.server.alert.MatchedLines;
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
-import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
@@ -93,10 +95,13 @@ public final class ProblemService {
      *
      * @param filter the query; its sort fields are already allow-listed by
      *               {@link AlertEventFilter}'s own setters
-     * @return one page of events plus the total match count
+     * @return one page of events plus the total match count, with stored Log
+     *         matches hidden as in {@link MatchedLines#visibleDetails}
      */
     public static PagedResult<AlertEvent> list(AlertEventFilter filter) {
-        return AlertEventRepository.listAlertEvents(filter);
+        PagedResult<AlertEvent> page = AlertEventRepository.listAlertEvents(filter);
+        MatchedLines.applyVisibleDetails(page.items());
+        return page;
     }
 
     /**
@@ -147,7 +152,8 @@ public final class ProblemService {
      * {@link AlertEventFilter}: CSV values are split, enum names parsed
      * strictly (an unknown severity is a client error worth a 400, not a
      * silently empty filter), epoch millis become {@link Instant}s, and the
-     * sort fields pass through the filter's own allow-list setters.
+     * sort fields pass through the filter's own allow-list setters. Only
+     * problems: notifications have their own list.
      *
      * @param status         AlertStatus name or null
      * @param severityCsv    CSV of Severity names or null
@@ -170,6 +176,7 @@ public final class ProblemService {
             Integer monitorId, String monitorTypeName, Boolean acknowledged, Long fromEpochMillis,
             Long toEpochMillis, String q, String sortColumn, String sortDir, int page, int pageSize) {
         AlertEventFilter filter = new AlertEventFilter();
+        filter.setKind(AlertKind.PROBLEM);
 
         if (!isBlank(status)) {
             filter.setStatus(parseEnum(AlertStatus.class, status, "status"));
@@ -231,11 +238,17 @@ public final class ProblemService {
      * from the current channel inventory used to authorize monitor metadata.
      * This keeps retained events readable after channel deletion without
      * broadening access to their monitor's current definition.
+     *
+     * <p>A server problem has no channel identity to check. It is readable
+     * only when {@code authorizedMonitorChannelIds} is {@code null}, the
+     * unrestricted caller, and {@code canReadEventChannel} is never asked
+     * about it (see {@link ProblemSubject#visibleTo(boolean, Predicate)}).</p>
      */
     public static ProblemDetail getDetail(long id, Set<String> authorizedMonitorChannelIds,
             Predicate<String> canReadEventChannel) {
         AlertEvent event = requireEvent(id);
-        if (!canReadEventChannel.test(event.getChannelId())) {
+        ProblemSubject subject = ProblemSubject.of(event);
+        if (!subject.visibleTo(authorizedMonitorChannelIds != null, canReadEventChannel)) {
             throw new NoSuchElementException("No problem with id " + id);
         }
 
@@ -251,13 +264,15 @@ public final class ProblemService {
         } catch (NoSuchElementException e) {
             // A readable event does not grant access to a hidden current definition.
         }
+        event.setDetailsJson(MatchedLines.visibleDetails(event, monitor));
         detail.setMonitorName(monitor != null ? monitor.getName()
                 : authorizedMonitorChannelIds == null ? DELETED_MONITOR : "(unavailable monitor)");
         detail.setMonitorType(monitor != null ? monitor.getMonitorType() : null);
         detail.setRunbookUrl(monitor != null ? monitor.getRunbookUrl() : null);
 
-        detail.setChannelName(ScopeResolver.channelName(event.getChannelId()));
-        detail.setConnectorName(resolveConnectorName(event));
+        detail.setChannelName(subject.displayName(
+                monitor != null && monitor.getMonitorType() != null ? monitor.getMonitorType().kind() : null));
+        detail.setConnectorName(subject.isServer() ? null : resolveConnectorName(event));
         detail.setDispatches(ActionDispatchLogRepository.listActionDispatchLogsForEvent(id));
         return detail;
     }
@@ -279,7 +294,7 @@ public final class ProblemService {
      */
     public static AlertEvent acknowledge(long id, String comment, int userId) {
         validateComment(comment);
-        AlertEvent event = requireEvent(id);
+        AlertEvent event = requireProblem(id, "acknowledged");
         if (event.getAcknowledgedBy() != null) {
             throw new IllegalArgumentException("Problem " + id + " is already acknowledged");
         }
@@ -291,6 +306,7 @@ public final class ProblemService {
             throw new IllegalArgumentException("Problem " + id + " was already acknowledged or resolved");
         }
         SentinelAuditLog.problemAcknowledged(userId, event, comment);
+        MatchedLines.applyVisibleDetails(List.of(event));
         return event;
     }
 
@@ -315,7 +331,7 @@ public final class ProblemService {
      */
     public static AlertEvent resolve(long id, String comment, int userId) {
         validateComment(comment);
-        AlertEvent event = requireEvent(id);
+        AlertEvent event = requireProblem(id, "resolved");
         if (event.getStatus() != AlertStatus.PROBLEM) {
             throw new IllegalArgumentException("Problem " + id + " is already resolved");
         }
@@ -323,6 +339,7 @@ public final class ProblemService {
             throw new IllegalArgumentException("Problem " + id + " was already resolved");
         }
         SentinelAuditLog.problemResolved(userId, event, comment);
+        MatchedLines.applyVisibleDetails(List.of(event));
         return event;
     }
 
@@ -525,8 +542,8 @@ public final class ProblemService {
             TriggerStateRepository.resetTriggerStateForAlert(event.getId(), now);
         } catch (Exception e) {
             log.warn("Failed to reset trigger state after manual resolve of problem {} "
-                    + "(monitor {}, channel {})", event.getId(), event.getMonitorId(),
-                    event.getChannelId(), e);
+                    + "(monitor {}, {})", event.getId(), event.getMonitorId(),
+                    ProblemSubject.of(event), e);
         }
     }
 
@@ -550,6 +567,15 @@ public final class ProblemService {
                     event.getId(), event.getChannelId(), event.getMetadataId(), e);
             return null;
         }
+    }
+
+    /** A notification has nothing to acknowledge or resolve; the bulk paths skip it as already resolved. */
+    private static AlertEvent requireProblem(long id, String verb) {
+        AlertEvent event = requireEvent(id);
+        if (event.getKind() == AlertKind.NOTIFICATION) {
+            throw new IllegalArgumentException(id + " is a notification, which cannot be " + verb);
+        }
+        return event;
     }
 
     /** Fetches an event or throws the 404-mapped exception. */

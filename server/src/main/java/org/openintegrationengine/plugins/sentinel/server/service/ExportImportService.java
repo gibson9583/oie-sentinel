@@ -20,6 +20,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.UnaryOperator;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
@@ -642,7 +643,7 @@ public final class ExportImportService {
 
         Monitor incoming;
         try {
-            incoming = Json.mapper().treeToValue(node, Monitor.class);
+            incoming = readMonitor(node);
         } catch (Exception e) {
             return entry.skipped("Not a valid monitor definition: " + rootMessage(e));
         }
@@ -685,6 +686,19 @@ public final class ExportImportService {
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
         }
+    }
+
+    /**
+     * Reads one monitor entry the way the import saves it. The servlet's Log
+     * monitor check reads entries with this too, so the check and the import
+     * cannot disagree about an entry's type.
+     *
+     * @return the monitor as the import would save it
+     * @throws JsonProcessingException  when the entry is not a monitor definition
+     * @throws IllegalArgumentException when Jackson rejects the entry outright
+     */
+    public static Monitor readMonitor(JsonNode node) throws JsonProcessingException {
+        return Json.mapper().treeToValue(node, Monitor.class);
     }
 
     private static String monitorReferenceProblem(JsonNode node) {

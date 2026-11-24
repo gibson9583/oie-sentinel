@@ -158,7 +158,7 @@ export function severityChipNode(severity) {
 /* ---- monitor types ------------------------------------------------------ */
 
 export const MONITOR_TYPE_ORDER = ['INACTIVITY', 'LOW_VOLUME', 'ANOMALY', 'CONNECTION_STATUS',
-    'ERROR_RATE', 'QUEUE_DEPTH', 'CHANNEL_STATE'];
+    'ERROR_RATE', 'QUEUE_DEPTH', 'CHANNEL_STATE', 'LOG_EVENTS'];
 
 // defaultConfig mirrors the configJson shapes in webadmin-contract.md; the
 // monitors page seeds new-monitor editors from it.
@@ -213,7 +213,38 @@ export const MONITOR_TYPE_META = {
         // ignore this monitor.
         defaultConfig: { alertOnStates: ['STOPPED', 'PAUSED', 'UNDEPLOYED'], minDurationSeconds: 300 },
     },
+    LOG_EVENTS: {
+        label: 'Log lines',
+        description: 'Lines the engine logs, matched by level, logger name and pattern.',
+        // The Log kind: scope is always ALL and its alerts carry no channel.
+        kind: 'LOG',
+        defaultConfig: {
+            minLevel: 'ERROR', loggerPrefix: '', pattern: '', condition: 'AT_LEAST', threshold: 1,
+            windowSeconds: 300, outcome: 'PROBLEM', clearMode: 'CONDITION', clearAfterSeconds: 3600,
+            includeMatches: false,
+        },
+    },
 };
+
+/* What a monitor watches, the editor's first choice. Event comes later. */
+export const MONITOR_KINDS = [
+    { key: 'CHANNEL', label: 'Channel', description: 'Watches channels: traffic, errors, queues, connectors and state.' },
+    { key: 'LOG', label: 'Log', description: 'Watches the lines the engine logs on every cluster node.' },
+];
+
+/** 'LOG' for LOG_EVENTS, 'CHANNEL' for every other type. The server refuses a
+    saved monitor that changes kind, and suppression across kinds. */
+export function monitorKind(type) {
+    return (MONITOR_TYPE_META[type] && MONITOR_TYPE_META[type].kind) || 'CHANNEL';
+}
+
+/* Shown where a channel name would go for a Log problem or notification. */
+export const LOG_LABEL = 'Log';
+
+/** True for a Log problem or notification: no channel (subjectType SERVER on the wire). */
+export function isLogAlert(event) {
+    return !!event && event.subjectType === 'SERVER';
+}
 
 /* ---- formatting --------------------------------------------------------- */
 
@@ -892,7 +923,7 @@ export function FilterBar({ value, onChange, monitors, channels }) {
 
 /* ---- Action condition builder ------------------------------------------- */
 
-export const EVENT_TYPES = ['PROBLEM', 'RESOLVED'];
+export const EVENT_TYPES = ['PROBLEM', 'RESOLVED', 'NOTIFICATION'];
 
 // Field/operator matrix per ActionConditionMatcher (server contract): rows are
 // ANDed; IN takes an array value; unknown field/op fails closed server-side.

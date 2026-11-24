@@ -20,6 +20,7 @@ import java.util.TreeMap;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorHistoryPoint;
 import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 
@@ -222,6 +223,7 @@ public final class MonitorHistoryService {
             Set<String> visibleChannelIds) {
         AlertEventFilter filter = new AlertEventFilter();
         filter.setMonitorId(monitorId);
+        filter.setKind(AlertKind.PROBLEM);
         filter.setChannelIdIn(new ArrayList<>(visibleChannelIds));
         filter.setFrom(from);
         filter.setTo(to);

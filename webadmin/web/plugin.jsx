@@ -12,6 +12,7 @@ import { canManage, canManageSettings } from './ui.jsx';
 import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
+import { NotificationsPage } from './pages/notifications.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
 import { ActionsPage } from './pages/actions.jsx';
 import { MaintenancePage } from './pages/maintenance.jsx';
@@ -78,6 +79,7 @@ const SENTINEL_CSS = `
 const TABS = [
     { key: 'dashboard', label: 'Dashboard', component: DashboardPage },
     { key: 'problems', label: 'Problems', component: ProblemsPage },
+    { key: 'notifications', label: 'Notifications', component: NotificationsPage },
     { key: 'monitors', label: 'Monitors', component: MonitorsPage },
     { key: 'actions', label: 'Actions', component: ActionsPage },
     { key: 'schedules', label: 'Schedules', component: MaintenancePage },

@@ -21,10 +21,12 @@ import org.apache.ibatis.session.SqlSessionManager;
 
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorHistoryPoint;
 import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
+import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 
 /**
  * Persistence for {@code sentinel_alert_event} — the "Problems" list backing
@@ -92,6 +94,19 @@ public final class AlertEventRepository {
         } catch (Exception e) {
             log.error("Failed to insert alert event for monitor {}, channel {}",
                     event.getMonitorId(), event.getChannelId(), e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /** Replaces an open problem's details; a resolved row is left as it is. */
+    public static boolean updateAlertEventDetails(long id, String detailsJson) {
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("id", id);
+            params.put("details_json", detailsJson);
+            return SqlConfig.getInstance().getSqlSessionManager().update(stmt("updateAlertEventDetails"), params) == 1;
+        } catch (Exception e) {
+            log.error("Failed to update details of alert event {}", id, e);
             throw new RepositoryException(e);
         }
     }
@@ -255,9 +270,18 @@ public final class AlertEventRepository {
      * @throws RepositoryException on persistence failure
      */
     public static List<AlertEvent> listRecentAlertEvents(int limit) {
+        return listRecentAlertEvents(limit, null);
+    }
+
+    /**
+     * @param kind {@code null} for every kind
+     * @see #listRecentAlertEvents(int)
+     */
+    public static List<AlertEvent> listRecentAlertEvents(int limit, AlertKind kind) {
         try {
             Map<String, Object> params = new HashMap<>();
             params.put("limit", limit);
+            params.put("kind", kind != null ? kind.name() : null);
 
             List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
                     .selectList(stmt("listRecentAlertEvents"), params);
@@ -342,6 +366,7 @@ public final class AlertEventRepository {
             params.put("monitorId", monitorId);
             params.put("from", toTimestamp(from));
             params.put("to", toTimestamp(to));
+            params.put("kind", AlertKind.PROBLEM.name());
 
             List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
                     .selectList(stmt("listMonitorHistory"), params);
@@ -392,6 +417,8 @@ public final class AlertEventRepository {
     private static Map<String, Object> toColumnMap(AlertEvent event) {
         Map<String, Object> params = new HashMap<>();
         params.put("monitor_id", event.getMonitorId());
+        params.put("subject_type", SubjectType.orChannel(event.getSubjectType()).name());
+        params.put("event_kind", AlertKind.orProblem(event.getKind()).name());
         params.put("channel_id", event.getChannelId());
         params.put("metadata_id", event.getMetadataId());
         params.put("severity", event.getSeverity() != null ? event.getSeverity().name() : null);
@@ -439,6 +466,7 @@ public final class AlertEventRepository {
     private static Map<String, Object> toFilterParams(AlertEventFilter filter) {
         Map<String, Object> params = new HashMap<>();
         params.put("status", filter.getStatus() != null ? filter.getStatus().name() : null);
+        params.put("kind", filter.getKind() != null ? filter.getKind().name() : null);
 
         List<Severity> severityIn = filter.getSeverityIn();
         if (severityIn != null) {
@@ -547,6 +575,9 @@ public final class AlertEventRepository {
         Integer monitorId = toInteger(row.get("monitor_id"));
         event.setMonitorId(monitorId != null ? monitorId : 0);
 
+        event.setSubjectType(toSubjectType(row.get("subject_type")));
+        Object kind = row.get("event_kind");
+        event.setKind(kind != null ? AlertKind.valueOf(kind.toString()) : null);
         event.setChannelId((String) row.get("channel_id"));
         event.setMetadataId(toInteger(row.get("metadata_id")));
 
@@ -640,6 +671,14 @@ public final class AlertEventRepository {
             return n.doubleValue();
         }
         return Double.valueOf(value.toString().trim());
+    }
+
+    /**
+     * Reads {@code subject_type}; NULL reads as CHANNEL, as the v14 backfill
+     * set it. Shared with {@link TriggerStateRepository}.
+     */
+    static SubjectType toSubjectType(Object value) {
+        return SubjectType.orChannel(value == null ? null : SubjectType.valueOf(value.toString().trim()));
     }
 
     /** Converts an {@link Instant} to the {@link Timestamp} MyBatis/JDBC expects as a bound parameter. */

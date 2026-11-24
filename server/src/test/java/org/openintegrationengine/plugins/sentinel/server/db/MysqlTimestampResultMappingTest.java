@@ -49,10 +49,10 @@ class MysqlTimestampResultMappingTest {
             "id name description monitor_type scope_type scope_id enabled severity config_json min_consecutive_breaches suppressed_by_monitor_id runbook_url created_by created_time updated_by updated_time",
             "created_time updated_time", "updated_time", false);
     private static final Shape ALERT = new Shape(
-            "id monitor_id channel_id metadata_id severity status message opened_time resolved_time acknowledged_by acknowledged_time ack_comment details_json suppressed problem_pending resolution_pending",
+            "id monitor_id subject_type event_kind channel_id metadata_id severity status message opened_time resolved_time acknowledged_by acknowledged_time ack_comment details_json suppressed problem_pending resolution_pending",
             "opened_time resolved_time acknowledged_time", "resolved_time acknowledged_time", true);
     private static final Shape TRIGGER = new Shape(
-            "id monitor_id channel_id metadata_id state consecutive_breach_count last_value_json open_alert_event_id last_change_time last_evaluated_time",
+            "id monitor_id subject_type channel_id metadata_id state consecutive_breach_count last_value_json open_alert_event_id last_change_time last_evaluated_time",
             "last_change_time last_evaluated_time", "last_change_time last_evaluated_time", false);
     private static final Shape SAMPLE = new Shape(
             "id channel_id sample_time received_delta sent_delta error_delta filtered_delta queued_snapshot",
@@ -74,6 +74,8 @@ class MysqlTimestampResultMappingTest {
             "id channel_id metadata_id node_id previous_state new_state changed_time deployment_time",
             "changed_time deployment_time", "deployment_time", true);
     private static final Shape PRESENCE = new Shape("metadata_id node_id deployed_time", "deployed_time", "", false);
+    private static final Shape MATCH = new Shape("id node_id monitor_id channel_id sample_time match_count samples_json complete",
+            "sample_time", "", true);
 
     private static List<Query> queries() {
         List<Query> queries = new ArrayList<>();
@@ -89,6 +91,7 @@ class MysqlTimestampResultMappingTest {
         add(queries, LEASE, "getNodeLease");
         add(queries, CONNECTOR, "getLatestConnectorStatusEvent", "listLatestConnectorStatusEvents", "listConnectorStatusEvents");
         add(queries, PRESENCE, "listActiveConnectorNodes");
+        add(queries, MATCH, "listRecentMatchSamples");
         return queries;
     }
 
@@ -173,9 +176,9 @@ class MysqlTimestampResultMappingTest {
 
     private static Map<String, Object> values(Shape shape, boolean nulls) {
         Map<String, Object> row = new LinkedHashMap<>();
-        Set<String> big = words("open_alert_event_id alert_event_id received_delta sent_delta error_delta filtered_delta queued_snapshot received_sum sent_sum error_sum min_queued max_queued lease_epoch");
+        Set<String> big = words("open_alert_event_id alert_event_id received_delta sent_delta error_delta filtered_delta queued_snapshot received_sum sent_sum error_sum min_queued max_queued lease_epoch match_count");
         Set<String> integers = words("monitor_id metadata_id created_by updated_by min_consecutive_breaches suppressed_by_monitor_id consecutive_breach_count action_id repeat_interval_seconds max_repeats max_notifications_per_window rollup_window_seconds escalate_after_seconds escalate_to_action_id");
-        Set<String> flags = words("enabled suppressed problem_pending resolution_pending success");
+        Set<String> flags = words("enabled suppressed problem_pending resolution_pending success complete");
         for (String column : shape.columns().split(" ")) {
             Object value;
             if (words(shape.timestamps()).contains(column)) {

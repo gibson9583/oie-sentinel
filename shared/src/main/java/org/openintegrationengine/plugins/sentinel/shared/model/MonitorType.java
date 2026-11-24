@@ -45,5 +45,26 @@ public enum MonitorType {
      * {@code ChannelStateEvaluator} and
      * {@code ScopeResolver#resolveScopedChannels}.</p>
      */
-    CHANNEL_STATE
+    CHANNEL_STATE,
+    /**
+     * The Log kind: lines the engine logs, matched by level, logger name
+     * prefix and pattern on every node. A log line belongs to no channel, so
+     * its problems and notifications carry {@link SubjectType#SERVER} and no
+     * channel id, and its scope is always {@link ScopeType#ALL}.
+     */
+    LOG_EVENTS;
+
+    /** @return {@link MonitorKind#LOG} for {@link #LOG_EVENTS}, {@link MonitorKind#CHANNEL} otherwise */
+    public MonitorKind kind() {
+        return this == LOG_EVENTS ? MonitorKind.LOG : MonitorKind.CHANNEL;
+    }
+
+    /**
+     * @return what problems raised by this type are about:
+     *         {@link SubjectType#SERVER} for {@link #LOG_EVENTS},
+     *         {@link SubjectType#CHANNEL} for every other type
+     */
+    public SubjectType subjectType() {
+        return this == LOG_EVENTS ? SubjectType.SERVER : SubjectType.CHANNEL;
+    }
 }

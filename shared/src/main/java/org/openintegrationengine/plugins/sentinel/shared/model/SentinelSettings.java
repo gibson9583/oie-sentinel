@@ -24,6 +24,7 @@ public class SentinelSettings {
     private int sampleRetentionDays = 7;
     private int trendRetentionDays = 90;
     private int resolvedAlertRetentionDays = 180;
+    private int logQueueCapacity = 1000;
 
     public SentinelSettings() {
     }
@@ -105,5 +106,20 @@ public class SentinelSettings {
      */
     public void setResolvedAlertRetentionDays(int resolvedAlertRetentionDays) {
         this.resolvedAlertRetentionDays = resolvedAlertRetentionDays;
+    }
+
+    /**
+     * @return how many log lines each node queues for Log monitors before it
+     *         drops new ones and counts them as dropped
+     */
+    public int getLogQueueCapacity() {
+        return logQueueCapacity;
+    }
+
+    /**
+     * @param logQueueCapacity how many log lines each node queues for Log monitors
+     */
+    public void setLogQueueCapacity(int logQueueCapacity) {
+        this.logQueueCapacity = logQueueCapacity;
     }
 }

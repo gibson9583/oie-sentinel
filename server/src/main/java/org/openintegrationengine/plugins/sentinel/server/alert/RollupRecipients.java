@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.shared.model.*;
 
 /** Recipient-specific disclosure policy; a global storm snapshot is never authority to name an incident. */
@@ -25,14 +26,17 @@ final class RollupRecipients {
         var verdict = new AlertStormControl.CeilingVerdict(AlertStormControl.CeilingOutcome.ROLLUP,
                 summary.sent(), summary.windowSeconds(),
                 channels(action, now.minusSeconds(summary.windowSeconds()), now));
-        return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(), payload.getMonitorName(),
-                payload.getMonitorType(), payload.getChannelId(), payload.getChannelName(), payload.getMetadataId(),
-                payload.getSeverity(), payload.getEventType(), AlertStormControl.rollupMessage(verdict),
-                payload.getOpenedTime(), payload.getValueJson(), payload.getRunbookUrl());
+        return payload.copy(payload.getEventType(), AlertStormControl.rollupMessage(verdict));
     }
 
+    /**
+     * Names the subjects this recipient may be told about, in subject order:
+     * channels by id, then "Log" when a Log problem or notification qualifies.
+     * Notifications count, as they spend the same budget, on the opened edge.
+     * Keyed on the subject, not the name, for the reason the storm scan gives.
+     */
     static List<String> channels(Action action, Instant from, Instant now) {
-        Map<String, String> names = new TreeMap<>();
+        Map<ProblemSubject, String> names = new TreeMap<>();
         for (AlertEvent candidate : AlertEventRepository.listRecentAlertEvents(CANDIDATE_LIMIT)) {
             try {
                 if (candidate.getId() == null || candidate.getOpenedTime() == null
@@ -40,12 +44,13 @@ final class RollupRecipients {
                     continue;
                 }
                 AlertEvent current = AlertEventRepository.getAlertEvent(candidate.getId());
-                if (current == null || current.getChannelId() == null || current.getStatus() == null
+                if (current == null || !ProblemSubject.of(current).isIdentified() || current.getStatus() == null
                         || NotificationSuppression.decision(current, now) != NotificationSuppression.Decision.ALLOW) {
                     continue;
                 }
                 OperationMode mode = action.getOperationMode();
-                boolean resolved = current.getStatus() == AlertStatus.RESOLVED;
+                boolean resolved = current.getStatus() == AlertStatus.RESOLVED
+                        && current.getKind() != AlertKind.NOTIFICATION;
                 if (mode != OperationMode.BOTH && mode != (resolved
                         ? OperationMode.ON_RESOLVE : OperationMode.ON_PROBLEM)) {
                     continue;
@@ -56,7 +61,7 @@ final class RollupRecipients {
                 }
                 AlertPayload payload = AlertPayload.of(current, monitor, resolved ? "RESOLVED" : "PROBLEM");
                 if (ActionConditionMatcher.matches(action, payload)) {
-                    names.put(current.getChannelId(), payload.getChannelName());
+                    names.put(ProblemSubject.of(current), payload.getChannelName());
                 }
             } catch (Exception e) {
                 log.warn("Cannot safely include alert {} in rollup for action {}",

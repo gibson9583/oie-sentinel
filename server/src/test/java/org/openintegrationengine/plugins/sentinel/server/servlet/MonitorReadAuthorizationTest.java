@@ -288,7 +288,7 @@ class MonitorReadAuthorizationTest {
             });
             scopes.when(() -> ScopeResolver.channelName(anyString())).thenAnswer(call -> call.getArgument(0));
             AlertEvent allowedAlert = event(ALLOWED), restrictedAlert = event(RESTRICTED);
-            alerts.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt())).thenReturn(List.of(allowedAlert, restrictedAlert));
+            alerts.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt(), eq(AlertKind.PROBLEM))).thenReturn(List.of(allowedAlert, restrictedAlert));
             alerts.when(() -> AlertEventRepository.listAlertEvents(any())).thenAnswer(call -> {
                 AlertEventFilter filter = call.getArgument(0);
                 List<AlertEvent> found = List.of(allowedAlert, restrictedAlert).stream()

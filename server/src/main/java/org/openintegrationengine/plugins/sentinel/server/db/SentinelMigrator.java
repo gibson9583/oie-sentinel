@@ -97,8 +97,19 @@ import org.slf4j.LoggerFactory;
  *   <li><b>11</b> — Per-node deployed-channel inventory for cluster-wide evaluation.</li>
  *   <li><b>12</b> — Connector observations carry their deployment identity; legacy rows stay untagged.</li>
  *   <li><b>13</b> — Dispatch-time index for complete notification-budget accounting.</li>
+ *   <li><b>14</b>: Match counts, problem subjects and alert kinds. Creates
+ *       {@code sentinel_match_sample}; adds {@code subject_type} to
+ *       {@code sentinel_alert_event} and {@code sentinel_trigger_state}
+ *       (backfilled to {@code CHANNEL}) and {@code event_kind} to
+ *       {@code sentinel_alert_event} (backfilled to {@code PROBLEM}); and makes
+ *       {@code channel_id} nullable on both, because a log problem has no
+ *       channel. SQL Server cannot relax a column that a constraint or index
+ *       uses, so there the trigger-state unique constraint (system-named since
+ *       v1) is recreated as {@code uq_sentinel_trigger_state}, the name Oracle
+ *       already uses, and the alert-event channel index is recreated.</li>
  * </ul>
- * <p>Versions 7–12 are this release's sequence after released schema v6.
+ * <p>Versions 7 to 12 shipped together in 1.1.1, after released schema v6, and
+ * 13 shipped in 1.2.0.
  * Unpublished hardening-branch versions are intentionally not the release
  * migration sequence; unrelated trigger identity and latency changes are excluded.</p>
  *
@@ -116,7 +127,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 13;
+    public static final int LATEST_VERSION = 14;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -200,6 +211,9 @@ public class SentinelMigrator extends Migrator {
         if (current < 13 && targetVersion >= 13) {
             applyV13();
         }
+        if (current < 14 && targetVersion >= 14) {
+            applyV14();
+        }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -216,7 +230,8 @@ public class SentinelMigrator extends Migrator {
      *         connector-status prune index present, 7 = lease epoch present,
      *         8 = per-node connector state complete, 9 = resolution outbox complete,
      *         10 = problem outbox and legacy backfill complete, 11 = deployed-channel inventory present,
-     *         12 = connector observation deployment identity present)
+     *         12 = connector observation deployment identity present, 13 = dispatch-time index present,
+     *         14 = match counts, subjects and alert kinds complete)
      */
     private int detectAndAlignSchemaVersion() throws MigrationException {
         int detected = detectFromState();
@@ -285,13 +300,22 @@ public class SentinelMigrator extends Migrator {
                     if (columnExists("sentinel_alert_event", "resolution_pending")
                             && indexExists("sentinel_alert_event", "idx_sentinel_alert_resolution",
                                     "resolution_pending, status, resolved_time")) {
-                        return columnExists("sentinel_alert_event", "problem_pending")
-                                && indexExists("sentinel_alert_event", "idx_sentinel_alert_problem",
-                                        "problem_pending, status, opened_time")
-                                ? (tableExists("sentinel_channel_presence")
-                                        ? (columnExists("sentinel_connector_status_event", "deployment_time")
-                                                ? (indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time",
-                                                        "dispatch_time") ? 13 : 12) : 11) : 10) : 9;
+                        if (!columnExists("sentinel_alert_event", "problem_pending")
+                                || !indexExists("sentinel_alert_event", "idx_sentinel_alert_problem",
+                                        "problem_pending, status, opened_time")) {
+                            return 9;
+                        }
+                        if (!tableExists("sentinel_channel_presence")) {
+                            return 10;
+                        }
+                        if (!columnExists("sentinel_connector_status_event", "deployment_time")) {
+                            return 11;
+                        }
+                        if (!indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time")) {
+                            return 12;
+                        }
+                        return indexExists("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time")
+                                ? 14 : 13;
                     }
                     return 8;
                 }
@@ -409,6 +433,175 @@ public class SentinelMigrator extends Migrator {
         createIndexIfAbsent("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time");
     }
 
+    /** The two tables whose rows name a problem subject: a channel, or the server as a whole. */
+    private static final String[] SUBJECT_TABLES = {"sentinel_alert_event", "sentinel_trigger_state"};
+
+    /**
+     * Match counts, problem subjects and alert kinds. Vendor DDL can
+     * auto-commit, so every step checks the state it produces and a retry
+     * resumes after any committed prefix. The kind index is created last and
+     * marks completion for {@link #detectFromState()}.
+     */
+    private void applyV14() throws MigrationException {
+        log.info("Applying Sentinel schema v14 (match counts, problem subjects, alert kinds)");
+        // The script is the single CREATE TABLE, so the table either exists
+        // whole or not at all; its indexes follow as separately guarded steps.
+        try {
+            if (!tableExists("sentinel_match_sample")) {
+                executeScript("/" + getDatabaseType() + "-sentinel-v14.sql");
+            }
+        } catch (MigrationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new MigrationException("Failed to create Sentinel match sample table", e);
+        }
+        createIndexIfAbsent("sentinel_match_sample", "idx_sentinel_match_monitor_time", "monitor_id, sample_time");
+        createIndexIfAbsent("sentinel_match_sample", "idx_sentinel_match_time", "sample_time");
+
+        String varchar = "oracle".equalsIgnoreCase(getDatabaseType()) ? "VARCHAR2(16)" : "VARCHAR(16)";
+        for (String table : SUBJECT_TABLES) {
+            addColumnIfAbsent(table, "subject_type", varchar);
+        }
+        addColumnIfAbsent("sentinel_alert_event", "event_kind", varchar);
+        // After the backfill, SQL compares these columns directly; only Java
+        // still reads NULL as the default.
+        for (String table : SUBJECT_TABLES) {
+            backfillNulls(table, "subject_type", "CHANNEL");
+        }
+        backfillNulls("sentinel_alert_event", "event_kind", "PROBLEM");
+        makeSubjectChannelNullable();
+        createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time");
+    }
+
+    /** NULL-only, so a retry never rewrites a row that was already set. */
+    private void backfillNulls(String table, String column, String value) throws MigrationException {
+        try {
+            executeStatement("UPDATE " + table + " SET " + column + " = '" + value + "' WHERE " + column + " IS NULL");
+        } catch (Exception e) {
+            throw new MigrationException("Failed to backfill Sentinel " + table + "." + column, e);
+        }
+    }
+
+    /**
+     * A log problem has no channel. The base DDL stays v1-shaped (NOT NULL),
+     * so fresh installs and upgrades both relax the column here.
+     */
+    private void makeSubjectChannelNullable() throws MigrationException {
+        try {
+            if ("sqlserver".equalsIgnoreCase(getDatabaseType())) {
+                makeSqlServerChannelNullable();
+                return;
+            }
+            for (String table : SUBJECT_TABLES) {
+                makeNullable(table, "channel_id", "CHAR(36)");
+            }
+        } catch (MigrationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new MigrationException("Failed to make Sentinel channel_id nullable", e);
+        }
+    }
+
+    /**
+     * SQL Server refuses ALTER COLUMN on a column that a constraint or index
+     * uses, so each dependent object is dropped, the column relaxed, and the
+     * object recreated. A failure can stop between any two of those
+     * statements; the recreate steps therefore run whenever the object is
+     * missing, not only right after a drop. v1 declared the trigger-state
+     * unique constraint inline, so SQL Server named it itself (UQ__...); it is
+     * found through the catalog and comes back named.
+     */
+    private void makeSqlServerChannelNullable() throws Exception {
+        if (!isNullable("sentinel_trigger_state", "channel_id")) {
+            for (Map.Entry<String, List<String>> constraint : sqlServerUniqueConstraints().entrySet()) {
+                if (constraint.getValue().contains("channel_id")) {
+                    executeStatement("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT ["
+                            + constraint.getKey().replace("]", "]]") + "]");
+                }
+            }
+            makeNullable("sentinel_trigger_state", "channel_id", "CHAR(36)");
+        }
+        if (!sqlServerUniqueConstraints().containsValue(List.of("monitor_id", "channel_id", "metadata_id"))) {
+            executeStatement("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT uq_sentinel_trigger_state "
+                    + "UNIQUE (monitor_id, channel_id, metadata_id)");
+        }
+
+        if (!isNullable("sentinel_alert_event", "channel_id")) {
+            if (indexExists("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel")) {
+                executeStatement("DROP INDEX idx_sentinel_alert_event_monitor_channel ON sentinel_alert_event");
+            }
+            makeNullable("sentinel_alert_event", "channel_id", "CHAR(36)");
+        }
+        createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel",
+                "monitor_id, channel_id");
+    }
+
+    /**
+     * @return every unique constraint on {@code sentinel_trigger_state}, by
+     *         name, with its key columns lower-cased in key order
+     */
+    private Map<String, List<String>> sqlServerUniqueConstraints() throws Exception {
+        Map<String, List<String>> constraints = new HashMap<>();
+        try (PreparedStatement statement = getConnection().prepareStatement(
+                "SELECT kc.name, c.name FROM sys.key_constraints kc "
+                        + "JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id "
+                        + "AND ic.index_id = kc.unique_index_id "
+                        + "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+                        + "WHERE kc.parent_object_id = OBJECT_ID(N'sentinel_trigger_state') AND kc.type = 'UQ' "
+                        + "ORDER BY kc.name, ic.key_ordinal");
+                ResultSet rows = statement.executeQuery()) {
+            while (rows.next()) {
+                constraints.computeIfAbsent(rows.getString(1), (ignored) -> new ArrayList<>())
+                        .add(rows.getString(2).toLowerCase(Locale.ROOT));
+            }
+        }
+        return constraints;
+    }
+
+    /**
+     * Drops a column's NOT NULL once. MySQL and SQL Server can only do that by
+     * restating the column, so they need its type.
+     */
+    private void makeNullable(String table, String column, String type) throws Exception {
+        if (isNullable(table, column)) {
+            return;
+        }
+        String change = switch (getDatabaseType().toLowerCase(Locale.ROOT)) {
+            case "derby" -> "ALTER COLUMN " + column + " NULL";
+            case "postgres" -> "ALTER COLUMN " + column + " DROP NOT NULL";
+            case "mysql" -> "MODIFY " + column + " " + type + " NULL";
+            case "sqlserver" -> "ALTER COLUMN " + column + " " + type + " NULL";
+            case "oracle" -> "MODIFY (" + column + " NULL)";
+            default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
+        };
+        executeStatement("ALTER TABLE " + table + " " + change);
+    }
+
+    /**
+     * Reads a column's declared nullability, trying the identifier cases the
+     * drivers fold to.
+     *
+     * @return {@code true} when the column accepts NULL
+     * @throws MigrationException when the column is missing or the driver
+     *                            cannot say
+     */
+    private boolean isNullable(String table, String column) throws Exception {
+        for (String tableName : namingCandidates(table)) {
+            for (String columnName : namingCandidates(column)) {
+                try (ResultSet columns = getConnection().getMetaData().getColumns(
+                        getConnection().getCatalog(), null, tableName, columnName)) {
+                    if (columns.next()) {
+                        int nullable = columns.getInt("NULLABLE");
+                        if (nullable == DatabaseMetaData.columnNullable) return true;
+                        if (nullable == DatabaseMetaData.columnNoNulls) return false;
+                        throw new MigrationException("Unknown nullability for Sentinel column " + table + "." + column);
+                    }
+                }
+            }
+        }
+        throw new MigrationException("Missing Sentinel column " + table + "." + column);
+    }
+
     private void addColumnIfAbsent(String table, String column, String sqlType) throws MigrationException {
         try {
             if (columnExists(table, column)) {
@@ -477,37 +670,7 @@ public class SentinelMigrator extends Migrator {
 
     private void makeWindowBoundNullable(String column) throws MigrationException {
         try {
-            boolean found = false;
-            for (String table : namingCandidates("sentinel_maintenance_window")) {
-                for (String name : namingCandidates(column)) {
-                    try (ResultSet columns = getConnection().getMetaData().getColumns(
-                            getConnection().getCatalog(), null, table, name)) {
-                        if (columns.next()) {
-                            int nullable = columns.getInt("NULLABLE");
-                            if (nullable == DatabaseMetaData.columnNullable) return;
-                            if (nullable != DatabaseMetaData.columnNoNulls) {
-                                throw new MigrationException("Unknown nullability for Sentinel window " + column);
-                            }
-                            found = true;
-                        }
-                    }
-                    if (found) break;
-                }
-                if (found) break;
-            }
-            if (!found) throw new MigrationException("Missing Sentinel window column " + column);
-            String change = switch (getDatabaseType().toLowerCase(Locale.ROOT)) {
-                case "derby" -> "ALTER COLUMN " + column + " NULL";
-                case "postgres" -> "ALTER COLUMN " + column + " DROP NOT NULL";
-                case "mysql" -> "MODIFY " + column + " DATETIME NULL";
-                case "sqlserver" -> "ALTER COLUMN " + column + " DATETIME NULL";
-                case "oracle" -> "MODIFY (" + column + " NULL)";
-                default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
-            };
-            try (PreparedStatement statement = getConnection().prepareStatement(
-                    "ALTER TABLE sentinel_maintenance_window " + change)) {
-                statement.executeUpdate();
-            }
+            makeNullable("sentinel_maintenance_window", column, "DATETIME");
         } catch (MigrationException e) {
             throw e;
         } catch (Exception e) {
@@ -695,13 +858,15 @@ public class SentinelMigrator extends Migrator {
     /**
      * All live Sentinel tables, with foreign-key dependents before their parents.
      * In particular, trigger state references both monitor and alert event, and
-     * dispatch log references alert event and action. Dropping a table also
+     * dispatch log references alert event and action. Match samples reference
+     * monitor. Dropping a table also
      * removes its indexes, constraints, and owned identity/serial sequences.
      */
     private static final String[] UNINSTALL_TABLES = {
             "sentinel_action_dispatch_log",
             "sentinel_trigger_state",
             "sentinel_alert_event",
+            "sentinel_match_sample",
             "sentinel_connector_status_event",
             "sentinel_channel_presence",
             "sentinel_channel_activity_trend",

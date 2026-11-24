@@ -23,6 +23,7 @@ public class TriggerState {
 
     private Integer id;
     private int monitorId;
+    private SubjectType subjectType = SubjectType.CHANNEL;
     private String channelId;
     private Integer metadataId;
     private TriggerStatus state;
@@ -71,7 +72,24 @@ public class TriggerState {
     }
 
     /**
-     * @return the OIE channel id (a UUID string) this state was evaluated for
+     * @return what this state tracks; {@link SubjectType#CHANNEL} unless the
+     *         monitor watches the server as a whole
+     */
+    public SubjectType getSubjectType() {
+        return subjectType;
+    }
+
+    /**
+     * @param subjectType what this state tracks; {@code null} is stored as
+     *                    {@link SubjectType#CHANNEL}
+     */
+    public void setSubjectType(SubjectType subjectType) {
+        this.subjectType = SubjectType.orChannel(subjectType);
+    }
+
+    /**
+     * @return the OIE channel id (a UUID string) this state was evaluated
+     *         for, or {@code null} for a {@link SubjectType#SERVER} state
      */
     public String getChannelId() {
         return channelId;
@@ -79,7 +97,7 @@ public class TriggerState {
 
     /**
      * @param channelId the OIE channel id (a UUID string) this state was
-     *                  evaluated for
+     *                  evaluated for; {@code null} for a server state
      */
     public void setChannelId(String channelId) {
         this.channelId = channelId;

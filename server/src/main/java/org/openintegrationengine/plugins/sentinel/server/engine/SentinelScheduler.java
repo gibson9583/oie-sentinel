@@ -24,13 +24,14 @@ import org.quartz.impl.StdSchedulerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.openintegrationengine.plugins.sentinel.server.log.LogMatchFlushJob;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 /**
- * Owns Sentinel's private Quartz scheduler and the four background jobs:
+ * Owns Sentinel's private Quartz scheduler and the five background jobs:
  * the activity collector and trigger evaluator (interval-driven,
- * operator-configurable), the hourly activity rollup, and the daily
- * retention prune.
+ * operator-configurable), the log match flush (on the collector's interval),
+ * the hourly activity rollup, and the daily retention prune.
  *
  * <p>Why a private scheduler instead of piggybacking on an engine one: the
  * engine has no shared scheduler to join — its own precedent
@@ -40,13 +41,15 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * Sentinel follows suit with instance name "SentinelScheduler", the default
  * in-memory RAMJobStore (job state is rebuilt from settings at every plugin
  * start, so persistence would only preserve stale schedules), and a small
- * fixed thread pool of 4 — one per job, because the worst case is real: a
+ * fixed thread pool of 5 — one per job, because the worst case is real: a
  * long retention prune (chunked delete after an operator lowers retention)
  * still running at :05 while the collector and a slow evaluator tick are
  * both busy would otherwise leave no thread for the rollup trigger, and a
- * missed rollup fire is the exact gap the backfill exists to cover. Four
- * threads means no Sentinel job can starve another, without ever competing
- * with message processing for more.</p>
+ * missed rollup fire is the exact gap the backfill exists to cover. The log
+ * match flush gets its own thread for the same reason: a flush held back for
+ * two intervals makes every log monitor read as unwatched. One thread per job
+ * means no Sentinel job can starve another, without ever competing with
+ * message processing for more.</p>
  *
  * <p>Multi-node engines: every node builds this same scheduler and fires its
  * own ticks. Exclusivity is enforced one level down, by the
@@ -57,7 +60,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * delegate classes, cluster clock requirements) to buy an exclusivity that a
  * single lease row already provides. Note the corollary: the scheduler knows
  * nothing about leadership, so nothing here changes when it moves — the
- * triggers keep firing on every node either way.</p>
+ * triggers keep firing on every node either way. The log match flush is the
+ * one job with no leadership check: each node counts its own log, so each
+ * node writes its own rows.</p>
  *
  * <p>Stateful singleton (like {@link CollectorState}) because the scheduler
  * handle must be shared between the plugin lifecycle
@@ -95,6 +100,8 @@ public final class SentinelScheduler {
     private static final String ROLLUP_TRIGGER = "activityRollupTrigger";
     private static final String PRUNE_JOB = "retentionPrune";
     private static final String PRUNE_TRIGGER = "retentionPruneTrigger";
+    private static final String LOG_FLUSH_JOB = "logMatchFlush";
+    private static final String LOG_FLUSH_TRIGGER = "logMatchFlushTrigger";
 
     /** Five past the hour — the rolled-up hour is fully closed and its last collector tick long written. */
     private static final String ROLLUP_CRON = "0 5 * * * ?";
@@ -140,7 +147,11 @@ public final class SentinelScheduler {
     }
 
     private static int collectorIntervalSeconds(Scheduler current) throws SchedulerException {
-        Trigger trigger = current.getTrigger(TriggerKey.triggerKey(COLLECTOR_TRIGGER, GROUP));
+        return intervalSeconds(current, COLLECTOR_TRIGGER);
+    }
+
+    private static int intervalSeconds(Scheduler current, String triggerName) throws SchedulerException {
+        Trigger trigger = current.getTrigger(TriggerKey.triggerKey(triggerName, GROUP));
         if (trigger instanceof SimpleTrigger interval) {
             long millis = interval.getRepeatInterval();
             if (millis > 0 && millis % 1000 == 0 && millis / 1000 <= Integer.MAX_VALUE) {
@@ -151,7 +162,7 @@ public final class SentinelScheduler {
     }
 
     /**
-     * Builds the private scheduler, registers all four jobs with triggers
+     * Builds the private scheduler, registers all five jobs with triggers
      * derived from the given settings, and starts it. Called from
      * {@code SentinelServicePlugin.start()}.
      *
@@ -174,7 +185,7 @@ public final class SentinelScheduler {
         try {
             Properties properties = new Properties();
             properties.setProperty("org.quartz.scheduler.instanceName", "SentinelScheduler");
-            properties.setProperty("org.quartz.threadPool.threadCount", "4");
+            properties.setProperty("org.quartz.threadPool.threadCount", "5");
             properties.setProperty("org.quartz.scheduler.skipUpdateCheck", "true");
 
             StdSchedulerFactory factory = new StdSchedulerFactory();
@@ -189,6 +200,10 @@ public final class SentinelScheduler {
             newScheduler.scheduleJob(evaluatorJob,
                     intervalTrigger(EVALUATOR_TRIGGER, evaluatorJob, settings.getEvaluatorIntervalSeconds()));
 
+            JobDetail logFlushJob = durableJob(LogMatchFlushJob.class, LOG_FLUSH_JOB);
+            newScheduler.scheduleJob(logFlushJob,
+                    intervalTrigger(LOG_FLUSH_TRIGGER, logFlushJob, settings.getCollectorIntervalSeconds()));
+
             JobDetail rollupJob = durableJob(ActivityRollupJob.class, ROLLUP_JOB);
             newScheduler.scheduleJob(rollupJob, cronTrigger(ROLLUP_TRIGGER, rollupJob, ROLLUP_CRON));
 
@@ -199,7 +214,7 @@ public final class SentinelScheduler {
             collectorCoverageSince = Instant.now();
             scheduler = newScheduler;
 
-            log.info("Sentinel scheduler started (collector every {}s, evaluator every {}s, "
+            log.info("Sentinel scheduler started (collector and log flush every {}s, evaluator every {}s, "
                             + "rollup cron '{}', prune cron '{}')",
                     settings.getCollectorIntervalSeconds(), settings.getEvaluatorIntervalSeconds(),
                     ROLLUP_CRON, PRUNE_CRON);
@@ -214,6 +229,8 @@ public final class SentinelScheduler {
      * successful settings update; the cron jobs are untouched because their
      * schedules are fixed by design, not operator-configurable. An unchanged
      * collector interval preserves its trigger and trusted observation window.
+     * The log match flush follows the collector interval, and its trigger is
+     * likewise replaced only when that interval changed.
      *
      * <p>{@code rescheduleJob} replaces the trigger atomically inside the
      * live scheduler — no job unregistration, no missed or doubled tick
@@ -244,12 +261,18 @@ public final class SentinelScheduler {
                     collectorCoverageSince = Instant.now();
                 }
             }
+            if (intervalSeconds(scheduler, LOG_FLUSH_TRIGGER) != settings.getCollectorIntervalSeconds()) {
+                scheduler.rescheduleJob(TriggerKey.triggerKey(LOG_FLUSH_TRIGGER, GROUP),
+                        intervalTrigger(LOG_FLUSH_TRIGGER,
+                                scheduler.getJobDetail(JobKey.jobKey(LOG_FLUSH_JOB, GROUP)),
+                                settings.getCollectorIntervalSeconds()));
+            }
             scheduler.rescheduleJob(TriggerKey.triggerKey(EVALUATOR_TRIGGER, GROUP),
                     intervalTrigger(EVALUATOR_TRIGGER,
                             scheduler.getJobDetail(JobKey.jobKey(EVALUATOR_JOB, GROUP)),
                             settings.getEvaluatorIntervalSeconds()));
 
-            log.info("Sentinel scheduler rescheduled (collector every {}s, evaluator every {}s)",
+            log.info("Sentinel scheduler rescheduled (collector and log flush every {}s, evaluator every {}s)",
                     settings.getCollectorIntervalSeconds(), settings.getEvaluatorIntervalSeconds());
         } catch (SchedulerException e) {
             throw new RuntimeException("Failed to reschedule the Sentinel jobs", e);

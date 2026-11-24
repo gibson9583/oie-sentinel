@@ -23,7 +23,8 @@ const React = platform.React;
 
 // Field metadata; min/max mirror SettingsService's server-side ranges
 // (collector 10..600, evaluator 30..3600, sample 1..90, trend 7..3650,
-// resolvedAlert 7..3650) so the hints match what a 400 would enforce.
+// resolvedAlert 7..3650, logQueue 100..10000) so the hints match what a 400
+// would enforce. Every field is sent on save; one left out would reset.
 const SETTINGS_FIELDS = [
     {
         key: 'collectorIntervalSeconds',
@@ -54,6 +55,13 @@ const SETTINGS_FIELDS = [
         label: 'Resolved alert retention (days)',
         min: 7, max: 3650,
         hint: 'How long resolved problems are kept. Range 7–3650.',
+    },
+    {
+        key: 'logQueueCapacity',
+        label: 'Log queue capacity (lines)',
+        min: 100, max: 10000,
+        hint: 'Log lines each node holds for Log monitors before it drops new ones. Changes this '
+            + 'node when saved and the other nodes within one collector interval. Range 100 to 10,000.',
     },
 ];
 

@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import com.mirth.connect.server.controllers.ConfigurationController;
 
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelScheduler;
+import org.openintegrationengine.plugins.sentinel.server.log.LogPipeline;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
@@ -53,12 +54,15 @@ public final class SettingsService {
     private static final String KEY_SAMPLE_RETENTION = "retention.sample.days";
     private static final String KEY_TREND_RETENTION = "retention.trend.days";
     private static final String KEY_RESOLVED_ALERT_RETENTION = "retention.resolvedalert.days";
+    private static final String KEY_LOG_QUEUE_CAPACITY = "log.queue.capacity";
 
     private static final int COLLECTOR_MIN = 10, COLLECTOR_MAX = 600;
     private static final int EVALUATOR_MIN = 30, EVALUATOR_MAX = 3600;
     private static final int SAMPLE_MIN = 1, SAMPLE_MAX = 90;
     private static final int TREND_MIN = 7, TREND_MAX = 3650;
     private static final int RESOLVED_MIN = 7, RESOLVED_MAX = 3650;
+    // Below 100 an ordinary burst drops lines; at 10,000 the queue of capped lines stays near 160 MB at worst.
+    private static final int LOG_QUEUE_MIN = 100, LOG_QUEUE_MAX = 10_000;
 
     private SettingsService() {
     }
@@ -85,6 +89,8 @@ public final class SettingsService {
                 defaults.getTrendRetentionDays(), TREND_MIN, TREND_MAX));
         settings.setResolvedAlertRetentionDays(readInt(KEY_RESOLVED_ALERT_RETENTION,
                 defaults.getResolvedAlertRetentionDays(), RESOLVED_MIN, RESOLVED_MAX));
+        settings.setLogQueueCapacity(readInt(KEY_LOG_QUEUE_CAPACITY,
+                defaults.getLogQueueCapacity(), LOG_QUEUE_MIN, LOG_QUEUE_MAX));
         return settings;
     }
 
@@ -109,14 +115,17 @@ public final class SettingsService {
         requireRange("sampleRetentionDays", settings.getSampleRetentionDays(), SAMPLE_MIN, SAMPLE_MAX);
         requireRange("trendRetentionDays", settings.getTrendRetentionDays(), TREND_MIN, TREND_MAX);
         requireRange("resolvedAlertRetentionDays", settings.getResolvedAlertRetentionDays(), RESOLVED_MIN, RESOLVED_MAX);
+        requireRange("logQueueCapacity", settings.getLogQueueCapacity(), LOG_QUEUE_MIN, LOG_QUEUE_MAX);
 
         saveAndVerify(KEY_COLLECTOR_INTERVAL, settings.getCollectorIntervalSeconds());
         saveAndVerify(KEY_EVALUATOR_INTERVAL, settings.getEvaluatorIntervalSeconds());
         saveAndVerify(KEY_SAMPLE_RETENTION, settings.getSampleRetentionDays());
         saveAndVerify(KEY_TREND_RETENTION, settings.getTrendRetentionDays());
         saveAndVerify(KEY_RESOLVED_ALERT_RETENTION, settings.getResolvedAlertRetentionDays());
+        saveAndVerify(KEY_LOG_QUEUE_CAPACITY, settings.getLogQueueCapacity());
 
         SentinelScheduler.getInstance().reschedule(settings);
+        LogPipeline.get().resize(settings.getLogQueueCapacity());
         SentinelAuditLog.settingsUpdated(userId, settings);
         return settings;
     }

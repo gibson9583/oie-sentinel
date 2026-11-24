@@ -51,6 +51,7 @@ class DatabaseVendorMatrixIT {
                             DatabaseMatrixSupport.verifyUpgradeFrom(database, sourceVersion)));
             IntStream.rangeClosed(8, 10).forEach((target) -> scenarios.add(() ->
                     DatabaseMatrixSupport.verifyInterruptedMigration(database, target)));
+            scenarios.add(() -> DatabaseMatrixSupport.verifyInterruptedSubjectMigration(database));
             scenarios.add(() -> MapperStatementMatrix.verifyAll(database));
             scenarios.add(() -> DatabaseMatrixSupport.verifyUninstallRestartReinstall(database));
             IntStream.rangeClosed(0, SentinelMigrator.LATEST_VERSION)

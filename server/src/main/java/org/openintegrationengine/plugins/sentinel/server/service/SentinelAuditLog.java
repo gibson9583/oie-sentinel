@@ -19,6 +19,7 @@ import com.mirth.connect.server.controllers.ChannelController;
 import com.mirth.connect.server.controllers.ConfigurationController;
 import com.mirth.connect.server.controllers.EventController;
 
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.shared.SentinelServletInterface;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
@@ -291,7 +292,12 @@ public final class SentinelAuditLog {
             if (comment != null && !comment.isBlank()) {
                 attributes.put("Comment", comment);
             }
-            addChannelAttributes(attributes, event.getChannelId());
+            // A server problem names no channel, so it gets no channel
+            // attributes and the engine's event log files it under none.
+            ProblemSubject subject = ProblemSubject.of(event);
+            if (!subject.isServer()) {
+                addChannelAttributes(attributes, subject.channelId());
+            }
             dispatch(userId, attributes);
         } catch (Exception e) {
             log.warn("Failed to audit '{}' for problem {}", actionPhrase, event.getId(), e);
@@ -314,6 +320,7 @@ public final class SentinelAuditLog {
             attributes.put("Sample Retention (days)", String.valueOf(settings.getSampleRetentionDays()));
             attributes.put("Trend Retention (days)", String.valueOf(settings.getTrendRetentionDays()));
             attributes.put("Resolved Alert Retention (days)", String.valueOf(settings.getResolvedAlertRetentionDays()));
+            attributes.put("Log Queue Capacity", String.valueOf(settings.getLogQueueCapacity()));
             dispatch(userId, attributes);
         } catch (Exception e) {
             log.warn("Failed to audit Sentinel settings update", e);

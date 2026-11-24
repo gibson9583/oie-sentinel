@@ -23,6 +23,8 @@ public class AlertEvent {
 
     private Long id;
     private int monitorId;
+    private SubjectType subjectType = SubjectType.CHANNEL;
+    private AlertKind kind = AlertKind.PROBLEM;
     private String channelId;
     private Integer metadataId;
     private Severity severity;
@@ -73,8 +75,39 @@ public class AlertEvent {
     }
 
     /**
+     * @return what this event is about; {@link SubjectType#CHANNEL} unless
+     *         the monitor watches the server as a whole
+     */
+    public SubjectType getSubjectType() {
+        return subjectType;
+    }
+
+    /**
+     * @param subjectType what this event is about; {@code null} is stored as
+     *                    {@link SubjectType#CHANNEL}
+     */
+    public void setSubjectType(SubjectType subjectType) {
+        this.subjectType = SubjectType.orChannel(subjectType);
+    }
+
+    /**
+     * @return whether this event is a problem or a notification
+     */
+    public AlertKind getKind() {
+        return kind;
+    }
+
+    /**
+     * @param kind whether this event is a problem or a notification;
+     *             {@code null} is stored as {@link AlertKind#PROBLEM}
+     */
+    public void setKind(AlertKind kind) {
+        this.kind = AlertKind.orProblem(kind);
+    }
+
+    /**
      * @return the OIE channel id (a UUID string) this event was raised
-     *         against
+     *         against, or {@code null} for a {@link SubjectType#SERVER} event
      */
     public String getChannelId() {
         return channelId;
@@ -82,7 +115,7 @@ public class AlertEvent {
 
     /**
      * @param channelId the OIE channel id (a UUID string) this event was
-     *                  raised against
+     *                  raised against; {@code null} for a server event
      */
     public void setChannelId(String channelId) {
         this.channelId = channelId;
