@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -45,7 +46,26 @@ class LogMatchCounterTest {
     }
 
     @Test
-    void refreshDecidesWhatCountsAndATallyOutlivesAConfigChange() {
+    void anUnchangedMonitorKeepsItsTallyAcrossARefreshAndASaveStartsItAfresh() {
+        Monitor saved = monitor(1, "{}");
+        saved.setUpdatedTime(Instant.parse("2026-11-25T12:00:00Z"));
+        counter.refresh(List.of(saved));
+        counter.record(line(1L, Level.ERROR, "counted"));
+        Monitor reread = monitor(1, "{}");
+        reread.setUpdatedTime(saved.getUpdatedTime());
+        counter.refresh(List.of(reread));
+        assertEquals(1, counter.drain().get(1).count(), "the same saved definition keeps its tally");
+
+        counter.record(line(2L, Level.ERROR, "matched before the save"));
+        Monitor resaved = monitor(1, "{}");
+        resaved.setUpdatedTime(Instant.parse("2026-11-25T12:05:00Z"));
+        counter.refresh(List.of(resaved));
+        counter.record(line(3L, Level.ERROR, "matched after the save"));
+        assertEquals(1, counter.drain().get(1).count(), "a save with the same config starts afresh too");
+    }
+
+    @Test
+    void refreshDecidesWhatCountsAndAConfigChangeStartsTheTallyAfresh() {
         Monitor disabled = monitor(2, "{}");
         disabled.setEnabled(false);
         Monitor channelType = monitor(3, "{}");
@@ -72,7 +92,7 @@ class LogMatchCounterTest {
         counter.record(line(3L, Level.ERROR, "before the change"));
         counter.refresh(List.of(monitor(1, "{\"minLevel\": \"WARN\"}")));
         counter.record(line(4L, Level.WARN, "after the change"));
-        assertEquals(2, counter.drain().get(1).count());
+        assertEquals(1, counter.drain().get(1).count(), "a line counted under the old config is dropped");
         counter.record(line(5L, Level.ERROR, "lost with its monitor"));
         counter.refresh(List.of());
         assertEquals(Map.of(), counter.drain());

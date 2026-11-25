@@ -5,6 +5,7 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.log;
 
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,7 +25,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
  * <p>{@link #record} runs on the matcher thread, the rest on the flush job's
  * thread. The monitors live in an array the flush replaces whole, and a
  * monitor's tally carries over from one array to the next, so a line matched
- * against the old array still lands in the right count.</p>
+ * against the old array still lands in the right count. A saved monitor
+ * starts a new tally instead: what its old definition matched is dropped, as
+ * the evaluator leaves out rows written before the save.</p>
  */
 public final class LogMatchCounter {
 
@@ -132,8 +135,9 @@ public final class LogMatchCounter {
 
     /**
      * Counts the enabled {@code LOG_EVENTS} monitors in this list from now on.
-     * An unchanged config keeps its compiled entry, a changed one keeps its
-     * tally, and an invalid one is left out.
+     * An unchanged monitor keeps its compiled entry and its tally. A monitor
+     * saved since the last refresh (a new updated time or config) starts with
+     * an empty tally, and an invalid one is left out.
      *
      * @return the matchers now counted, for the queue's gate
      */
@@ -149,13 +153,14 @@ public final class LogMatchCounter {
                 continue;
             }
             Entry entry = previous.get(monitor.getId());
-            if (entry == null || !Objects.equals(entry.configJson, monitor.getConfigJson())) {
+            if (entry == null || !Objects.equals(entry.configJson, monitor.getConfigJson())
+                    || !Objects.equals(entry.savedTime, monitor.getUpdatedTime())) {
                 LogEventsConfig config = LogEventsConfig.lenient(monitor.getId(), monitor.getConfigJson());
                 if (config == null) {
                     continue;
                 }
-                entry = new Entry(monitor.getId(), monitor.getConfigJson(), config, LogMatcher.of(config),
-                        samplesToKeep(config), entry != null ? entry.tally : new Tally());
+                entry = new Entry(monitor.getId(), monitor.getConfigJson(), monitor.getUpdatedTime(), config,
+                        LogMatcher.of(config), samplesToKeep(config), new Tally());
             }
             next.put(entry.monitorId, entry);
         }
@@ -217,8 +222,8 @@ public final class LogMatchCounter {
         internalErrors.reset();
     }
 
-    private record Entry(int monitorId, String configJson, LogEventsConfig config, LogMatcher matcher, int samples,
-            Tally tally) {
+    private record Entry(int monitorId, String configJson, Instant savedTime, LogEventsConfig config,
+            LogMatcher matcher, int samples, Tally tally) {
     }
 
     private static final class Tally {

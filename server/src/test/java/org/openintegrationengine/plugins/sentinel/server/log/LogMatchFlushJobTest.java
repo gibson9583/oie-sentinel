@@ -8,6 +8,7 @@ package org.openintegrationengine.plugins.sentinel.server.log;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -45,6 +46,8 @@ import com.mirth.connect.server.logging.MirthLog4jFilter;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.MatchSample;
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
+import org.openintegrationengine.plugins.sentinel.server.evaluate.LogEventsEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
@@ -385,6 +388,29 @@ class LogMatchFlushJobTest {
         }
         pipeline.matcher().start();
         assertNull(pipeline.notCountingReason());
+    }
+
+    @Test
+    void savingAMonitorStartsItsCountAfreshSoLinesMatchedByTheOldRuleNeverCount() throws Exception {
+        counting();
+        Monitor monitor = database.logMonitor("alpha", "{\"pattern\": \"ALPHA\", \"includeMatches\": true}");
+        flush();
+        matched(Level.ERROR, "x", "ALPHA only", System.currentTimeMillis());
+        flush();
+        matched(Level.ERROR, "x", "ALPHA only, not written yet", System.currentTimeMillis());
+        assertEquals(EvaluationOutcome.Result.BREACH, LogEventsEvaluator.evaluate(monitor, Instant.now()).getResult(),
+                "the old rule breaches");
+
+        monitor.setConfigJson("{\"pattern\": \"BETA\", \"includeMatches\": true}");
+        monitor.setUpdatedTime(Instant.now());
+        MonitorRepository.updateMonitor(monitor);
+        flush();
+
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, Instant.now());
+        assertNotEquals(EvaluationOutcome.Result.BREACH, outcome.getResult(), outcome.getValueJson());
+        assertEquals(0, Json.mapper().readTree(outcome.getValueJson()).path("count").asLong());
+        assertFalse(outcome.getValueJson().contains("ALPHA"), outcome.getValueJson());
+        assertEquals(List.of(0L, 1L, 0L), counts(rows(monitor)), "the line matched before the save is not written");
     }
 
     @Test

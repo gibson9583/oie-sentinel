@@ -41,6 +41,12 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * is INSUFFICIENT_DATA, which neither opens nor clears. Each occurrence, as a
  * problem, is "at least 1".</p>
  *
+ * <p>Rows written before the monitor was last saved are left out: saving
+ * starts the count afresh, so lines the old definition matched never count
+ * under the new one. Each node also drops its unwritten tally at the save.
+ * The window's coverage is still measured from its start, so a window that
+ * began well before the save is not complete.</p>
+ *
  * <p>The window is clamped at run time to between the evaluator interval and
  * the sample retention, so settings changed after the monitor was saved
  * neither skip lines between evaluations nor ask for rows already pruned.
@@ -71,8 +77,9 @@ public final class LogEventsEvaluator {
         SentinelSettings settings = SettingsService.get();
         long windowSeconds = windowSeconds(config, settings);
         Instant from = now.minusSeconds(windowSeconds);
+        Instant counted = countedFrom(monitor, from);
 
-        List<MatchSampleRepository.NodeSum> sums = MatchSampleRepository.sumSamplesByNode(monitor.getId(), from, now);
+        List<MatchSampleRepository.NodeSum> sums = MatchSampleRepository.sumSamplesByNode(monitor.getId(), counted, now);
         long count = 0L;
         long incomplete = 0L;
         Instant earliest = null;
@@ -106,7 +113,7 @@ public final class LogEventsEvaluator {
             value.put("lastBreach", now.toString());
         }
         if (config.includeMatches()) {
-            value.set("matches", recentMatches(monitor.getId(), sums, from, now));
+            value.set("matches", recentMatches(monitor.getId(), sums, counted, now));
         }
         String valueJson = Json.write(value);
 
@@ -120,6 +127,17 @@ public final class LogEventsEvaluator {
                 : String.format(" (%s %d)", atMost ? "at most" : "at least", threshold);
         return EvaluationOutcome.breach(valueJson, String.format("%d matching log %s in the last %ds%s",
                 count, count == 1 ? "line" : "lines", windowSeconds, bound));
+    }
+
+    /**
+     * Where the counted rows start: the window's start, or the monitor's last
+     * save (its updated time, which a create sets too) when that is later.
+     * Assumes the nodes' clocks agree with the one that served the save to
+     * within a collector interval.
+     */
+    static Instant countedFrom(Monitor monitor, Instant from) {
+        Instant saved = monitor.getUpdatedTime();
+        return saved != null && saved.isAfter(from) ? saved : from;
     }
 
     /** The configured window, clamped to the current evaluator interval and sample retention. */
