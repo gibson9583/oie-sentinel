@@ -7,6 +7,7 @@ package org.openintegrationengine.plugins.sentinel.server.alert;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -135,6 +136,16 @@ public final class AlertPayload {
     }
 
     RollupSummary rollupSummary() { return rollupSummary; }
+
+    /** This payload with another value JSON, and the matches parsed from it; everything else is kept. */
+    AlertPayload withValueJson(String newValueJson) {
+        if (Objects.equals(newValueJson, valueJson)) {
+            return this;
+        }
+        return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
+                metadataId, severity, eventType, message, openedTime, newValueJson, runbookUrl, rollupSummary,
+                subject, kind);
+    }
 
     /** The dispatcher's one way to reword a payload; keeps the subject, drops the rollup summary. */
     AlertPayload copy(String eventType, String message) {

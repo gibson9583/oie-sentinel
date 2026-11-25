@@ -78,12 +78,35 @@ public final class MatchedLines {
      * @param monitor the alert's monitor now, or {@code null} when it was deleted
      */
     public static String visibleDetails(AlertEvent event, Monitor monitor) {
+        return visibleValue(ProblemSubject.of(event), event.getDetailsJson(), monitor);
+    }
+
+    /** {@link #visibleDetails} for a value JSON whose alert is about {@code subject}. */
+    private static String visibleValue(ProblemSubject subject, String valueJson, Monitor monitor) {
         MonitorType type = monitor != null ? monitor.getMonitorType() : null;
-        if (ProblemSubject.of(event).isServer() && !(type != null && type.kind() == MonitorKind.LOG
+        if (subject.isServer() && !(type != null && type.kind() == MonitorKind.LOG
                 && LogEventsConfig.includesMatches(monitor.getConfigJson()))) {
-            return strip(event.getDetailsJson());
+            return strip(valueJson);
         }
-        return event.getDetailsJson();
+        return valueJson;
+    }
+
+    /**
+     * The payload with its matched lines only if its monitor includes them
+     * now. A payload is built before it waits for a dispatch worker and a
+     * transport, so the transport thread calls this right before the send:
+     * turning the option off covers what is already queued.
+     *
+     * @throws RuntimeException when the monitor cannot be read; the caller
+     *         defers the send rather than guess
+     */
+    static AlertPayload disclosedNow(AlertPayload payload) {
+        if (payload == null || payload.subject() == null || !payload.subject().isServer()
+                || payload.getValueJson() == null || !payload.getValueJson().contains("\"" + KEY + "\"")) {
+            return payload;
+        }
+        Monitor monitor = MonitorRepository.getMonitor(payload.getMonitorId());
+        return payload.withValueJson(visibleValue(payload.subject(), payload.getValueJson(), monitor));
     }
 
     /** {@link #visibleDetails} for each Log alert of a page, reading each monitor once; channel alerts are untouched. */

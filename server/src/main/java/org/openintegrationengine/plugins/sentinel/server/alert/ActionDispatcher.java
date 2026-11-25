@@ -984,6 +984,14 @@ public final class ActionDispatcher {
                     throw new DispatchDeferredException("Cannot verify rollup recipient scope before delivery", uncertainty);
                 }
                 beforeTransport.run();
+                // Matched lines go out only while the monitor includes them at
+                // this last check; the option may have been turned off since.
+                try {
+                    currentPayload = MatchedLines.disclosedNow(currentPayload);
+                } catch (Exception uncertainty) {
+                    throw new DispatchDeferredException("Cannot verify matched-line disclosure before delivery",
+                            uncertainty);
+                }
                 if (Thread.currentThread().isInterrupted()) {
                     throw new DispatchDeferredException("Transport was cancelled before delivery");
                 }
