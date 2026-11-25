@@ -160,6 +160,10 @@ public class LogMatchFlushJob implements Job {
                 notifications.addAll(LogNotifications.forOccurrences(monitor, config, value, nodeId, now));
             }
         }
+        // The drain consumed the pipeline's completeness, so what a failed write
+        // puts back carries each row's own: the retried row is no more complete.
+        Map<Integer, LogMatchCounter.Drained> back = new HashMap<>();
+        drained.forEach((id, value) -> back.put(id, value.withComplete(complete && value.complete())));
         try {
             LogNotifications.insert(notifications);
         } catch (Exception e) {
@@ -168,7 +172,7 @@ public class LogMatchFlushJob implements Job {
                         notifications.size(), e);
                 return;
             }
-            counter.recredit(drained);
+            counter.recredit(back);
             log.error("Failed to write {} Log notification(s); they and this flush's counts are kept for the next "
                     + "flush", notifications.size(), e);
             return;
@@ -182,7 +186,7 @@ public class LogMatchFlushJob implements Job {
                 return;
             }
             Map<Integer, LogMatchCounter.Drained> counts = new HashMap<>();
-            drained.forEach((id, value) -> counts.put(id, value.countsOnly()));
+            back.forEach((id, value) -> counts.put(id, value.countsOnly()));
             counter.recredit(counts);
             log.error("Failed to write {} log match sample(s); their counts are kept for the next flush",
                     samples.size(), e);

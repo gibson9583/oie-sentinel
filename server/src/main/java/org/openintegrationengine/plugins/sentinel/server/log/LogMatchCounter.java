@@ -54,6 +54,11 @@ public final class LogMatchCounter {
         public Drained countsOnly() {
             return new Drained(count, samples, complete, List.of(), 0);
         }
+
+        /** @return this, marked complete only when {@code rowComplete} is true, for putting back a row's counts */
+        public Drained withComplete(boolean rowComplete) {
+            return new Drained(count, samples, rowComplete, occurrences, overflow);
+        }
     }
 
     /**

@@ -332,6 +332,62 @@ class LogMatchFlushJobTest {
     }
 
     @Test
+    void aCountRetriedAfterAFailedCountWriteStaysIncompleteWhenALineWasDropped() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{}");
+        start();
+        flush();
+        flush();
+        droppedOneOf101();
+
+        sql("RENAME TABLE sentinel_match_sample TO sentinel_match_sample_away");
+        try {
+            flush();
+        } finally {
+            sql("RENAME TABLE sentinel_match_sample_away TO sentinel_match_sample");
+        }
+        flush();
+        assertEquals(List.of(0L, 0L, 100L), counts(rows(monitor)), "101 lines, one dropped");
+        assertEquals(List.of(false, true, false), completes(rows(monitor)));
+    }
+
+    @Test
+    void aCountRetriedAfterAFailedNotificationWriteStaysIncompleteWhenALineWasDropped() {
+        Monitor monitor = database.logMonitor("each", EACH_NOTIFICATION);
+        start();
+        flush();
+        flush();
+        droppedOneOf101();
+
+        try (MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class, CALLS_REAL_METHODS)) {
+            alerts.when(() -> AlertEventRepository.insertAlertEvent(any()))
+                    .thenThrow(new IllegalStateException("database unavailable"));
+            flush();
+        }
+        flush();
+        assertEquals(List.of(0L, 0L, 100L), counts(rows(monitor)), "101 lines, one dropped");
+        assertEquals(List.of(false, true, false), completes(rows(monitor)));
+        assertEquals(100, notifications(monitor).size());
+    }
+
+    /**
+     * Offers 101 ERROR lines to a queue with room for 100, so one is dropped,
+     * and counts the 100 on this thread. The matcher runs again afterwards, so
+     * only the drop can make the next row incomplete.
+     */
+    private void droppedOneOf101() {
+        pipeline.matcher().stop(2_000);
+        pipeline.resize(100);
+        for (int i = 0; i < 101; i++) {
+            pipeline.queue().offer(LogQueueTest.event(Level.ERROR, "x", "line " + i));
+        }
+        for (LogQueue.Line line = pipeline.queue().poll(); line != null; line = pipeline.queue().poll()) {
+            pipeline.counter().record(line);
+        }
+        pipeline.matcher().start();
+        assertNull(pipeline.notCountingReason());
+    }
+
+    @Test
     void aQueueCapacitySavedOnAnotherNodeIsAppliedHereAtTheNextFlushAndKeepsWhatIsQueued() {
         database.logMonitor("errors", "{}");
         start();
