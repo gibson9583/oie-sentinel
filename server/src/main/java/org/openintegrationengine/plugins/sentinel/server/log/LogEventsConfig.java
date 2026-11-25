@@ -148,10 +148,14 @@ public record LogEventsConfig(Level minLevel, String loggerPrefix, Pattern patte
         }
     }
 
-    /** @return whether a stored config asks for matches, without compiling its pattern; false when unreadable */
+    /**
+     * @return whether a stored config asks for matches, read as validation
+     *         reads it but without compiling the pattern; false when the
+     *         config or the value is unreadable
+     */
     public static boolean includesMatches(String configJson) {
         try {
-            return configJson != null && Json.mapper().readTree(configJson).path("includeMatches").asBoolean(false);
+            return configJson != null && bool(Json.mapper().readTree(configJson), "includeMatches");
         } catch (Exception e) {
             return false;
         }

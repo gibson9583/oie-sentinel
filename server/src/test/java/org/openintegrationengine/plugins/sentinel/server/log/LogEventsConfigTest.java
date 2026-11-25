@@ -138,6 +138,23 @@ class LogEventsConfigTest {
         assertFalse(LogEventsConfig.includesMatches(null));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"true", "\"TRUE\"", "\" True \"", "false", "\"false\"", "\"yes\"", "1", "null"})
+    void includesMatchesReadsTheOptionTheWayValidationAcceptsIt(String value) {
+        String config = "{\"includeMatches\": " + value + "}";
+        boolean accepted;
+        boolean saved;
+        try {
+            saved = LogEventsConfig.parse(config).includeMatches();
+            accepted = true;
+        } catch (IllegalArgumentException rejected) {
+            saved = false;
+            accepted = false;
+        }
+        assertEquals(saved, LogEventsConfig.includesMatches(config),
+                value + (accepted ? " is accepted on save" : " is refused on save, so it reads as off"));
+    }
+
     @Test
     void theJsonNodeFormIsWhatMonitorServiceCanCall() throws Exception {
         LogEventsConfig config = LogEventsConfig.parse(Json.mapper().readTree("{\"threshold\": 4, \"pattern\": \"ORA-\\\\d{5}\"}"));
