@@ -191,6 +191,31 @@ class LogMonitorEvaluationTest {
     }
 
     @Test
+    void aFreshBreachExtendsAHeldTimeoutProblemBeforeTheOpeningThresholdIsCounted() throws Exception {
+        Monitor monitor = database.logMonitor("Log errors", "{\"clearMode\":\"TIMEOUT\",\"clearAfterSeconds\":180}");
+        monitor.setMinConsecutiveBreaches(2);
+        evaluate(monitor, NOW, breach(NOW));
+        evaluate(monitor, NOW.plusSeconds(60), breach(NOW.plusSeconds(60)));
+        long id = logState(monitor).getOpenAlertEventId();
+        evaluate(monitor, NOW.plusSeconds(120), ok());
+        evaluate(monitor, NOW.plusSeconds(180), ok());
+        assertEquals(TriggerStatus.OK, logState(monitor).getState(), "held open by its timeout");
+
+        // One breach, under the two it takes to open a problem: it is still the open problem's last breach.
+        evaluate(monitor, NOW.plusSeconds(240), breach(NOW.plusSeconds(240)));
+        evaluate(monitor, NOW.plusSeconds(300), ok());
+        evaluate(monitor, NOW.plusSeconds(419), ok());
+        assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(id).getStatus(),
+                "180 seconds after the breach at 60 but not after the breach at 240");
+        assertEquals(NOW.plusSeconds(240).toString(),
+                details(AlertEventRepository.getAlertEvent(id)).path("lastBreach").asText());
+        evaluate(monitor, NOW.plusSeconds(420), ok());
+        assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(id).getStatus());
+        assertEquals(1, events(monitor, AlertKind.PROBLEM).size());
+        assertEquals(1, resolved.size());
+    }
+
+    @Test
     void aTimeoutProblemAlsoClearsWithoutDataOnceTheTimeIsUp() {
         Monitor monitor = database.logMonitor("Log errors", "{\"clearMode\":\"TIMEOUT\",\"clearAfterSeconds\":600}");
         evaluate(monitor, NOW, breach(NOW));

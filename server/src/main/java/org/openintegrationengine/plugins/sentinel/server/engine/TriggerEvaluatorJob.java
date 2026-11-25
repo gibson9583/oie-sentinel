@@ -618,6 +618,11 @@ public class TriggerEvaluatorJob implements Job {
             state.setOpenAlertEventId(null);
             state.setLastChangeTime(now);
         }
+        // A Log problem held open by its clear mode (trigger OK or
+        // INSUFFICIENT_DATA) is still open, so this breach is its last breach
+        // whether or not enough breaches have been counted to adopt it again.
+        // Otherwise a timed problem clears counting from an older breach.
+        LogMonitorEvaluation.addTo(monitor, state, outcome);
         state.setConsecutiveBreachCount(state.getConsecutiveBreachCount() + 1);
 
         if (state.getConsecutiveBreachCount() < required) {
