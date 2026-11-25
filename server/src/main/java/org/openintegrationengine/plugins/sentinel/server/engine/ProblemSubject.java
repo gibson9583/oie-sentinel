@@ -97,14 +97,12 @@ public final class ProblemSubject implements Comparable<ProblemSubject> {
     }
 
     /**
-     * @param kind the owning monitor's kind, or {@code null} when unknown
      * @return a channel's current name ({@code "(unknown)"} when deleted); for
-     *         the server, the monitor kind's label, "Log" unless the monitor
-     *         is an Event monitor
+     *         the server, "Log"
      */
-    public String displayName(MonitorKind kind) {
+    public String displayName() {
         if (isServer()) {
-            return (kind == MonitorKind.EVENT ? MonitorKind.EVENT : MonitorKind.LOG).label();
+            return MonitorKind.LOG.label();
         }
         return ScopeResolver.channelName(channelId);
     }

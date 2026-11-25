@@ -18,14 +18,14 @@ import org.slf4j.LoggerFactory;
 import com.mirth.connect.server.util.SqlConfig;
 
 /**
- * Persistence for {@code sentinel_match_sample}, the counts table shared by
- * Log and Event monitors.
+ * Persistence for {@code sentinel_match_sample}, the counts table of Log
+ * monitors.
  *
- * <p>A row without a channel is a node's heartbeat for a monitor: written every
- * flush, zero counts included, so the evaluator can tell "no matches" from "no
- * data". A row with a channel counts matches tied to that channel. Each node
- * writes only its own rows, so the insert takes no leadership fence; the prune
- * is leader-only and fenced, like the activity-sample prune.</p>
+ * <p>Each row is a node's heartbeat for a monitor: written every flush, zero
+ * counts included, so the evaluator can tell "no matches" from "no data". Its
+ * {@code channel_id} is always {@code NULL}; the reads ask for such rows. Each
+ * node writes only its own rows, so the insert takes no leadership fence; the
+ * prune is leader-only and fenced, like the activity-sample prune.</p>
  */
 public final class MatchSampleRepository {
 
@@ -61,15 +61,6 @@ public final class MatchSampleRepository {
     }
 
     /**
-     * One channel's rows in a range, from every node.
-     *
-     * @param channelId  the channel
-     * @param matchCount the sum of their counts
-     */
-    public record ChannelSum(String channelId, long matchCount) {
-    }
-
-    /**
      * A monitor's heartbeat rows (no channel) in an inclusive range, without
      * their matched lines: what the evaluator needs to count a window to the
      * second and to see which nodes covered it.
@@ -98,30 +89,7 @@ public final class MatchSampleRepository {
     }
 
     /**
-     * Sums a monitor's rows that have a channel, per channel across all nodes,
-     * inclusive range.
-     *
-     * @return one entry per channel with a row in the range, by channel id;
-     *         never {@code null}
-     * @throws RepositoryException on persistence failure
-     */
-    public static List<ChannelSum> sumSamplesByChannel(int monitorId, Instant from, Instant to) {
-        try {
-            List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
-                    .selectList(stmt("sumMatchSamplesByChannel"), range(monitorId, from, to));
-            List<ChannelSum> sums = new ArrayList<>(rows.size());
-            for (Map<String, Object> row : rows) {
-                sums.add(new ChannelSum((String) row.get("channel_id"), toLong(row.get("match_sum"))));
-            }
-            return sums;
-        } catch (Exception e) {
-            log.error("Failed to sum match samples by channel for monitor {} from {} to {}", monitorId, from, to, e);
-            throw new RepositoryException(e);
-        }
-    }
-
-    /**
-     * One node's newest rows that keep samples, any channel, inclusive range.
+     * One node's newest rows that keep samples, inclusive range.
      *
      * @param limit the most rows to return
      * @return rows with a non-null {@code samplesJson}, newest first; never

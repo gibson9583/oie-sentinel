@@ -31,7 +31,6 @@ import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateReposito
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
-import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
 import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
@@ -79,17 +78,11 @@ class ProblemSubjectTest {
     }
 
     @Test
-    void displayNameIsLogForTheServerUnlessItIsAnEventMonitorAndTheChannelsNameOtherwise() {
+    void displayNameIsLogForTheServerAndTheChannelsNameOtherwise() {
         try (MockedStatic<ScopeResolver> scope = mockStatic(ScopeResolver.class)) {
             scope.when(() -> ScopeResolver.channelName("c-1")).thenReturn("ADT In");
-            assertEquals("Log", ProblemSubject.server().displayName(MonitorKind.LOG));
-            assertEquals("Log", ProblemSubject.server().displayName(null));
-            assertEquals("Log", ProblemSubject.server().displayName(MonitorKind.CHANNEL));
-            assertEquals("Event", ProblemSubject.server().displayName(MonitorKind.EVENT));
-            for (MonitorKind kind : MonitorKind.values()) {
-                assertEquals("ADT In", ProblemSubject.channel("c-1").displayName(kind), kind.name());
-            }
-            assertEquals("ADT In", ProblemSubject.channel("c-1").displayName(null));
+            assertEquals("Log", ProblemSubject.server().displayName());
+            assertEquals("ADT In", ProblemSubject.channel("c-1").displayName());
             scope.verify(() -> ScopeResolver.channelName(null), never());
         }
     }

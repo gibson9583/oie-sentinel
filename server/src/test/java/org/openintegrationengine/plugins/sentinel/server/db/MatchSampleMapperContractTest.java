@@ -56,7 +56,7 @@ class MatchSampleMapperContractTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"derby", "mysql", "oracle", "postgres", "sqlserver"})
-    void countRowsAreReadOneByOneAndChannelSumsGroupInTheDatabase(String vendor) throws Exception {
+    void countRowsAreReadOneByOneWithoutAChannel(String vendor) throws Exception {
         Configuration mapper = mapper(vendor);
         String where = "FROM sentinel_match_sample WHERE monitor_id = ? AND channel_id ";
         String range = " AND sample_time >= ? AND sample_time <= ? ";
@@ -72,14 +72,6 @@ class MatchSampleMapperContractTest {
         // Derby and Oracle hand a CLOB back as a Clob, not a String.
         assertEquals(vendor.equals("derby") || vendor.equals("oracle"),
                 nodeColumns.get(3).getTypeHandler() instanceof ClobStringTypeHandler, vendor + " second_counts type handler");
-
-        MappedStatement byChannel = mapper.getMappedStatement("Sentinel.sumMatchSamplesByChannel");
-        BoundSql channel = byChannel.getBoundSql(Map.of("monitorId", 7));
-        assertEquals("SELECT channel_id, SUM(match_count) AS match_sum "
-                + where + "IS NOT NULL" + range + "GROUP BY channel_id ORDER BY channel_id", normalized(channel), vendor);
-        assertEquals(List.of("monitorId", "from", "to"), properties(channel.getParameterMappings()), vendor);
-        assertEquals(List.of("channel_id", "match_sum"),
-                columns(byChannel.getResultMaps().get(0).getResultMappings()), vendor);
     }
 
     @ParameterizedTest

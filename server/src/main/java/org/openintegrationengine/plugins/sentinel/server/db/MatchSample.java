@@ -8,14 +8,14 @@ package org.openintegrationengine.plugins.sentinel.server.db;
 import java.time.Instant;
 
 /**
- * One row of {@code sentinel_match_sample}: what one node counted for a Log or
- * Event monitor since its previous flush. Server-side only.
+ * One row of {@code sentinel_match_sample}: what one node counted for a Log
+ * monitor since its previous flush. Server-side only.
  *
  * @param id          database id; {@code null} until read back
  * @param nodeId      the node that counted
  * @param monitorId   the monitor the count belongs to
- * @param channelId   the channel the matches belong to, or {@code null} for
- *                    counts not tied to a channel
+ * @param channelId   always {@code null}: a Log monitor's counts belong to no
+ *                    channel
  * @param sampleTime  when the node flushed
  * @param matchCount  matches since the node's previous flush, not a running
  *                    total

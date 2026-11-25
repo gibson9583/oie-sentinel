@@ -270,8 +270,7 @@ public final class ProblemService {
         detail.setMonitorType(monitor != null ? monitor.getMonitorType() : null);
         detail.setRunbookUrl(monitor != null ? monitor.getRunbookUrl() : null);
 
-        detail.setChannelName(subject.displayName(
-                monitor != null && monitor.getMonitorType() != null ? monitor.getMonitorType().kind() : null));
+        detail.setChannelName(subject.displayName());
         detail.setConnectorName(subject.isServer() ? null : resolveConnectorName(event));
         detail.setDispatches(ActionDispatchLogRepository.listActionDispatchLogsForEvent(id));
         return detail;

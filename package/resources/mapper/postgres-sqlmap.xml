@@ -855,12 +855,6 @@
             #{complete}, #{second_counts})
     </insert>
 
-    <!-- The sums alias their columns, so explicit maps keep the keys lower case on every dialect. -->
-    <resultMap id="matchChannelSumResult" type="map">
-        <result property="channel_id" column="channel_id" />
-        <result property="match_sum" column="match_sum" />
-    </resultMap>
-
     <resultMap id="matchCountResult" type="map">
         <result property="node_id" column="node_id" />
         <result property="sample_time" column="sample_time" javaType="java.sql.Timestamp" />
@@ -878,15 +872,6 @@
         WHERE monitor_id = #{monitorId} AND channel_id IS NULL
             AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
         ORDER BY node_id, sample_time, id
-    </select>
-
-    <select id="sumMatchSamplesByChannel" parameterType="map" resultMap="matchChannelSumResult">
-        SELECT channel_id, SUM(match_count) AS match_sum
-        FROM sentinel_match_sample
-        WHERE monitor_id = #{monitorId} AND channel_id IS NOT NULL
-            AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
-        GROUP BY channel_id
-        ORDER BY channel_id
     </select>
 
     <select id="listRecentMatchSamples" parameterType="map" resultMap="matchSampleResult">

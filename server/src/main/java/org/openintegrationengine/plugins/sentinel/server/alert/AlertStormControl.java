@@ -595,7 +595,7 @@ final class AlertStormControl {
             }
             ProblemSubject subject = ProblemSubject.of(event);
             if (openedInWindow && !event.isSuppressed() && subject.isIdentified()) {
-                affected.computeIfAbsent(subject, key -> key.displayName(null));
+                affected.computeIfAbsent(subject, key -> key.displayName());
             }
 
             scanned++;

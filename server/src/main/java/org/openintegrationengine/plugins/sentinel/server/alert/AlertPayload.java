@@ -17,7 +17,6 @@ import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
-import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
 
@@ -171,7 +170,7 @@ public final class AlertPayload {
 
     /**
      * Builds the payload for a real alert event, resolving the subject's
-     * display name via {@link ProblemSubject#displayName(MonitorKind)}: the
+     * display name via {@link ProblemSubject#displayName()}: the
      * channel's name from {@link ScopeResolver#channelName(String)} (which
      * falls back to {@code "(unknown)"} for deleted channels, so senders never
      * have to null-check the name), or "Log" for a Log alert. A Log alert
@@ -201,7 +200,7 @@ public final class AlertPayload {
                 monitor != null && monitor.getName() != null ? monitor.getName() : "(deleted monitor)",
                 type,
                 subject.channelId(),
-                subject.displayName(type != null ? type.kind() : null),
+                subject.displayName(),
                 event.getMetadataId(),
                 event.getSeverity(),
                 eventType,

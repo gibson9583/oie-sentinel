@@ -270,9 +270,6 @@ final class MapperStatementMatrix {
                         vendor + " per-second counts round-trip, the long value intact");
                 assertEquals(List.of(true, false, true), nodes.stream().map(row -> isTrue(row.get("complete"))).toList(),
                         vendor + " complete per row");
-                List<Map<String, Object>> channels = session.selectList("Sentinel.sumMatchSamplesByChannel", range);
-                assertEquals(List.of(SUBJECT_CHANNEL + "=6", OTHER_CHANNEL + "=1"), sums(channels, "channel_id", null),
-                        vendor + " channel sums across nodes");
 
                 Map<String, Object> recent = new HashMap<>(range);
                 recent.put("nodeId", "node-a");
@@ -302,14 +299,16 @@ final class MapperStatementMatrix {
                 assertEquals(2, session.delete("Sentinel.deleteMatchSamplesOlderThan", prune), vendor);
                 assertEquals(0, session.delete("Sentinel.deleteMatchSamplesOlderThan", prune), vendor);
                 range.put("from", Timestamp.from(base.toInstant().minusSeconds(60)));
-                List<String> remaining = sums(session.selectList("Sentinel.sumMatchSamplesByChannel", range),
-                        "channel_id", null);
-                remaining.addAll(counts(session.selectList("Sentinel.listMatchSampleCounts", range)).stream()
-                        .map(row -> row.substring(0, row.indexOf('@'))).toList());
-                assertEquals(List.of(SUBJECT_CHANNEL + "=4", OTHER_CHANNEL + "=1", "node-a=5000"), remaining,
+                List<String> remaining = counts(session.selectList("Sentinel.listMatchSampleCounts", range));
+                assertEquals(List.of("node-a=5000@" + Timestamp.from(base.toInstant().plusSeconds(2))), remaining,
                         vendor + " prune removed a sample at the cutoff");
+                try (Statement sql = connection.createStatement(); ResultSet left = sql.executeQuery(
+                        "SELECT COUNT(*) FROM sentinel_match_sample WHERE monitor_id = " + seed.monitorId())) {
+                    assertTrue(left.next());
+                    assertEquals(3, left.getInt(1), vendor + " rows at or after the cutoff are kept");
+                }
                 MatrixEvidenceSupport.observation(vendor, "match-samples", "nodes=" + counts(nodes)
-                        + " channels=" + channels + " samplesLength=" + large.length()
+                        + " samplesLength=" + large.length()
                         + " secondCountsLength=" + largeSeconds.length() + " remainingAfterPrune=" + remaining);
             } finally {
                 connection.rollback();
@@ -332,15 +331,6 @@ final class MapperStatementMatrix {
                     + row.get("sample_time"));
         }
         return counts;
-    }
-
-    private static List<String> sums(List<Map<String, Object>> rows, String key, String time) {
-        List<String> sums = new ArrayList<>();
-        for (Map<String, Object> row : rows) {
-            String at = time == null ? "" : "@" + row.get(time);
-            sums.add(row.get(key) + "=" + ((Number) row.get("match_sum")).longValue() + at);
-        }
-        return sums;
     }
 
     /** Default Connector/J returns DATETIME as LocalDateTime unless the mapper asks for Timestamp. */

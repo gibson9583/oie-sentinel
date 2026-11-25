@@ -42,7 +42,6 @@ class LogPersistenceTest {
     private static final Instant NOW = Instant.parse("2026-11-21T12:00:00.123Z");
     /** channel_id is CHAR(36), so a shorter id would come back padded. */
     private static final String CHANNEL_A = "00000000-0000-0000-0000-00000000000a";
-    private static final String CHANNEL_B = "00000000-0000-0000-0000-00000000000b";
 
     private LogMatchTestDatabase database;
     private Monitor monitor;
@@ -77,21 +76,6 @@ class LogPersistenceTest {
                         new MatchSample(null, "node-b", monitor.getId(), null, NOW.plusSeconds(30), 0, null, true, null)),
                 MatchSampleRepository.listCountRows(monitor.getId(), NOW, NOW.plusSeconds(30)),
                 "per-second counts round-trip; the matched lines are not read");
-    }
-
-    @Test
-    void channelRowsSumPerChannelAcrossNodes() {
-        int id = monitor.getId();
-        MatchSampleRepository.insertSamples(List.of(
-                sample("node-a", id, CHANNEL_B, NOW, 1, null, true),
-                sample("node-a", id, CHANNEL_A, NOW, 2, null, true),
-                sample("node-b", id, CHANNEL_A, NOW.plusSeconds(30), 3, null, true),
-                sample("node-b", id, CHANNEL_A, NOW.minusSeconds(60), 7, null, true),
-                sample("node-a", id, null, NOW, 4, null, true)));
-
-        assertEquals(List.of(new MatchSampleRepository.ChannelSum(CHANNEL_A, 5),
-                        new MatchSampleRepository.ChannelSum(CHANNEL_B, 1)),
-                MatchSampleRepository.sumSamplesByChannel(id, NOW, NOW.plusSeconds(30)));
     }
 
     @Test
