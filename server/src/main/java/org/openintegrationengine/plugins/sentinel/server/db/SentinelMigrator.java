@@ -214,6 +214,10 @@ public class SentinelMigrator extends Migrator {
         if (current < 14 && targetVersion >= 14) {
             applyV14();
         }
+        // Like v2, reconciled on every start, not only when v14 is applied.
+        if (targetVersion >= 14) {
+            backfillSubjectsAndKinds();
+        }
         if (current < 15 && targetVersion >= 15) {
             applyV15();
         }
@@ -468,12 +472,8 @@ public class SentinelMigrator extends Migrator {
             addColumnIfAbsent(table, "subject_type", varchar);
         }
         addColumnIfAbsent("sentinel_alert_event", "event_kind", varchar);
-        // After the backfill, SQL compares these columns directly; only Java
-        // still reads NULL as the default.
-        for (String table : SUBJECT_TABLES) {
-            backfillNulls(table, "subject_type", "CHANNEL");
-        }
-        backfillNulls("sentinel_alert_event", "event_kind", "PROBLEM");
+        // The existing rows get their subject and kind from
+        // backfillSubjectsAndKinds, which runs after this step on every start.
         makeSubjectChannelNullable();
         createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time");
     }
@@ -494,6 +494,21 @@ public class SentinelMigrator extends Migrator {
             default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
         };
         addColumnIfAbsent("sentinel_match_sample", "second_counts", text);
+    }
+
+    /**
+     * Gives every row without a subject or kind the channel and problem it
+     * had before v14. SQL compares these columns directly, so a NULL would
+     * hide a row from those reads; only Java reads NULL as the default. Run
+     * on every start: an older Sentinel started on this schema (a downgrade,
+     * which is not supported) writes such rows. NULL-only, so a row that is
+     * set is never rewritten.
+     */
+    private void backfillSubjectsAndKinds() throws MigrationException {
+        for (String table : SUBJECT_TABLES) {
+            backfillNulls(table, "subject_type", "CHANNEL");
+        }
+        backfillNulls("sentinel_alert_event", "event_kind", "PROBLEM");
     }
 
     /** NULL-only, so a retry never rewrites a row that was already set. */

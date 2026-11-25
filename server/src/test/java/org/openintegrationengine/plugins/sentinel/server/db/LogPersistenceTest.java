@@ -190,7 +190,7 @@ class LogPersistenceTest {
     }
 
     @Test
-    void rowsWithoutASubjectOrKindReadAsChannelProblems() throws Exception {
+    void unfilteredReadsShowRowsWithoutASubjectOrKindAsChannelProblems() throws Exception {
         try (Connection connection = database.connection(); Statement sql = connection.createStatement()) {
             // Only an unsupported downgrade writes these into a v14 schema.
             sql.executeUpdate("INSERT INTO sentinel_trigger_state (monitor_id, channel_id) VALUES ("
@@ -205,6 +205,36 @@ class LogPersistenceTest {
         assertEquals("legacy", event.getMessage());
         assertEquals(SubjectType.CHANNEL, event.getSubjectType());
         assertEquals(AlertKind.PROBLEM, event.getKind());
+    }
+
+    @Test
+    void aRestartFillsTheSubjectAndKindADowngradeLeftEmptySoFilteredReadsFindTheRows() throws Exception {
+        try (Connection connection = database.connection(); Statement sql = connection.createStatement()) {
+            // What Sentinel 1.2.2 writes if it is started on this schema, which is not supported.
+            sql.executeUpdate("INSERT INTO sentinel_trigger_state (monitor_id, channel_id) VALUES ("
+                    + monitor.getId() + ", '" + CHANNEL_A + "')");
+            sql.executeUpdate("INSERT INTO sentinel_alert_event (monitor_id, channel_id, severity, status, message, "
+                    + "opened_time) VALUES (" + monitor.getId() + ", '" + CHANNEL_A + "', 'HIGH', 'PROBLEM', "
+                    + "'downgrade', CURRENT_TIMESTAMP)");
+        }
+        assertNull(TriggerStateRepository.getTriggerState(monitor.getId(), SubjectType.CHANNEL, CHANNEL_A, null),
+                "a lookup by subject misses the row");
+
+        try (Connection connection = database.connection()) {
+            SentinelMigrator restart = new SentinelMigrator();
+            restart.setConnection(connection);
+            restart.setDatabaseType("derby");
+            restart.migrate();
+        }
+        assertNotNull(TriggerStateRepository.getTriggerState(monitor.getId(), SubjectType.CHANNEL, CHANNEL_A, null));
+        assertEquals(List.of("downgrade"), AlertEventRepository.listRecentAlertEvents(100, AlertKind.PROBLEM).stream()
+                .map(AlertEvent::getMessage).toList());
+        try (Connection connection = database.connection(); Statement sql = connection.createStatement();
+                ResultSet rows = sql.executeQuery("SELECT COUNT(*) FROM sentinel_alert_event "
+                        + "WHERE subject_type IS NULL OR event_kind IS NULL")) {
+            assertTrue(rows.next());
+            assertEquals(0, rows.getInt(1));
+        }
     }
 
     @Test
