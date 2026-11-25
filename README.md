@@ -103,14 +103,16 @@ still fire an "at least" monitor or clear an "at most" problem. It can't clear a
 or fire an "at most" monitor. If the engine database can't be written, the counts wait in memory and
 are written once it can.
 
-Each count row also keeps how many lines matched in each second, so a window starts at an exact
-second. A line logged before the window starts doesn't count, even when its row was written late. If
-writes fail for so long that one row's lines fall in more than 3,600 different seconds, that row
-keeps only its total. A window that starts inside that row's collector interval is then incomplete.
+Each count row also keeps how many lines matched in each second, so a window's edges are exact to
+the second: a line logged before the window starts doesn't count, even when its count row was
+written late. If the engine database can't be written for so long that one row's lines fall in
+more than 3,600 different seconds, that row keeps only its line count, and a window that starts
+within the period that row covers is incomplete.
 
 A window is also incomplete until count rows cover all of it, from its start to now, with no gap
-longer than two collector intervals. A missing row is treated as unknown. So a new, just saved or
-just enabled "at most" monitor can't fire until it has counted for a full window.
+longer than two collector intervals. An incomplete window works as described above. So a monitor
+that was just saved or enabled can't fire an "at most" condition until it has counted for a full
+window.
 
 The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
 any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log
@@ -121,8 +123,9 @@ A Log monitor watches no channel:
   included. They carry no channel id and add nothing to the Dashboard's channel badges.
 - Only users with Manage Monitoring and no channel restrictions can create, change, enable, disable,
   delete or import Log monitors. Users with channel restrictions don't see Log monitors, their
-  problems and notifications, or the log capture status on the Dashboard.
-  [Permissions](#permissions) says what this means for exports and actions.
+  problems and notifications, or the log capture status on the Dashboard. Their exports leave Log
+  monitors out, and they can't manage actions that can receive Log alerts (see
+  [Permissions](#permissions)).
 - Channel, channel group and channel tag action conditions never match them, whatever the operator.
   An action gets them through a **Monitor type** (Log lines) or **Monitor** condition, or by having
   no channel conditions. If such an action escalates, the action it escalates to gets the Log
@@ -133,11 +136,10 @@ A Log monitor watches no channel:
 
 A Log monitor does not count:
 - Lines logged before Sentinel starts, such as engine startup and migration errors.
-- Lines logged between saving or enabling a monitor and each node's next collector run, which is up
-  to one collector interval.
-- Lines matched before the monitor was last saved or enabled.
-- Lines logged on the threads Sentinel uses to deliver alerts, such as the engine's error when a
-  Channel action routes to a channel that isn't deployed.
+- Lines logged before the monitor's count starts. Each node starts it at its first collector run
+  after the monitor is saved or enabled, up to one collector interval later.
+- Lines logged on the threads Sentinel uses to deliver alerts, such as the error the engine logs
+  when a Channel action routes to a channel that isn't deployed.
 - Lines dropped because the queue was full.
 - Lines the engine's log configuration drops: below a logger's level, or removed by the engine's own
   filter for mirth.log.
@@ -429,13 +431,14 @@ global configuration reads. **Manage Monitoring** grants global configuration au
 **Manage Schedules** grants global schedule authoring. These management grants are broader than a
 channel-scoped monitoring view and should be assigned accordingly.
 
-Users with channel restrictions get no Log data through Manage Monitoring. They can't create,
-change, enable, disable, delete or import Log monitors, and their exports leave Log monitors out.
-They can't create, change (including turning it on or off), delete or import an action that can
-receive Log alerts. An action can receive Log alerts if its conditions let a Log monitor through (an
-action with no conditions does), or if an action that can receive them escalates to it. Restricted
-users can still manage actions with a channel, channel group or channel tag condition, because those
-never receive Log alerts.
+For users with channel restrictions, Manage Monitoring doesn't cover Log monitors or their alerts
+(a Log monitor's problems and notifications). They can't create, change, enable, disable, delete or
+import Log monitors, and their exports leave Log monitors out. They can't create, change (including
+enabling or disabling), delete or import an action that can receive Log alerts. An action can
+receive Log alerts if its conditions let a Log monitor through (an action with no conditions does),
+or if another action that can receive Log alerts escalates to it. Restricted users can still manage
+an action with a channel, channel group or channel tag condition, unless another action that can
+receive Log alerts escalates to it.
 
 Without an authorization plugin installed, the engine permits everything.
 
