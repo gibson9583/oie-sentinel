@@ -184,6 +184,19 @@ class ServerAlertActionAuthorizationTest {
     }
 
     @Test
+    void anImportReadsTheActionsAndMonitorsOnceForAllItsEntries() {
+        String entry = "{\"name\":\"Channel page %d\",\"conditionJson\":\"[{\\\"field\\\":\\\"CHANNEL\\\","
+                + "\\\"operator\\\":\\\"=\\\",\\\"value\\\":\\\"c-1\\\"}]\"}";
+        servlet(true).importConfiguration("{\"schemaVersion\":3,\"actions\":[" + String.format(entry, 1) + ","
+                + String.format(entry, 2) + "," + String.format(entry, 3) + "]}");
+        imports.verify(() -> ExportImportService.importDocument(any(), eq(42)));
+        actionRows.verify(() -> ActionRepository.listActions(null), times(1));
+        monitorRows.verify(() -> MonitorRepository.listMonitors(null, null, null, null), times(1));
+        actions.verify(ActionService::list, times(1));
+        monitorService.verify(MonitorService::list, times(1));
+    }
+
+    @Test
     void anExportForARestrictedManagerLeavesLogMonitorsOut() throws Exception {
         stored.add(action(4, "Log page", "[{\"field\":\"MONITOR\",\"operator\":\"IN\",\"value\":[\"5\"]}]", null));
 

@@ -45,6 +45,7 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.LogEventsEvalu
 import org.openintegrationengine.plugins.sentinel.server.log.LogMatchTestDatabase;
 import org.openintegrationengine.plugins.sentinel.server.service.ProblemService;
 import org.openintegrationengine.plugins.sentinel.server.service.SentinelAuditLog;
+import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
@@ -243,6 +244,18 @@ class LogMonitorEvaluationTest {
     }
 
     @Test
+    void oneEvaluatorTickReadsTheSettingsOnceForAllLogMonitors() {
+        Monitor errors = database.logMonitor("errors", "{}");
+        Monitor warnings = database.logMonitor("warnings", "{\"minLevel\": \"WARN\"}");
+        try (MockedStatic<SettingsService> settings = mockStatic(SettingsService.class, CALLS_REAL_METHODS)) {
+            new TriggerEvaluatorJob().execute(null);
+            settings.verify(SettingsService::get, times(1));
+        }
+        assertNotNull(logState(errors), "both monitors were evaluated");
+        assertNotNull(logState(warnings));
+    }
+
+    @Test
     void aTimeoutProblemAlsoClearsWithoutDataOnceTheTimeIsUp() {
         Monitor monitor = database.logMonitor("Log errors", "{\"clearMode\":\"TIMEOUT\",\"clearAfterSeconds\":600}");
         evaluate(monitor, NOW, breach(NOW));
@@ -356,9 +369,9 @@ class LogMonitorEvaluationTest {
         Monitor notifications = database.logMonitor("each", "{\"condition\":\"EACH\",\"outcome\":\"NOTIFICATION\"}");
         Monitor problems = database.logMonitor("each problem", "{\"condition\":\"EACH\"}");
         try (MockedStatic<LogEventsEvaluator> evaluator = mockStatic(LogEventsEvaluator.class)) {
-            evaluator.when(() -> LogEventsEvaluator.evaluate(any(), any())).thenReturn(breach(NOW));
+            evaluator.when(() -> LogEventsEvaluator.evaluate(any(), any(), any())).thenReturn(breach(NOW));
             TriggerEvaluatorJob.evaluateMonitor(notifications, NOW);
-            evaluator.verify(() -> LogEventsEvaluator.evaluate(any(), any()), never());
+            evaluator.verify(() -> LogEventsEvaluator.evaluate(any(), any(), any()), never());
             TriggerEvaluatorJob.evaluateMonitor(problems, NOW);
         }
         assertEquals(List.of(), TriggerStateRepository.listTriggerStatesByMonitor(notifications.getId()));
@@ -492,7 +505,7 @@ class LogMonitorEvaluationTest {
 
     private void evaluate(Monitor monitor, Instant at, EvaluationOutcome outcome) {
         try (MockedStatic<LogEventsEvaluator> evaluator = mockStatic(LogEventsEvaluator.class)) {
-            evaluator.when(() -> LogEventsEvaluator.evaluate(any(), any())).thenReturn(outcome);
+            evaluator.when(() -> LogEventsEvaluator.evaluate(any(), any(), any())).thenReturn(outcome);
             TriggerEvaluatorJob.evaluateMonitor(monitor, at);
         }
     }

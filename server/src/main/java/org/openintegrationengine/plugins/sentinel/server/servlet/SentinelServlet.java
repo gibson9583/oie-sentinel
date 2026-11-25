@@ -853,9 +853,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
                     requireUnrestrictedForLogMonitors();
                 }
             }
-            if (doesUserHaveChannelRestrictions()) {
+            if (doesUserHaveChannelRestrictions() && !document.path("actions").isEmpty()) {
+                // One read of the stored actions and monitors for every entry.
+                ServerAlertReach reach = ServerAlertReach.current();
+                ExportImportService.ImportedActionReader reader = new ExportImportService.ImportedActionReader();
                 for (JsonNode entry : document.path("actions")) {
-                    requireUnrestrictedForServerAlerts(importedActions(entry));
+                    requireUnrestrictedForServerAlerts(reach, importedActions(reader, entry));
                 }
             }
             if (!document.path("maintenanceWindows").isEmpty()
@@ -900,11 +903,18 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * {@link ServerAlertReach} for "can receive".
      */
     private void requireUnrestrictedForServerAlerts(Action... actions) {
+        if (doesUserHaveChannelRestrictions()) {
+            requireUnrestrictedForServerAlerts(ServerAlertReach.current(), actions);
+        }
+    }
+
+    /** As above, against one read of the stored actions and monitors; a {@code null} action is refused. */
+    private void requireUnrestrictedForServerAlerts(ServerAlertReach reach, Action... actions) {
         if (!doesUserHaveChannelRestrictions()) {
             return;
         }
         for (Action action : actions) {
-            if (action == null || ServerAlertReach.canReceive(action)) {
+            if (action == null || reach.receives(action)) {
                 throw apiError(Status.FORBIDDEN, "Only users without channel restrictions can create, change or "
                         + "delete an action that can receive Log alerts");
             }
@@ -916,15 +926,15 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * replace, as the import itself binds them; an entry that can't be read is
      * {@code null}, so the check fails closed.
      */
-    private static Action[] importedActions(JsonNode entry) {
-        Action incoming;
+    private static Action[] importedActions(ExportImportService.ImportedActionReader reader, JsonNode entry) {
+        ExportImportService.ImportedAction imported;
         try {
-            incoming = ExportImportService.readImportedAction(entry);
+            imported = reader.read(entry);
         } catch (Exception unreadable) {
             return new Action[] {null};
         }
-        return incoming.getId() == null ? new Action[] {incoming}
-                : new Action[] {incoming, ActionService.get(incoming.getId())};
+        return imported.replaced() == null ? new Action[] {imported.incoming()}
+                : new Action[] {imported.incoming(), imported.replaced()};
     }
 
     /** An import entry's type as the import itself reads it, or {@code null} when it can't be read. */

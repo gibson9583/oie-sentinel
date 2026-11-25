@@ -39,12 +39,14 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.InactivityEval
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.log.LogNotifications;
+import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
+import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
@@ -200,11 +202,14 @@ public class TriggerEvaluatorJob implements Job {
      */
     private static void runTick(Instant now, LeaseFence fence) {
         List<Monitor> monitors = MonitorRepository.listMonitors(null, null, Boolean.TRUE, null);
+        // Every Log monitor's window reads the same settings; read them once a tick.
+        SentinelSettings settings = monitors.stream().anyMatch(TriggerEvaluatorJob::isLog)
+                ? SettingsService.get() : null;
 
         for (Monitor monitor : orderByDependency(monitors)) {
             if (!SentinelLeadership.recheckFence(fence)) return;
             try {
-                evaluateMonitor(monitor, now, fence);
+                evaluateMonitor(monitor, now, fence, settings);
             } catch (Exception e) {
                 log.error("Evaluation failed for monitor {} ({})", monitor.getId(), monitor.getName(), e);
             }
@@ -338,15 +343,20 @@ public class TriggerEvaluatorJob implements Job {
      * grants {@link #applyOutcome} no authority to resolve an open alert.</p>
      */
     static void evaluateMonitor(Monitor monitor, Instant now) {
-        evaluateMonitor(monitor, now, SentinelLeadership.captureFence());
+        evaluateMonitor(monitor, now, SentinelLeadership.captureFence(), null);
     }
 
-    private static void evaluateMonitor(Monitor monitor, Instant now, LeaseFence fence) {
+    private static boolean isLog(Monitor monitor) {
+        return monitor.getMonitorType() != null && monitor.getMonitorType().kind() == MonitorKind.LOG;
+    }
+
+    /** @param settings the tick's settings for a Log monitor, or {@code null} to read them */
+    private static void evaluateMonitor(Monitor monitor, Instant now, LeaseFence fence, SentinelSettings settings) {
         // A Log monitor has one subject and no channel scope; the sweep then
         // closes only rows of the wrong kind.
         if (monitor.getMonitorType().kind() == MonitorKind.LOG) {
             if (!SentinelLeadership.holdsFence(fence)) return;
-            LogMonitorEvaluation.evaluate(monitor, now, fence);
+            LogMonitorEvaluation.evaluate(monitor, now, fence, settings != null ? settings : SettingsService.get());
             autoResolveDepartedTriggers(monitor, Set.of(), null, Map.of(), now, fence);
             return;
         }

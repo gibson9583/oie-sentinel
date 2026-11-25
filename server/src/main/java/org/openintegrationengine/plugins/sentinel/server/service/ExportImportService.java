@@ -717,25 +717,37 @@ public final class ExportImportService {
     }
 
     /**
-     * Reads one action entry the way the import binds it, for the servlet's
-     * check of actions that can receive Log alerts: MONITOR condition values
-     * become the id of this server's monitor of that name (a name with no
-     * monitor stays as written), and the id is that of the stored action the
-     * entry would replace by name, or {@code null}.
-     *
-     * @throws JsonProcessingException  when the entry is not an action definition
-     * @throws IllegalArgumentException when Jackson rejects the entry outright
+     * An import action entry as the import would write it, and the stored
+     * action it would replace by name, or {@code null}.
      */
-    public static Action readImportedAction(JsonNode node) throws JsonProcessingException {
-        Action incoming = Json.mapper().treeToValue(node, Action.class);
-        MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
-        incoming.setConditionJson(mapMonitorConditionValues(incoming.getConditionJson(), value -> {
-            Integer id = monitors.idOf(value);
-            return id != null ? String.valueOf(id) : null;
-        }));
-        Action existing = ActionIndex.of(ActionService.list()).byName(textOrNull(node, "name"));
-        incoming.setId(existing != null ? existing.getId() : null);
-        return incoming;
+    public record ImportedAction(Action incoming, Action replaced) {
+    }
+
+    /**
+     * Reads action entries the way the import binds them, for the servlet's
+     * check of actions that can receive Log alerts, against one read of this
+     * server's monitors and actions: MONITOR condition values become the id
+     * of the monitor of that name (a name with no monitor stays as written),
+     * and the incoming action takes the id of the one it would replace.
+     */
+    public static final class ImportedActionReader {
+        private final MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
+        private final ActionIndex actions = ActionIndex.of(ActionService.list());
+
+        /**
+         * @throws JsonProcessingException  when the entry is not an action definition
+         * @throws IllegalArgumentException when Jackson rejects the entry outright
+         */
+        public ImportedAction read(JsonNode node) throws JsonProcessingException {
+            Action incoming = Json.mapper().treeToValue(node, Action.class);
+            incoming.setConditionJson(mapMonitorConditionValues(incoming.getConditionJson(), value -> {
+                Integer id = monitors.idOf(value);
+                return id != null ? String.valueOf(id) : null;
+            }));
+            Action existing = actions.byName(textOrNull(node, "name"));
+            incoming.setId(existing != null ? existing.getId() : null);
+            return new ImportedAction(incoming, existing);
+        }
     }
 
     private static String monitorReferenceProblem(JsonNode node) {

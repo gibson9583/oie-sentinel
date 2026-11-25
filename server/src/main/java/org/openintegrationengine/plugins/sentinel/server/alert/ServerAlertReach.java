@@ -52,39 +52,47 @@ public final class ServerAlertReach {
     /** A monitor id no monitor has, standing for one created later. */
     private static final int UNUSED_MONITOR_ID = -1;
 
-    private ServerAlertReach() {
+    private final Map<Integer, Action> stored = new HashMap<>();
+    private final List<AlertPayload> alerts;
+
+    private ServerAlertReach(Collection<Action> actions, Collection<Monitor> monitors) {
+        for (Action action : actions) {
+            if (action != null && action.getId() != null) {
+                stored.put(action.getId(), action);
+            }
+        }
+        alerts = serverAlerts(monitors);
     }
 
-    /**
-     * {@link #canReceive(Action, Collection, Collection)} against every stored
-     * action and monitor.
-     */
-    public static boolean canReceive(Action action) {
-        return canReceive(action, ActionRepository.listActions(null),
+    /** One read of the stored actions and monitors, for checking several actions against them. */
+    public static ServerAlertReach current() {
+        return new ServerAlertReach(ActionRepository.listActions(null),
                 MonitorRepository.listMonitors(null, null, null, null));
     }
 
+    /** @return {@link #receives(Action)} against every stored action and monitor */
+    public static boolean canReceive(Action action) {
+        return current().receives(action);
+    }
+
+    /** @return {@link #receives(Action)} against these actions and monitors */
+    public static boolean canReceive(Action action, Collection<Action> actions, Collection<Monitor> monitors) {
+        return new ServerAlertReach(actions, monitors).receives(action);
+    }
+
     /**
-     * @param action   the action as stored or as it would be saved; with an
-     *                 id, it replaces the stored action of that id
-     * @param actions  the stored actions, for escalation links
-     * @param monitors the stored monitors
+     * @param action the action as stored or as it would be saved; with an id,
+     *               it replaces the stored action of that id
      * @return whether some server alert would reach the action
      */
-    public static boolean canReceive(Action action, Collection<Action> actions, Collection<Monitor> monitors) {
-        List<AlertPayload> alerts = serverAlerts(monitors);
+    public boolean receives(Action action) {
         if (letsThrough(action, alerts)) {
             return true;
         }
         if (action.getId() == null) {
             return false;
         }
-        Map<Integer, Action> byId = new HashMap<>();
-        for (Action stored : actions) {
-            if (stored != null && stored.getId() != null) {
-                byId.put(stored.getId(), stored);
-            }
-        }
+        Map<Integer, Action> byId = new HashMap<>(stored);
         byId.put(action.getId(), action);
         for (Action source : byId.values()) {
             if (!source.getId().equals(action.getId()) && escalatesTo(source, action.getId(), byId)

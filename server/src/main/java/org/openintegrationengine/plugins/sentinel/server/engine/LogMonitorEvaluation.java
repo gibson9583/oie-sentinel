@@ -23,6 +23,7 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
+import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
 
@@ -53,13 +54,13 @@ final class LogMonitorEvaluation {
     private LogMonitorEvaluation() {
     }
 
-    static void evaluate(Monitor monitor, Instant now, LeaseFence fence) {
+    static void evaluate(Monitor monitor, Instant now, LeaseFence fence, SentinelSettings settings) {
         LogEventsConfig config = LogEventsConfig.lenient(monitor.getId(), monitor.getConfigJson());
         if (config != null && config.notifiesEachOccurrence()) {
             resolveLeftoverProblem(monitor, now, fence);
             return;
         }
-        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, now);
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, now, settings);
         if (config != null && config.outcome() == LogEventsConfig.Outcome.NOTIFICATION) {
             AlertLifecycleTransaction.execute(fence, afterCommit -> {
                 AlertEvent fired = applyNotification(monitor, outcome, now, afterCommit);

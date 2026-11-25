@@ -78,14 +78,19 @@ public final class LogEventsEvaluator {
     private LogEventsEvaluator() {
     }
 
+    /** {@link #evaluate(Monitor, Instant, SentinelSettings)} with the stored settings. */
     public static EvaluationOutcome evaluate(Monitor monitor, Instant now) {
+        return evaluate(monitor, now, SettingsService.get());
+    }
+
+    /** @param settings the tick's settings, read once for every Log monitor */
+    public static EvaluationOutcome evaluate(Monitor monitor, Instant now, SentinelSettings settings) {
         LogEventsConfig config = LogEventsConfig.lenient(monitor.getId(), monitor.getConfigJson());
         if (config == null) {
             ObjectNode invalid = Json.mapper().createObjectNode();
             invalid.put("invalidConfig", true);
             return EvaluationOutcome.insufficientData(Json.write(invalid));
         }
-        SentinelSettings settings = SettingsService.get();
         long windowSeconds = windowSeconds(config, settings);
         int collectorSeconds = settings.getCollectorIntervalSeconds();
         long allowance = COVERAGE_INTERVALS * (long) collectorSeconds;
