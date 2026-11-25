@@ -43,7 +43,15 @@ function labelOf(item, channelNames) {
     return isLogAlert(item) ? LOG_LABEL : (channelNames[item.channelId] || item.channelId || '—');
 }
 
-/** The list: time, monitor, label, message and whether it was held back. */
+/** Enter or Space on a focused row opens it, as a click does. */
+function openOnKey(e, open) {
+    if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+    }
+}
+
+/** The list: time, monitor, label, message and whether it was held back. Rows open by click or keyboard. */
 function NotificationTable({ items, monitorNames, channelNames, onOpen }) {
     return (
         <table className="dt">
@@ -52,7 +60,8 @@ function NotificationTable({ items, monitorNames, channelNames, onOpen }) {
             </thead>
             <tbody>
                 {items.map((n) => (
-                    <tr key={n.id} style={{ cursor: 'pointer' }} title="Show details" onClick={() => onOpen(n)}>
+                    <tr key={n.id} className="sn-row-link" tabIndex={0} title="Show details"
+                        onClick={() => onOpen(n)} onKeyDown={(e) => openOnKey(e, () => onOpen(n))}>
                         <td title={fmtAgo(n.openedTime)}>{fmtTime(n.openedTime)}</td>
                         <td>{monitorNames[n.monitorId] || `#${n.monitorId}`}</td>
                         <td>{labelOf(n, channelNames)}</td>

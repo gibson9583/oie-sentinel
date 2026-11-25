@@ -68,6 +68,10 @@ const SENTINEL_CSS = `
 /* Empty state for lists. */
 .sn-view .sn-empty { color: var(--text-dim); padding: 18px 0; text-align: center; }
 
+/* A table row that opens a detail, by click or by Enter/Space once focused. */
+.sn-view .sn-row-link { cursor: pointer; }
+.sn-view .sn-row-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; box-shadow: inset 0 0 0 2px var(--accent); }
+
 /* Open-problem row tint (Problems / Recent problems tables). */
 .sn-view table.dt tbody tr.sn-problem,
 .sn-view table.dt tbody tr.sn-problem:hover {
