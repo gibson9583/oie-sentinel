@@ -30,10 +30,17 @@ import org.openintegrationengine.plugins.sentinel.server.util.Json;
  * lines are; otherwise it is left out and the window is incomplete. A row
  * without matches needs neither.</p>
  *
- * <p>The window is <b>covered</b> when its earliest row is no later than
- * {@link LogEventsEvaluator#COVERAGE_INTERVALS} collector intervals after its
- * start, and <b>complete</b> when it is covered, every row in it is complete,
- * and every row's lines could be placed.</p>
+ * <p>A low count is evidence only when every node that was counting watched
+ * the whole window. The nodes expected are those with a row in the window or
+ * in the {@link LogEventsEvaluator#COVERAGE_INTERVALS} collector intervals
+ * before it. Each must have a row at or before the window's start, within
+ * that allowance before it; no two consecutive rows in the window further
+ * apart than the allowance; and a newest row within the allowance of now.
+ * The window is then <b>covered</b>, and it is <b>complete</b> when it is
+ * covered, every row in it is complete, and every row's lines could be placed.
+ * A node that stops writing therefore leaves windows incomplete until it has
+ * been gone for a whole window, and a new monitor needs a full window of rows
+ * before a zero count means anything.</p>
  */
 final class LogWindowCount {
 
@@ -49,25 +56,30 @@ final class LogWindowCount {
 
     /**
      * @param rows             a monitor's count rows, ordered by node and then
-     *                         time, from before the window as far back as the
-     *                         caller reads
+     *                         time, read from the coverage allowance before
+     *                         the window's start (or the monitor's last save)
      * @param start            the window's first second
+     * @param now              the evaluation time, the window's end
      * @param collectorSeconds the collector interval now
      */
-    static LogWindowCount of(List<MatchSample> rows, Instant start, int collectorSeconds) {
+    static LogWindowCount of(List<MatchSample> rows, Instant start, Instant now, int collectorSeconds) {
+        long allowance = LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds;
         Map<String, Long> perNode = new TreeMap<>();
         long count = 0L;
         boolean rowsComplete = true;
-        Instant earliest = null;
+        boolean covered = !rows.isEmpty();
         MatchSample previous = null;
+        Coverage coverage = null;
         for (MatchSample row : rows) {
             MatchSample before = previous != null && previous.nodeId().equals(row.nodeId()) ? previous : null;
             previous = row;
+            if (before == null) {
+                covered &= coverage == null || coverage.covers(now, allowance);
+                coverage = new Coverage();
+            }
+            coverage.add(row.sampleTime(), start, allowance);
             if (row.sampleTime().isBefore(start)) {
                 continue; // every line in it is older than the window
-            }
-            if (earliest == null || row.sampleTime().isBefore(earliest)) {
-                earliest = row.sampleTime();
             }
             rowsComplete &= row.complete();
             Long inside = linesInside(row, before, start);
@@ -78,9 +90,29 @@ final class LogWindowCount {
             perNode.merge(row.nodeId(), inside, Long::sum);
             count += inside;
         }
-        boolean covered = earliest != null && !earliest.isAfter(
-                start.plusSeconds(LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds));
+        covered &= coverage == null || coverage.covers(now, allowance);
         return new LogWindowCount(count, perNode, covered && rowsComplete);
+    }
+
+    /** One node's rows, oldest first: did they watch the window from its start up to now? */
+    private static final class Coverage {
+        private boolean anchored;
+        private boolean gapless = true;
+        private Instant newest;
+
+        void add(Instant time, Instant start, long allowance) {
+            if (!time.isAfter(start) && !time.isBefore(start.minusSeconds(allowance))) {
+                anchored = true;
+            }
+            if (newest != null && time.isAfter(start) && time.isAfter(newest.plusSeconds(allowance))) {
+                gapless = false;
+            }
+            newest = time;
+        }
+
+        boolean covers(Instant now, long allowance) {
+            return anchored && gapless && !newest.isBefore(now.minusSeconds(allowance));
+        }
     }
 
     /** @return matched lines in the window, summed over every node */

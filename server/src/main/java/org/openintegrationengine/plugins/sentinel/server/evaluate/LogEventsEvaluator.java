@@ -36,20 +36,21 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * <p>The window starts at the start of the second {@code now - window} falls
  * in, and only lines whose own second is at or after it count, including
  * lines in a row written late (see {@link LogWindowCount}). It is
- * <b>complete</b> when {@link LogWindowCount} says so: covered, every row in
- * it complete (no dropped lines, no detached appender, no timed-out check, no
- * restart), and every row's lines placed. A count is positive evidence however
- * incomplete the rows: "at least N" breaches on it, and "at most N" is false
- * once the count exceeds N. Declaring "at least N" false (which clears a
- * problem) or "at most N" true needs a complete window; otherwise the verdict
- * is INSUFFICIENT_DATA, which neither opens nor clears. Each occurrence, as a
- * problem, is "at least 1".</p>
+ * <b>complete</b> when {@link LogWindowCount} says so: every node that was
+ * counting has rows from the window's start up to now with no long gap, every
+ * row in it is complete (no dropped lines, no detached appender, no timed-out
+ * check, no restart), and every row's lines are placed. A count is positive
+ * evidence however incomplete the rows: "at least N" breaches on it, and
+ * "at most N" is false once the count exceeds N. Declaring "at least N" false
+ * (which clears a problem) or "at most N" true needs a complete window;
+ * otherwise the verdict is INSUFFICIENT_DATA, which neither opens nor clears.
+ * Each occurrence, as a problem, is "at least 1".</p>
  *
  * <p>Rows written before the monitor was last saved are left out: saving
  * starts the count afresh, so lines the old definition matched never count
  * under the new one. Each node also drops its unwritten tally at the save.
- * The window's coverage is still measured from its start, so a window that
- * began well before the save is not complete.</p>
+ * A window is complete only once a node's rows cover it from its start, so
+ * after a save a window must pass before a low count is evidence.</p>
  *
  * <p>The window is clamped at run time to between the evaluator interval and
  * the sample retention, so settings changed after the monitor was saved
@@ -65,7 +66,10 @@ public final class LogEventsEvaluator {
 
     private static final Logger log = LoggerFactory.getLogger(LogEventsEvaluator.class);
 
-    /** How many collector intervals the earliest row may start after the window does. */
+    /**
+     * How many collector intervals a node's rows may be apart while it counts
+     * as watching: before the window's start, between two rows, and before now.
+     */
     static final int COVERAGE_INTERVALS = 2;
 
     private LogEventsEvaluator() {
@@ -86,7 +90,7 @@ public final class LogEventsEvaluator {
         Instant read = countedFrom(monitor, start.minusSeconds(COVERAGE_INTERVALS * (long) collectorSeconds));
 
         LogWindowCount window = LogWindowCount.of(
-                MatchSampleRepository.listCountRows(monitor.getId(), read, now), start, collectorSeconds);
+                MatchSampleRepository.listCountRows(monitor.getId(), read, now), start, now, collectorSeconds);
         long count = window.count();
         boolean complete = window.complete();
         ObjectNode perNode = Json.mapper().createObjectNode();

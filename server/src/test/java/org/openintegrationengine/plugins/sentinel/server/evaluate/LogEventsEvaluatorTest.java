@@ -154,20 +154,22 @@ class LogEventsEvaluatorTest {
     @Test
     void atLeastBelowTheThresholdIsOkOnlyWhenTheWindowIsCoveredAndComplete() throws Exception {
         Monitor covered = database.logMonitor("covered", "{\"threshold\": 5}");
-        rows(covered, row("node-a", START.plusSeconds(60), 1), row("node-a", NOW, 3));
+        rows(covered, every("node-a", START.minusSeconds(60), NOW.minusSeconds(60), 60));
+        rows(covered, row("node-a", START.plusSeconds(90), 1), row("node-a", NOW, 3));
         EvaluationOutcome ok = LogEventsEvaluator.evaluate(covered, NOW);
-        assertEquals(EvaluationOutcome.Result.OK, ok.getResult(), "the earliest row exactly two intervals in");
+        assertEquals(EvaluationOutcome.Result.OK, ok.getResult(), "a row at the start, then every two intervals");
         assertNull(ok.getMessage());
         assertEquals(4, value(ok).get("count").asLong());
         assertFalse(value(ok).has("lastBreach"));
 
         Monitor late = database.logMonitor("late", "{\"threshold\": 5}");
-        rows(late, row("node-a", START.plusSeconds(61), 0), row("node-a", NOW, 0));
+        rows(late, every("node-a", START.plusSeconds(1), NOW, 30));
         assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(late),
-                "the window's first 61 seconds were not watched, so 'nothing matched' cannot be asserted");
+                "no row at or before the start, so 'nothing matched' cannot be asserted");
 
         Monitor gap = database.logMonitor("gap", "{\"threshold\": 5}");
-        rows(gap, row("node-a", START.plusSeconds(10), 0), incomplete("node-a", NOW.minusSeconds(30), 1), row("node-a", NOW, 0));
+        rows(gap, every("node-a", START.minusSeconds(30), NOW, 30));
+        rows(gap, incomplete("node-a", NOW.minusSeconds(15), 1));
         assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(gap), "one incomplete row in a covered window");
     }
 
@@ -181,6 +183,7 @@ class LogEventsEvaluatorTest {
         assertFalse(value(ok).has("lastBreach"));
 
         Monitor quiet = database.logMonitor("quiet", config);
+        rows(quiet, every("node-a", START.minusSeconds(30), NOW.minusSeconds(30), 30));
         rows(quiet, row("node-a", START.plusSeconds(10), 1), row("node-a", NOW, 1));
         EvaluationOutcome breach = LogEventsEvaluator.evaluate(quiet, NOW);
         assertEquals(EvaluationOutcome.Result.BREACH, breach.getResult());
@@ -189,6 +192,7 @@ class LogEventsEvaluatorTest {
         assertEquals(NOW.toString(), value(breach).get("lastBreach").asText());
 
         Monitor gap = database.logMonitor("gap", config);
+        rows(gap, every("node-a", START.minusSeconds(30), NOW.minusSeconds(30), 30));
         rows(gap, row("node-a", START.plusSeconds(10), 1), incomplete("node-a", NOW, 1));
         assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(gap));
         Monitor unwatched = database.logMonitor("unwatched", config);
@@ -216,23 +220,27 @@ class LogEventsEvaluatorTest {
 
         rows(monitor, row("node-a", START.minusMillis(1), 7), row("node-a", NOW.plusMillis(1), 7));
         assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor));
-        rows(monitor, row("node-a", START, 0));
-        assertEquals(EvaluationOutcome.Result.OK, result(monitor));
+        // A row exactly at the start and one exactly at now cover the window.
+        rows(monitor, every("node-a", START, NOW, 30));
+        EvaluationOutcome ok = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(EvaluationOutcome.Result.OK, ok.getResult());
+        assertEquals(0, value(ok).get("count").asLong(), "the lines a millisecond before the start and after now");
     }
 
     @Test
     void theCoverageAllowanceFollowsTheCollectorIntervalSetting() {
         Monitor monitor = database.logMonitor("errors", "{\"windowSeconds\": 3600}");
-        rows(monitor, row("node-a", NOW.minusSeconds(3600).plusSeconds(1000), 0));
+        rows(monitor, every("node-a", NOW.minusSeconds(4600), NOW.minusSeconds(600), 1000));
         assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor));
         database.collectorIntervalSeconds(600);
-        assertEquals(EvaluationOutcome.Result.OK, result(monitor), "two 600-second intervals allow a first row 1000 seconds in");
+        assertEquals(EvaluationOutcome.Result.OK, result(monitor), "two 600-second intervals allow rows 1000 seconds apart");
     }
 
     @Test
-    void theEarliestRowOfAnyNodeCoversTheWindow() throws Exception {
+    void everyNodeThatCoversTheWindowIsListedEvenWithNoMatches() throws Exception {
         Monitor monitor = database.logMonitor("errors", "{}");
-        rows(monitor, row("node-a", START.plusSeconds(15), 0), row("node-b", NOW.minusSeconds(30), 0));
+        rows(monitor, every("node-a", START.minusSeconds(30), NOW, 30));
+        rows(monitor, every("node-b", START.minusSeconds(15), NOW.minusSeconds(15), 30));
         EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
         assertEquals(EvaluationOutcome.Result.OK, outcome.getResult());
         assertEquals(0, value(outcome).get("perNode").get("node-b").asLong(), "a node with rows and no matches is listed");
@@ -251,7 +259,7 @@ class LogEventsEvaluatorTest {
         Monitor longWindow = database.logMonitor("long", "{\"windowSeconds\": 172800}");
         rows(longWindow, row("node-a", NOW.minusSeconds(90_000), 5), row("node-a", NOW.minusSeconds(86_390), 0));
         EvaluationOutcome narrowed = LogEventsEvaluator.evaluate(longWindow, NOW);
-        assertEquals(EvaluationOutcome.Result.OK, narrowed.getResult(), "the row older than a day is outside the window");
+        assertEquals(0, value(narrowed).get("count").asLong(), "the row older than a day is outside the window");
         assertEquals(86_400, value(narrowed).get("windowSeconds").asInt());
     }
 
@@ -288,6 +296,72 @@ class LogEventsEvaluatorTest {
                 "matched lines older than the window are left out too");
     }
 
+    private static final String HEARTBEAT = "{\"condition\": \"AT_MOST\", \"threshold\": 0}";
+
+    /** Zero-count rows from one node every {@code step} seconds, from {@code first} up to {@code last}. */
+    private static MatchSample[] every(String node, Instant first, Instant last, int step) {
+        List<MatchSample> rows = new ArrayList<>();
+        for (Instant at = first; !at.isAfter(last); at = at.plusSeconds(step)) {
+            rows.add(row(node, at, 0));
+        }
+        return rows.toArray(new MatchSample[0]);
+    }
+
+    @Test
+    void aNewHeartbeatCannotFireUntilItHasCountedAFullWindow() {
+        Monitor monitor = database.logMonitor("heartbeat",
+                "{\"condition\": \"AT_MOST\", \"threshold\": 0, \"windowSeconds\": 60}");
+        // The first flush after the save, 71 milliseconds before this evaluation.
+        rows(monitor, row("node-a", NOW.minusMillis(71), 0));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor));
+    }
+
+    @Test
+    void oneOldZeroRowIsNoProofThatNothingMatched() {
+        Monitor monitor = database.logMonitor("heartbeat", HEARTBEAT);
+        // Later flushes are missing: no row at the window's start, and none near now.
+        rows(monitor, row("node-a", NOW.minusSeconds(298), 0));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor));
+    }
+
+    @Test
+    void aStalledNodeBesideAReportingOneLeavesTheWindowIncomplete() {
+        Monitor monitor = database.logMonitor("heartbeat", HEARTBEAT);
+        rows(monitor, every("node-a", START.minusSeconds(30), NOW, 30));
+        rows(monitor, every("node-b", START.minusSeconds(30), START.plusSeconds(30), 30));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor),
+                "node-b stopped writing 270 seconds ago");
+    }
+
+    @Test
+    void aNodeThatWroteJustBeforeTheWindowAndStoppedLeavesItIncomplete() {
+        Monitor monitor = database.logMonitor("heartbeat", HEARTBEAT);
+        rows(monitor, every("node-a", START.minusSeconds(30), NOW, 30));
+        rows(monitor, row("node-b", START.minusSeconds(50), 0));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor));
+    }
+
+    @Test
+    void aGapLongerThanTwoCollectorIntervalsInsideTheWindowLeavesItIncomplete() {
+        Monitor monitor = database.logMonitor("heartbeat", HEARTBEAT);
+        rows(monitor, every("node-a", START.minusSeconds(30), START.plusSeconds(90), 30));
+        rows(monitor, every("node-a", START.plusSeconds(151), NOW, 30));
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, result(monitor), "61 seconds between two rows");
+    }
+
+    @Test
+    void everyNodeCoveringTheStartTheMiddleAndTheEndIsEvidenceThatNothingMatched() throws Exception {
+        Monitor heartbeat = database.logMonitor("heartbeat", HEARTBEAT);
+        rows(heartbeat, every("node-a", START.minusSeconds(30), NOW, 30));
+        rows(heartbeat, every("node-b", START.minusSeconds(45), NOW.minusSeconds(15), 30));
+        assertEquals(EvaluationOutcome.Result.BREACH, result(heartbeat), "both nodes covered the whole window");
+
+        Monitor errors = database.logMonitor("errors", "{\"threshold\": 1}");
+        rows(errors, every("node-a", START.minusSeconds(60), NOW.minusSeconds(60), 60));
+        assertEquals(EvaluationOutcome.Result.OK, result(errors),
+                "rows exactly two intervals apart, the first exactly two before the start and the last two before now");
+    }
+
     @Test
     void matchesAreTheNewestTenAcrossNodesOldestFirst() throws Exception {
         Monitor monitor = database.logMonitor("errors", "{\"threshold\": 100, \"includeMatches\": true}");
@@ -305,7 +379,8 @@ class LogEventsEvaluatorTest {
                 row("node-c", t.plusSeconds(100), 0));
 
         EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
-        assertEquals(EvaluationOutcome.Result.OK, outcome.getResult());
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult(),
+                "14 is under 100, and no node has a row at the window's start");
         JsonNode value = value(outcome);
         assertEquals(14, value.get("count").asLong());
         List<String> times = new ArrayList<>();
@@ -372,7 +447,7 @@ class LogEventsEvaluatorTest {
         Monitor mine = database.logMonitor("mine", "{}");
         Monitor other = database.logMonitor("other", "{}");
         rows(other, row("node-a", NOW.minusSeconds(10), 50));
-        rows(mine, row("node-a", START.plusSeconds(5), 0));
+        rows(mine, every("node-a", START.minusSeconds(30), NOW, 30));
         assertEquals(EvaluationOutcome.Result.OK, result(mine), "another monitor's matches are not this monitor's");
         assertEquals(EvaluationOutcome.Result.BREACH, result(other));
     }

@@ -139,7 +139,12 @@ class LogMonitorEvaluationTest {
         assertEquals(AlertStatus.PROBLEM, AlertEventRepository.getAlertEvent(event.getId()).getStatus());
         assertEquals(2, repeated.size());
 
-        samples(monitor, sample("node-a", NOW.plusSeconds(410), 0, null), sample("node-a", NOW.plusSeconds(690), 0, null));
+        // node-a covers the next window from its start to its end; node-b stopped before it.
+        List<MatchSample> covering = new ArrayList<>();
+        for (int at = 370; at <= 700; at += 30) {
+            covering.add(sample("node-a", NOW.plusSeconds(at), 0, null));
+        }
+        samples(monitor, covering.toArray(new MatchSample[0]));
         TriggerEvaluatorJob.evaluateMonitor(monitor, NOW.plusSeconds(700));
         assertEquals(TriggerStatus.OK, logState(monitor).getState());
         assertNull(logState(monitor).getOpenAlertEventId());
