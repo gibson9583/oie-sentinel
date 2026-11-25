@@ -83,12 +83,15 @@ function Row({ label, children }) {
     );
 }
 
-/** One notification: details, matches and the actions it was sent to. */
-function NotificationBody({ event, detail, label }) {
+/**
+ * One notification: details, matches and the actions it was sent to. With a
+ * matchesNote, the matches are not shown and the note says why.
+ */
+function NotificationBody({ event, detail, label, matchesNote }) {
     const ev = event || {};
     const d = detail || {};
     const typeMeta = MONITOR_TYPE_META[d.monitorType];
-    const matches = matchDetailsOf(ev, d.monitorType);
+    const matches = matchesNote ? null : matchDetailsOf(ev, d.monitorType);
     const dispatches = Array.isArray(d.dispatches) ? d.dispatches : [];
     return (
         <>
@@ -115,7 +118,7 @@ function NotificationBody({ event, detail, label }) {
                 <div className="panel-header">Matches</div>
                 <div className="panel-body">
                     {matches ? <MatchesPanel details={matches} />
-                        : <div className="sn-hint">No match details were recorded.</div>}
+                        : <div className="sn-hint">{matchesNote || 'No match details were recorded.'}</div>}
                 </div>
             </div>
             <div className="panel">
@@ -146,7 +149,13 @@ function NotificationBody({ event, detail, label }) {
 
 function NotificationDetail({ item, label, onBack }) {
     const detail = useApi(() => getProblem(item.id), [item.id]);
-    const ev = (detail.data && detail.data.event) || item;
+    const loaded = detail.data && detail.data.event;
+    const ev = loaded || item;
+    // Matched lines come only from this detail read, which applies the access
+    // and include-matches rules now; the list row may predate a change to either.
+    const matchesNote = loaded ? null
+        : detail.error ? 'Matched lines are not shown because the notification could not be loaded.'
+            : 'Loading matched lines…';
     return (
         <div className="sn-notification-detail">
             <div className="flex items-center gap-2 mb-3">
@@ -162,7 +171,7 @@ function NotificationDetail({ item, label, onBack }) {
                     <button className="btn btn-sm" onClick={detail.reload}>Retry</button>
                 </div>
             ) : null}
-            <NotificationBody event={ev} detail={detail.data} label={label} />
+            <NotificationBody event={ev} detail={detail.data} label={label} matchesNote={matchesNote} />
         </div>
     );
 }
