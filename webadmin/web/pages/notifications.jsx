@@ -20,7 +20,11 @@ const PAGE_SIZE = 25;
 const NO_FILTERS = { monitorId: '', from: '', to: '' };
 const HELD_BACK = 'Held back from actions by a schedule, a Suppressed by monitor, or the monitor being disabled.';
 
-/** Epoch millis of a yyyy-mm-dd day's first or last millisecond in the browser's zone. */
+/**
+ * Epoch millis of a yyyy-mm-dd day's first or last millisecond in the browser's
+ * zone, which the filter says. The rows follow the host's display zone, which
+ * the host does not give plugins yet.
+ */
 function dayEdge(day, end) {
     if (!day) return undefined;
     const t = new Date(`${day}T${end ? '23:59:59.999' : '00:00:00'}`).getTime();
@@ -211,6 +215,7 @@ export function NotificationsPage() {
                     <input type="date" aria-label="From" value={filters.from} onChange={(e) => set('from', e.target.value)} />
                     <span className="sn-hint">To</span>
                     <input type="date" aria-label="To" value={filters.to} onChange={(e) => set('to', e.target.value)} />
+                    <span className="sn-hint">Dates in your browser's time zone</span>
                     <button type="button" className="btn btn-sm" onClick={() => { setFilters(NO_FILTERS); setPage(0); }}>
                         Clear
                     </button>
