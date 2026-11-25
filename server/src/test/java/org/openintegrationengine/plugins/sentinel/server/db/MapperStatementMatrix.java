@@ -18,6 +18,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -207,27 +208,34 @@ final class MapperStatementMatrix {
      * Match samples through the shipped statements, inserted under a BATCH
      * executor as MatchSampleRepository does. Fractional seconds must survive,
      * which is why MySQL and SQL Server store DATETIME(3)/DATETIME2(3). The
-     * 40,000-character samples value is past the 32,767-byte bind limit of a
-     * plain Oracle string, so the CLOB path is exercised.
+     * 40,000-character samples value and the longer per-second counts value
+     * are past the 32,767-byte bind limit of a plain Oracle string, so the
+     * CLOB path is exercised for both.
      */
     private static void verifyMatchSamples(DatabaseMatrixSupport.MatrixDatabase database,
             SqlSessionFactory sessions, Seed seed) throws Exception {
         String vendor = database.vendor();
         Timestamp base = Timestamp.from(Instant.parse("2026-08-30T12:00:00.123Z"));
         String large = "[\"" + "x".repeat(39_996) + "\"]";
+        StringBuilder manySeconds = new StringBuilder("{");
+        for (int second = 0; second < 5_000; second++) {
+            manySeconds.append(second == 0 ? "" : ",").append('"').append(1_788_000_000L + second).append("\":1");
+        }
+        String largeSeconds = manySeconds.append('}').toString();
+        String oneSecond = "{\"" + base.toInstant().getEpochSecond() + "\":3}";
         try (Connection connection = database.open()) {
             connection.setAutoCommit(false);
             SqlSession session = sessions.openSession(connection);
             SqlSession batch = sessions.openSession(ExecutorType.BATCH, connection);
             try {
                 Object[][] rows = {
-                        {"node-a", -1, null, 1L, null, false},
-                        {"node-a", 0, null, 3L, large, true},
-                        {"node-b", 1, null, 0L, null, true},
-                        {"node-a", 2, null, 5L, "[]", false},
-                        {"node-a", 1, SUBJECT_CHANNEL, 2L, "[\"a\"]", true},
-                        {"node-b", 2, SUBJECT_CHANNEL, 4L, null, true},
-                        {"node-b", 2, OTHER_CHANNEL, 1L, null, true}};
+                        {"node-a", -1, null, 1L, null, false, null},
+                        {"node-a", 0, null, 3L, large, true, oneSecond},
+                        {"node-b", 1, null, 0L, null, true, null},
+                        {"node-a", 2, null, 5_000L, "[]", false, largeSeconds},
+                        {"node-a", 1, SUBJECT_CHANNEL, 2L, "[\"a\"]", true, null},
+                        {"node-b", 2, SUBJECT_CHANNEL, 4L, null, true, null},
+                        {"node-b", 2, OTHER_CHANNEL, 1L, null, true, null}};
                 for (Object[] row : rows) {
                     Map<String, Object> sample = new HashMap<>();
                     sample.put("node_id", row[0]);
@@ -237,6 +245,7 @@ final class MapperStatementMatrix {
                     sample.put("match_count", row[3]);
                     sample.put("samples_json", row[4]);
                     sample.put("complete", row[5]);
+                    sample.put("second_counts", row[6]);
                     batch.insert("Sentinel.insertMatchSample", sample);
                 }
                 batch.flushStatements();
@@ -245,12 +254,16 @@ final class MapperStatementMatrix {
                 range.put("monitorId", seed.monitorId());
                 range.put("from", base);
                 range.put("to", Timestamp.from(base.toInstant().plusSeconds(2)));
-                List<Map<String, Object>> nodes = session.selectList("Sentinel.sumMatchSamplesByNode", range);
-                assertEquals(List.of("node-a=8@" + base, "node-b=0@" + Timestamp.from(base.toInstant().plusSeconds(1))),
-                        sums(nodes, "node_id", "first_time"), vendor + " heartbeat sums, inclusive range");
-                assertTrue(nodes.get(0).get("first_time") instanceof Timestamp, vendor + " first_time type");
-                assertEquals(List.of(1L, 0L), nodes.stream().map(row -> ((Number) row.get("incomplete_count")).longValue())
-                        .toList(), vendor + " incomplete rows per node, inside the range only");
+                List<Map<String, Object>> nodes = session.selectList("Sentinel.listMatchSampleCounts", range);
+                assertEquals(List.of("node-a=3@" + base, "node-a=5000@" + Timestamp.from(base.toInstant().plusSeconds(2)),
+                        "node-b=0@" + Timestamp.from(base.toInstant().plusSeconds(1))), counts(nodes),
+                        vendor + " heartbeat rows by node then time, inclusive range");
+                assertTrue(nodes.get(0).get("sample_time") instanceof Timestamp, vendor + " sample_time type");
+                assertEquals(Arrays.asList(oneSecond, largeSeconds, null),
+                        nodes.stream().map(row -> row.get("second_counts")).toList(),
+                        vendor + " per-second counts round-trip, the long value intact");
+                assertEquals(List.of(true, false, true), nodes.stream().map(row -> isTrue(row.get("complete"))).toList(),
+                        vendor + " complete per row");
                 List<Map<String, Object>> channels = session.selectList("Sentinel.sumMatchSamplesByChannel", range);
                 assertEquals(List.of(SUBJECT_CHANNEL + "=6", OTHER_CHANNEL + "=1"), sums(channels, "channel_id", null),
                         vendor + " channel sums across nodes");
@@ -285,11 +298,13 @@ final class MapperStatementMatrix {
                 range.put("from", Timestamp.from(base.toInstant().minusSeconds(60)));
                 List<String> remaining = sums(session.selectList("Sentinel.sumMatchSamplesByChannel", range),
                         "channel_id", null);
-                remaining.addAll(sums(session.selectList("Sentinel.sumMatchSamplesByNode", range), "node_id", null));
-                assertEquals(List.of(SUBJECT_CHANNEL + "=4", OTHER_CHANNEL + "=1", "node-a=5"), remaining,
+                remaining.addAll(counts(session.selectList("Sentinel.listMatchSampleCounts", range)).stream()
+                        .map(row -> row.substring(0, row.indexOf('@'))).toList());
+                assertEquals(List.of(SUBJECT_CHANNEL + "=4", OTHER_CHANNEL + "=1", "node-a=5000"), remaining,
                         vendor + " prune removed a sample at the cutoff");
-                MatrixEvidenceSupport.observation(vendor, "match-samples", "nodes=" + nodes + " channels=" + channels
-                        + " samplesLength=" + large.length() + " remainingAfterPrune=" + remaining);
+                MatrixEvidenceSupport.observation(vendor, "match-samples", "nodes=" + counts(nodes)
+                        + " channels=" + channels + " samplesLength=" + large.length()
+                        + " secondCountsLength=" + largeSeconds.length() + " remainingAfterPrune=" + remaining);
             } finally {
                 connection.rollback();
                 batch.close();
@@ -301,6 +316,16 @@ final class MapperStatementMatrix {
     /** A boolean column can come back as a Boolean or as a number, depending on the vendor's driver. */
     private static boolean isTrue(Object value) {
         return value instanceof Boolean flag ? flag : value instanceof Number number && number.intValue() != 0;
+    }
+
+    /** Count rows as {@code node=count@time}, in the order read. */
+    private static List<String> counts(List<Map<String, Object>> rows) {
+        List<String> counts = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            counts.add(row.get("node_id") + "=" + ((Number) row.get("match_count")).longValue() + "@"
+                    + row.get("sample_time"));
+        }
+        return counts;
     }
 
     private static List<String> sums(List<Map<String, Object>> rows, String key, String time) {

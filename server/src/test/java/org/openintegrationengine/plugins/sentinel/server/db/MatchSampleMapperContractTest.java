@@ -29,7 +29,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * The schema v14 statements (match samples, subjects and alert kinds) in every
+ * The schema v14 and v15 statements (match samples, subjects and alert kinds) in every
  * shipped mapper, without a database. Derby also runs them in
  * DatabaseVendorMatrixTest; the other four run only in the opt-in db-matrix,
  * so this is what catches a typo in those four in an ordinary build.
@@ -49,27 +49,29 @@ class MatchSampleMapperContractTest {
         List<ParameterMapping> bindings = mapper(vendor).getMappedStatement("Sentinel.insertMatchSample")
                 .getBoundSql(row).getParameterMappings();
         assertEquals(List.of("node_id", "monitor_id", "channel_id", "sample_time", "match_count", "samples_json",
-                "complete"), properties(bindings), vendor);
+                "complete", "second_counts"), properties(bindings), vendor);
         // Independent of the engine's jdbcTypeForNull setting.
         assertEquals(JdbcType.VARCHAR, bindings.get(2).getJdbcType(), vendor);
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"derby", "mysql", "oracle", "postgres", "sqlserver"})
-    void theSumsGroupInTheDatabaseAndTheNodeSumCountsIncompleteRows(String vendor) throws Exception {
+    void countRowsAreReadOneByOneAndChannelSumsGroupInTheDatabase(String vendor) throws Exception {
         Configuration mapper = mapper(vendor);
         String where = "FROM sentinel_match_sample WHERE monitor_id = ? AND channel_id ";
         String range = " AND sample_time >= ? AND sample_time <= ? ";
-        String complete = vendor.equals("oracle") || vendor.equals("sqlserver") ? "1" : "TRUE";
-        MappedStatement byNode = mapper.getMappedStatement("Sentinel.sumMatchSamplesByNode");
-        BoundSql node = byNode.getBoundSql(Map.of("monitorId", 7));
-        assertEquals("SELECT node_id, SUM(match_count) AS match_sum, MIN(sample_time) AS first_time, "
-                + "SUM(CASE WHEN complete = " + complete + " THEN 0 ELSE 1 END) AS incomplete_count "
-                + where + "IS NULL" + range + "GROUP BY node_id ORDER BY node_id", normalized(node), vendor);
+        MappedStatement counts = mapper.getMappedStatement("Sentinel.listMatchSampleCounts");
+        BoundSql node = counts.getBoundSql(Map.of("monitorId", 7));
+        assertEquals("SELECT node_id, sample_time, match_count, second_counts, complete "
+                + where + "IS NULL" + range + "ORDER BY node_id, sample_time, id", normalized(node), vendor);
         assertEquals(List.of("monitorId", "from", "to"), properties(node.getParameterMappings()), vendor);
-        List<ResultMapping> nodeColumns = byNode.getResultMaps().get(0).getResultMappings();
-        assertEquals(List.of("node_id", "match_sum", "first_time", "incomplete_count"), columns(nodeColumns), vendor);
-        assertEquals(Timestamp.class, nodeColumns.get(2).getJavaType(), vendor + " first_time must map to Timestamp");
+        List<ResultMapping> nodeColumns = counts.getResultMaps().get(0).getResultMappings();
+        assertEquals(List.of("node_id", "sample_time", "match_count", "second_counts", "complete"),
+                columns(nodeColumns), vendor);
+        assertEquals(Timestamp.class, nodeColumns.get(1).getJavaType(), vendor + " sample_time must map to Timestamp");
+        // Derby and Oracle hand a CLOB back as a Clob, not a String.
+        assertEquals(vendor.equals("derby") || vendor.equals("oracle"),
+                nodeColumns.get(3).getTypeHandler() instanceof ClobStringTypeHandler, vendor + " second_counts type handler");
 
         MappedStatement byChannel = mapper.getMappedStatement("Sentinel.sumMatchSamplesByChannel");
         BoundSql channel = byChannel.getBoundSql(Map.of("monitorId", 7));

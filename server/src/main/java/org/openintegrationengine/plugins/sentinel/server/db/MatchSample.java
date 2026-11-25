@@ -24,7 +24,18 @@ import java.time.Instant;
  * @param complete    whether every line in the interval was checked; false
  *                    after dropped lines, a detached appender, a timed-out
  *                    pattern check or a restart
+ * @param secondCounts the matches per second of the lines' own time, as a
+ *                    JSON object of epoch second to count, for example
+ *                    {@code {"1764072000":3}}; only seconds with matches.
+ *                    {@code null} when the count is zero, and for rows
+ *                    written before schema v15
  */
 public record MatchSample(Long id, String nodeId, int monitorId, String channelId, Instant sampleTime,
-        long matchCount, String samplesJson, boolean complete) {
+        long matchCount, String samplesJson, boolean complete, String secondCounts) {
+
+    /** A row without per-second counts. */
+    public MatchSample(Long id, String nodeId, int monitorId, String channelId, Instant sampleTime,
+            long matchCount, String samplesJson, boolean complete) {
+        this(id, nodeId, monitorId, channelId, sampleTime, matchCount, samplesJson, complete, null);
+    }
 }

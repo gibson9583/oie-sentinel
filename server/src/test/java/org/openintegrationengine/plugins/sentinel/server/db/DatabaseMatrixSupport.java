@@ -430,6 +430,8 @@ final class DatabaseMatrixSupport {
         assertTrue(indexExists(connection, "sentinel_match_sample", "idx_sentinel_match_time"),
                 vendor + " missing match sample prune index");
         assertTrue(columnExists(connection, "sentinel_match_sample", "complete"), vendor + " missing match sample complete");
+        assertTrue(columnExists(connection, "sentinel_match_sample", "second_counts"),
+                vendor + " missing match sample per-second counts");
     }
 
     /**
@@ -626,9 +628,12 @@ final class DatabaseMatrixSupport {
                     + "VALUES ('matrix-channel', 'matrix-node', 0, CURRENT_TIMESTAMP)");
         }
         if (schemaVersion >= 14) {
-            execute(connection, "INSERT INTO sentinel_match_sample (node_id, monitor_id, sample_time, match_count) "
-                    + "SELECT 'matrix-node', id, CURRENT_TIMESTAMP, 3 FROM sentinel_monitor "
-                    + "WHERE name = 'matrix-uninstall-marker'");
+            // From v15 the application writes each row's per-second counts.
+            String secondsColumn = schemaVersion >= 15 ? ", second_counts" : "";
+            String secondsValue = schemaVersion >= 15 ? ", '{\"1788000000\":3}'" : "";
+            execute(connection, "INSERT INTO sentinel_match_sample (node_id, monitor_id, sample_time, match_count"
+                    + secondsColumn + ") SELECT 'matrix-node', id, CURRENT_TIMESTAMP, 3" + secondsValue
+                    + " FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
         }
     }
 

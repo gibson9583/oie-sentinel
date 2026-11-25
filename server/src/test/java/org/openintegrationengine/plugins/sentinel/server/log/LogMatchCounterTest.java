@@ -7,6 +7,7 @@ package org.openintegrationengine.plugins.sentinel.server.log;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Instant;
@@ -62,6 +63,25 @@ class LogMatchCounterTest {
         counter.refresh(List.of(resaved));
         counter.record(line(3L, Level.ERROR, "matched after the save"));
         assertEquals(1, counter.drain().get(1).count(), "a save with the same config starts afresh too");
+    }
+
+    @Test
+    void aDrainCountsEachSecondOfTheLinesOwnTimeAndARecreditMergesThem() {
+        counter.refresh(List.of(monitor(1, "{}")));
+        counter.record(line(1_500L, Level.ERROR, "first second"));
+        counter.record(line(1_999L, Level.ERROR, "first second again"));
+        counter.record(line(3_000L, Level.ERROR, "third second"));
+        LogMatchCounter.Drained drained = counter.drain().get(1);
+        assertEquals(Map.of(1L, 2L, 3L, 1L), drained.seconds());
+        assertEquals(List.of(1L, 3L), List.copyOf(drained.seconds().keySet()), "in second order");
+
+        counter.record(line(3_200L, Level.ERROR, "after the failed write"));
+        counter.recredit(Map.of(1, drained));
+        LogMatchCounter.Drained retried = counter.drain().get(1);
+        assertEquals(4, retried.count());
+        assertEquals(Map.of(1L, 2L, 3L, 2L), retried.seconds());
+        assertEquals("{\"1\":2,\"3\":2}", LogMatchFlushJob.secondCountsJson(retried.seconds()));
+        assertNull(LogMatchFlushJob.secondCountsJson(counter.drain().get(1).seconds()), "nothing matched");
     }
 
     @Test

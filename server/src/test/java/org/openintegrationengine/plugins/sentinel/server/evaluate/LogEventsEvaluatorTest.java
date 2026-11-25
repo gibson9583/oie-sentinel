@@ -20,6 +20,7 @@ import static org.mockito.Mockito.times;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.TreeMap;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -61,21 +62,43 @@ class LogEventsEvaluatorTest {
         List<MatchSample> samples = new ArrayList<>();
         for (MatchSample row : rows) {
             samples.add(new MatchSample(null, row.nodeId(), monitor.getId(), null, row.sampleTime(), row.matchCount(),
-                    row.samplesJson(), row.complete()));
+                    row.samplesJson(), row.complete(), row.secondCounts()));
         }
         MatchSampleRepository.insertSamples(samples);
     }
 
+    /** A row whose lines were all logged in the second it was written. */
     private static MatchSample row(String node, Instant time, long count) {
-        return new MatchSample(null, node, 0, null, time, count, null, true);
+        return new MatchSample(null, node, 0, null, time, count, null, true, seconds(time, count));
     }
 
     private static MatchSample incomplete(String node, Instant time, long count) {
-        return new MatchSample(null, node, 0, null, time, count, null, false);
+        return new MatchSample(null, node, 0, null, time, count, null, false, seconds(time, count));
     }
 
     private static MatchSample row(String node, Instant time, long count, String matches) {
-        return new MatchSample(null, node, 0, null, time, count, matches, true);
+        return new MatchSample(null, node, 0, null, time, count, matches, true, seconds(time, count));
+    }
+
+    /** A row as written before schema v15, without per-second counts. */
+    private static MatchSample legacy(String node, Instant time, long count) {
+        return new MatchSample(null, node, 0, null, time, count, null, true, null);
+    }
+
+    /** A row written at {@code time} whose lines were logged at the given seconds. */
+    private static MatchSample late(String node, Instant time, Instant... lines) {
+        TreeMap<Long, Long> seconds = new TreeMap<>();
+        for (Instant line : lines) {
+            seconds.merge(line.getEpochSecond(), 1L, Long::sum);
+        }
+        StringBuilder json = new StringBuilder("{");
+        seconds.forEach((second, count) -> json.append(json.length() > 1 ? "," : "")
+                .append('"').append(second).append("\":").append(count));
+        return new MatchSample(null, node, 0, null, time, lines.length, null, true, json.append('}').toString());
+    }
+
+    private static String seconds(Instant time, long count) {
+        return count > 0 ? "{\"" + time.getEpochSecond() + "\":" + count + "}" : null;
     }
 
     private static EvaluationOutcome.Result result(Monitor monitor) {
@@ -230,6 +253,39 @@ class LogEventsEvaluatorTest {
         EvaluationOutcome narrowed = LogEventsEvaluator.evaluate(longWindow, NOW);
         assertEquals(EvaluationOutcome.Result.OK, narrowed.getResult(), "the row older than a day is outside the window");
         assertEquals(86_400, value(narrowed).get("windowSeconds").asInt());
+    }
+
+    @Test
+    void aRowWithoutPerSecondCountsCountsOnlyWhenItsWholeIntervalIsInsideTheWindow() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"threshold\": 5}");
+        // Rows as written before schema v15. The second row's interval starts before the window.
+        rows(monitor, legacy("node-a", START.minusSeconds(20), 0), legacy("node-a", START.plusSeconds(10), 3),
+                legacy("node-a", START.plusSeconds(40), 2), legacy("node-a", NOW.minusSeconds(10), 0));
+
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(2, value(outcome).get("count").asLong(), "the straddling row's 3 lines cannot be placed");
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult(),
+                "a row left out makes the window incomplete");
+    }
+
+    @Test
+    void aLateRowCountsOnlyTheLinesWhoseSecondIsInsideTheWindow() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"threshold\": 3, \"includeMatches\": true}");
+        MatchSample late = late("node-a", NOW.minusSeconds(5), START.minusSeconds(100), START.minusSeconds(1), START,
+                NOW.minusSeconds(10));
+        rows(monitor, row("node-a", START.minusSeconds(30), 0), new MatchSample(null, "node-a", 0, null,
+                late.sampleTime(), late.matchCount(), matches("node-a", START.minusSeconds(100), START.minusSeconds(1),
+                        START, NOW.minusSeconds(10)), true, late.secondCounts()));
+
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
+        JsonNode value = value(outcome);
+        assertEquals(2, value.get("count").asLong(), "the window's first second counts, the one before it does not");
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, outcome.getResult(), "2 is under 3 and the window "
+                + "has no row near its start");
+        List<String> times = new ArrayList<>();
+        value.get("matches").forEach(line -> times.add(line.get("time").asText()));
+        assertEquals(List.of(START.toString(), NOW.minusSeconds(10).toString()), times,
+                "matched lines older than the window are left out too");
     }
 
     @Test

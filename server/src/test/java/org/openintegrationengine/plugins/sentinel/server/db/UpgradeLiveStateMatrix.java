@@ -70,6 +70,9 @@ final class UpgradeLiveStateMatrix {
     private static final String PENDING_RESOLUTION = "matrix-live-pending-resolution";
     private static final List<String> STORM_ALERTS = List.of(
             "matrix-live-storm-1", "matrix-live-storm-2", "matrix-live-storm-3", "matrix-live-storm-held");
+    /** A Log count row from v14: written before per-second counts existed, so v15 leaves them NULL. */
+    private static final Instant COUNTED = Instant.parse("2026-11-20T13:00:00Z");
+    private static final String SECONDS = "{\"" + COUNTED.minusSeconds(5).getEpochSecond() + "\":2}";
 
     private UpgradeLiveStateMatrix() {
     }
@@ -102,6 +105,21 @@ final class UpgradeLiveStateMatrix {
             for (String alert : STORM_ALERTS) {
                 insertAlert(connection, schemaVersion, monitorId, alert, "PROBLEM", false,
                         alert.endsWith("held"), false);
+            }
+        }
+        if (schemaVersion >= 14) {
+            boolean v15 = schemaVersion >= 15;
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "INSERT INTO sentinel_match_sample (node_id, monitor_id, sample_time, match_count, complete"
+                            + (v15 ? ", second_counts" : "") + ") VALUES ('matrix-live-node', ?, ?, 2, ?"
+                            + (v15 ? ", ?" : "") + ")")) {
+                statement.setLong(1, monitorId);
+                statement.setTimestamp(2, Timestamp.from(COUNTED));
+                statement.setBoolean(3, true);
+                if (v15) {
+                    statement.setString(4, SECONDS);
+                }
+                assertEquals(1, statement.executeUpdate());
             }
         }
         for (Row row : rows(schemaVersion)) {
@@ -191,6 +209,20 @@ final class UpgradeLiveStateMatrix {
             assertEquals(4, row.getInt(3), vendor + " max repeats");
         }
         observed.add(stored);
+        if (schemaVersion >= 14) {
+            try (Statement sql = connection.createStatement(); ResultSet row = sql.executeQuery(
+                    "SELECT s.sample_time, s.match_count, s.second_counts FROM sentinel_match_sample s "
+                            + "JOIN sentinel_monitor m ON s.monitor_id = m.id WHERE m.name = 'matrix-live-monitor'")) {
+                assertTrue(row.next(), vendor + " v" + schemaVersion + " lost the Log count row");
+                assertEquals(COUNTED, row.getTimestamp(1).toInstant(), vendor + " count row time");
+                assertEquals(2, row.getLong(2), vendor + " count");
+                String seconds = row.getString(3);
+                assertEquals(schemaVersion >= 15 ? SECONDS : null, seconds,
+                        vendor + " v" + schemaVersion + " per-second counts after the upgrade");
+                assertFalse(row.next(), vendor + " one count row");
+                observed.add("countRow second_counts=" + seconds);
+            }
+        }
         MatrixEvidenceSupport.observation(vendor, "live-state-from-" + schemaVersion, observed);
     }
 
@@ -267,6 +299,14 @@ final class UpgradeLiveStateMatrix {
                 assertEquals(1, window.stream().filter(row -> row.contains(ROLLUP)).count(), label + " one rollup");
             } else {
                 assertNull(repeat.getEscalateAfterSeconds(), label);
+            }
+            if (schemaVersion >= 14) {
+                int monitor = AlertEventRepository.getAlertEvent(ids.get(ESCALATING)).getMonitorId();
+                List<MatchSample> counted = MatchSampleRepository.listCountRows(monitor,
+                        COUNTED.minusSeconds(1), COUNTED.plusSeconds(1));
+                assertEquals(List.of(new MatchSample(null, "matrix-live-node", monitor, null, COUNTED, 2, null,
+                        true, schemaVersion >= 15 ? SECONDS : null)), counted,
+                        label + " the count row through the repository");
             }
         } finally {
             if (sessions.isManagedSessionStarted()) sessions.close();

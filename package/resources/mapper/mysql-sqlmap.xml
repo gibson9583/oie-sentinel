@@ -986,34 +986,34 @@
          insertActivitySample. -->
     <insert id="insertMatchSample" parameterType="map">
         INSERT INTO sentinel_match_sample (node_id, monitor_id, channel_id, sample_time, match_count, samples_json,
-            complete)
+            complete, second_counts)
         VALUES (#{node_id}, #{monitor_id}, #{channel_id,jdbcType=VARCHAR}, #{sample_time}, #{match_count}, #{samples_json},
-            #{complete})
+            #{complete}, #{second_counts})
     </insert>
 
     <!-- The sums alias their columns, so explicit maps keep the keys lower case on every dialect. -->
-    <resultMap id="matchNodeSumResult" type="map">
-        <result property="node_id" column="node_id" />
-        <result property="match_sum" column="match_sum" />
-        <result property="first_time" column="first_time" javaType="java.sql.Timestamp" />
-        <result property="incomplete_count" column="incomplete_count" />
-    </resultMap>
-
     <resultMap id="matchChannelSumResult" type="map">
         <result property="channel_id" column="channel_id" />
         <result property="match_sum" column="match_sum" />
     </resultMap>
 
-    <!-- Rows without a channel are each node's heartbeat, written every flush, so first_time
-         shows how much of the window a node covered. -->
-    <select id="sumMatchSamplesByNode" parameterType="map" resultMap="matchNodeSumResult">
-        SELECT node_id, SUM(match_count) AS match_sum, MIN(sample_time) AS first_time,
-            SUM(CASE WHEN complete = TRUE THEN 0 ELSE 1 END) AS incomplete_count
+    <resultMap id="matchCountResult" type="map">
+        <result property="node_id" column="node_id" />
+        <result property="sample_time" column="sample_time" javaType="java.sql.Timestamp" />
+        <result property="match_count" column="match_count" />
+        <result property="second_counts" column="second_counts" />
+        <result property="complete" column="complete" />
+    </resultMap>
+
+    <!-- Rows without a channel are each node's heartbeat, written every flush. The evaluator reads
+         them one by one, oldest first per node, to count a window to the second and to see whether
+         each node covered it; the matched lines are not read. -->
+    <select id="listMatchSampleCounts" parameterType="map" resultMap="matchCountResult">
+        SELECT node_id, sample_time, match_count, second_counts, complete
         FROM sentinel_match_sample
         WHERE monitor_id = #{monitorId} AND channel_id IS NULL
             AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
-        GROUP BY node_id
-        ORDER BY node_id
+        ORDER BY node_id, sample_time, id
     </select>
 
     <select id="sumMatchSamplesByChannel" parameterType="map" resultMap="matchChannelSumResult">

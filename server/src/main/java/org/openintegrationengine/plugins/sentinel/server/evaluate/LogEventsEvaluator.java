@@ -6,9 +6,11 @@
 package org.openintegrationengine.plugins.sentinel.server.evaluate;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,10 +33,12 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * node's rows in {@code sentinel_match_sample}. BREACH means the condition is
  * true. A row's count covers the interval since that node's previous row.
  *
- * <p>The window is <b>covered</b> when its earliest row is no later than two
- * collector intervals after its start, and <b>complete</b> when it is covered
- * and every row in it is complete (no dropped lines, no detached appender, no
- * timed-out check, no restart). A count is positive evidence however
+ * <p>The window starts at the start of the second {@code now - window} falls
+ * in, and only lines whose own second is at or after it count, including
+ * lines in a row written late (see {@link LogWindowCount}). It is
+ * <b>complete</b> when {@link LogWindowCount} says so: covered, every row in
+ * it complete (no dropped lines, no detached appender, no timed-out check, no
+ * restart), and every row's lines placed. A count is positive evidence however
  * incomplete the rows: "at least N" breaches on it, and "at most N" is false
  * once the count exceeds N. Declaring "at least N" false (which clears a
  * problem) or "at most N" true needs a complete window; otherwise the verdict
@@ -76,25 +80,17 @@ public final class LogEventsEvaluator {
         }
         SentinelSettings settings = SettingsService.get();
         long windowSeconds = windowSeconds(config, settings);
-        Instant from = now.minusSeconds(windowSeconds);
-        Instant counted = countedFrom(monitor, from);
+        Instant start = now.minusSeconds(windowSeconds).truncatedTo(ChronoUnit.SECONDS);
+        int collectorSeconds = settings.getCollectorIntervalSeconds();
+        // Rows from before the window too: a row's interval starts at its node's previous row.
+        Instant read = countedFrom(monitor, start.minusSeconds(COVERAGE_INTERVALS * (long) collectorSeconds));
 
-        List<MatchSampleRepository.NodeSum> sums = MatchSampleRepository.sumSamplesByNode(monitor.getId(), counted, now);
-        long count = 0L;
-        long incomplete = 0L;
-        Instant earliest = null;
+        LogWindowCount window = LogWindowCount.of(
+                MatchSampleRepository.listCountRows(monitor.getId(), read, now), start, collectorSeconds);
+        long count = window.count();
+        boolean complete = window.complete();
         ObjectNode perNode = Json.mapper().createObjectNode();
-        for (MatchSampleRepository.NodeSum sum : sums) {
-            count += sum.matchCount();
-            incomplete += sum.incompleteRows();
-            perNode.put(sum.nodeId(), sum.matchCount());
-            if (sum.firstSampleTime() != null && (earliest == null || sum.firstSampleTime().isBefore(earliest))) {
-                earliest = sum.firstSampleTime();
-            }
-        }
-        boolean covered = earliest != null
-                && !earliest.isAfter(from.plusSeconds(COVERAGE_INTERVALS * (long) settings.getCollectorIntervalSeconds()));
-        boolean complete = covered && incomplete == 0;
+        window.perNode().forEach(perNode::put);
 
         LogEventsConfig.Condition condition = config.condition();
         int threshold = condition == LogEventsConfig.Condition.EACH ? 1 : config.threshold();
@@ -113,7 +109,8 @@ public final class LogEventsEvaluator {
             value.put("lastBreach", now.toString());
         }
         if (config.includeMatches()) {
-            value.set("matches", recentMatches(monitor.getId(), sums, counted, now));
+            value.set("matches", recentMatches(monitor.getId(), window.perNode(), start, countedFrom(monitor, start),
+                    now));
         }
         String valueJson = Json.write(value);
 
@@ -149,21 +146,26 @@ public final class LogEventsEvaluator {
     /**
      * The newest lines in the window across all nodes, oldest first. Each
      * node's newest rows with lines hold its newest lines, so reading that
-     * many rows per node with matches is enough.
+     * many rows per node with matches is enough. A line older than the
+     * window's start, from a row that straddles it, is left out.
      */
-    private static ArrayNode recentMatches(int monitorId, List<MatchSampleRepository.NodeSum> sums, Instant from,
+    private static ArrayNode recentMatches(int monitorId, Map<String, Long> perNode, Instant start, Instant from,
             Instant now) {
         List<JsonNode> lines = new ArrayList<>();
-        for (MatchSampleRepository.NodeSum sum : sums) {
-            if (sum.matchCount() <= 0) {
+        for (Map.Entry<String, Long> node : perNode.entrySet()) {
+            if (node.getValue() <= 0) {
                 continue;
             }
             for (MatchSample sample : MatchSampleRepository.listRecentSamples(
-                    monitorId, sum.nodeId(), from, now, LogMatchCounter.MAX_SAMPLES)) {
+                    monitorId, node.getKey(), from, now, LogMatchCounter.MAX_SAMPLES)) {
                 try {
                     JsonNode stored = Json.mapper().readTree(sample.samplesJson());
                     if (stored != null && stored.isArray()) {
-                        stored.forEach(lines::add);
+                        for (JsonNode line : stored) {
+                            if (!lineTime(line).isBefore(start)) {
+                                lines.add(line);
+                            }
+                        }
                     }
                 } catch (Exception e) {
                     log.debug("Skipping unreadable matched lines in match sample {}", sample.id(), e);

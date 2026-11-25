@@ -127,7 +127,7 @@ public class SentinelMigrator extends Migrator {
     public static final String PLUGIN_NAME = "OIE Sentinel";
 
     /** Bump when adding a new {@code applyVN} step. */
-    public static final int LATEST_VERSION = 14;
+    public static final int LATEST_VERSION = 15;
 
     /**
      * CONFIGURATION property key holding the applied schema version. Public
@@ -214,6 +214,9 @@ public class SentinelMigrator extends Migrator {
         if (current < 14 && targetVersion >= 14) {
             applyV14();
         }
+        if (current < 15 && targetVersion >= 15) {
+            applyV15();
+        }
         writeSchemaVersion(targetVersion);
         log.info("Sentinel schema at version {}", targetVersion);
     }
@@ -231,7 +234,7 @@ public class SentinelMigrator extends Migrator {
      *         8 = per-node connector state complete, 9 = resolution outbox complete,
      *         10 = problem outbox and legacy backfill complete, 11 = deployed-channel inventory present,
      *         12 = connector observation deployment identity present, 13 = dispatch-time index present,
-     *         14 = match counts, subjects and alert kinds complete)
+     *         14 = match counts, subjects and alert kinds complete, 15 = per-second match counts present)
      */
     private int detectAndAlignSchemaVersion() throws MigrationException {
         int detected = detectFromState();
@@ -314,8 +317,10 @@ public class SentinelMigrator extends Migrator {
                         if (!indexExists("sentinel_action_dispatch_log", "idx_sentinel_dispatch_time", "dispatch_time")) {
                             return 12;
                         }
-                        return indexExists("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time")
-                                ? 14 : 13;
+                        if (!indexExists("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time")) {
+                            return 13;
+                        }
+                        return columnExists("sentinel_match_sample", "second_counts") ? 15 : 14;
                     }
                     return 8;
                 }
@@ -471,6 +476,24 @@ public class SentinelMigrator extends Migrator {
         backfillNulls("sentinel_alert_event", "event_kind", "PROBLEM");
         makeSubjectChannelNullable();
         createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time");
+    }
+
+    /**
+     * Per-second match counts on each count row, so the evaluator can judge a
+     * window to the second, also after a delayed write. One column added in a
+     * single statement, so it cannot be partial; rows written before it read
+     * as NULL and are judged by their whole interval.
+     */
+    private void applyV15() throws MigrationException {
+        log.info("Applying Sentinel schema v15 (per-second match counts)");
+        String text = switch (getDatabaseType().toLowerCase(Locale.ROOT)) {
+            case "derby", "oracle" -> "CLOB";
+            case "mysql" -> "LONGTEXT";
+            case "postgres" -> "TEXT";
+            case "sqlserver" -> "NVARCHAR(MAX)";
+            default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
+        };
+        addColumnIfAbsent("sentinel_match_sample", "second_counts", text);
     }
 
     /** NULL-only, so a retry never rewrites a row that was already set. */

@@ -1,0 +1,148 @@
+/*
+ * OIE Sentinel — channel monitoring & alerting plugin.
+ *
+ * Published under the terms of the Mozilla Public License 2.0.
+ */
+package org.openintegrationengine.plugins.sentinel.server.evaluate;
+
+import java.time.Instant;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
+import org.openintegrationengine.plugins.sentinel.server.db.MatchSample;
+import org.openintegrationengine.plugins.sentinel.server.util.Json;
+
+/**
+ * What a Log monitor's count rows say about one window: how many matched
+ * lines fall inside it, per node, and whether that count is complete.
+ *
+ * <p>A row counts what its node matched since that node's previous row, and
+ * every line in it is older than the row. Rows written since schema v15 carry
+ * their count per second of the lines' own time, so only lines whose second
+ * is at or after the window's first second are counted, however late the row
+ * was written. A row from before v15 has no per-second counts: it is counted
+ * only when the node's previous row is inside the window too, so all of its
+ * lines are; otherwise it is left out and the window is incomplete. A row
+ * without matches needs neither.</p>
+ *
+ * <p>The window is <b>covered</b> when its earliest row is no later than
+ * {@link LogEventsEvaluator#COVERAGE_INTERVALS} collector intervals after its
+ * start, and <b>complete</b> when it is covered, every row in it is complete,
+ * and every row's lines could be placed.</p>
+ */
+final class LogWindowCount {
+
+    private final long count;
+    private final Map<String, Long> perNode;
+    private final boolean complete;
+
+    private LogWindowCount(long count, Map<String, Long> perNode, boolean complete) {
+        this.count = count;
+        this.perNode = Collections.unmodifiableMap(perNode);
+        this.complete = complete;
+    }
+
+    /**
+     * @param rows             a monitor's count rows, ordered by node and then
+     *                         time, from before the window as far back as the
+     *                         caller reads
+     * @param start            the window's first second
+     * @param collectorSeconds the collector interval now
+     */
+    static LogWindowCount of(List<MatchSample> rows, Instant start, int collectorSeconds) {
+        Map<String, Long> perNode = new TreeMap<>();
+        long count = 0L;
+        boolean rowsComplete = true;
+        Instant earliest = null;
+        MatchSample previous = null;
+        for (MatchSample row : rows) {
+            MatchSample before = previous != null && previous.nodeId().equals(row.nodeId()) ? previous : null;
+            previous = row;
+            if (row.sampleTime().isBefore(start)) {
+                continue; // every line in it is older than the window
+            }
+            if (earliest == null || row.sampleTime().isBefore(earliest)) {
+                earliest = row.sampleTime();
+            }
+            rowsComplete &= row.complete();
+            Long inside = linesInside(row, before, start);
+            if (inside == null) {
+                rowsComplete = false;
+                inside = 0L;
+            }
+            perNode.merge(row.nodeId(), inside, Long::sum);
+            count += inside;
+        }
+        boolean covered = earliest != null && !earliest.isAfter(
+                start.plusSeconds(LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds));
+        return new LogWindowCount(count, perNode, covered && rowsComplete);
+    }
+
+    /** @return matched lines in the window, summed over every node */
+    long count() {
+        return count;
+    }
+
+    /** @return lines in the window by node id, for every node with a row in the window */
+    Map<String, Long> perNode() {
+        return perNode;
+    }
+
+    /** @return whether the count can be trusted as complete, so a zero or low count is evidence */
+    boolean complete() {
+        return complete;
+    }
+
+    /**
+     * @param before the same node's previous row, or {@code null} when it was
+     *               not read
+     * @return the row's lines whose second is in the window, or {@code null}
+     *         when they cannot be told apart from older lines
+     */
+    private static Long linesInside(MatchSample row, MatchSample before, Instant start) {
+        if (row.matchCount() <= 0) {
+            return 0L;
+        }
+        Map<Long, Long> seconds = seconds(row);
+        if (seconds != null) {
+            long inside = 0L;
+            for (Map.Entry<Long, Long> second : seconds.entrySet()) {
+                if (second.getKey() >= start.getEpochSecond()) {
+                    inside += second.getValue();
+                }
+            }
+            return inside;
+        }
+        // No usable per-second counts: the whole interval, if it is inside.
+        return before != null && !before.sampleTime().isBefore(start) ? row.matchCount() : null;
+    }
+
+    /** @return the row's per-second counts, or {@code null} when absent, unreadable or not adding up to its count */
+    private static Map<Long, Long> seconds(MatchSample row) {
+        if (row.secondCounts() == null || row.secondCounts().isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode stored = Json.mapper().readTree(row.secondCounts());
+            if (stored == null || !stored.isObject()) {
+                return null;
+            }
+            Map<Long, Long> seconds = new TreeMap<>();
+            long total = 0L;
+            for (Iterator<Map.Entry<String, JsonNode>> fields = stored.fields(); fields.hasNext(); ) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                long matches = field.getValue().asLong();
+                seconds.put(Long.parseLong(field.getKey()), matches);
+                total += matches;
+            }
+            return total == row.matchCount() ? seconds : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}

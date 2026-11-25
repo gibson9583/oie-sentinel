@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.SortedMap;
 
 import org.quartz.DisallowConcurrentExecution;
 import org.quartz.Job;
@@ -52,7 +53,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
  *
  * <p>Matched lines are stored as a JSON array, oldest first, of
  * {@code {"time", "node", "level", "logger", "message"}}, {@code time} being
- * ISO-8601 UTC with milliseconds.</p>
+ * ISO-8601 UTC with milliseconds. Each row also stores its count per second
+ * of the lines' own time, a JSON object of epoch second to count, so the
+ * evaluator can tell which lines fall inside a window even when a row was
+ * written late.</p>
  */
 @DisallowConcurrentExecution
 public class LogMatchFlushJob implements Job {
@@ -152,7 +156,7 @@ public class LogMatchFlushJob implements Job {
             LogMatchCounter.Drained value = entry.getValue();
             samples.add(new MatchSample(null, nodeId, entry.getKey(), null, now, value.count(),
                     value.samples().isEmpty() ? null : samplesJson(value.samples(), nodeId),
-                    complete && value.complete()));
+                    complete && value.complete(), secondCountsJson(value.seconds())));
             Monitor monitor = byId.get(entry.getKey());
             LogEventsConfig config = monitor == null ? null
                     : LogEventsConfig.lenient(monitor.getId(), monitor.getConfigJson());
@@ -191,6 +195,16 @@ public class LogMatchFlushJob implements Job {
             log.error("Failed to write {} log match sample(s); their counts are kept for the next flush",
                     samples.size(), e);
         }
+    }
+
+    /** @return {@code {"epochSecond": count, ...}} in second order, or {@code null} when nothing matched */
+    static String secondCountsJson(SortedMap<Long, Long> seconds) {
+        if (seconds.isEmpty()) {
+            return null;
+        }
+        ObjectNode counts = Json.mapper().createObjectNode();
+        seconds.forEach((second, count) -> counts.put(String.valueOf(second), count));
+        return Json.write(counts);
     }
 
     static String samplesJson(List<LogMatchCounter.MatchedLine> lines, String nodeId) {

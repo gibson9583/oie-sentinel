@@ -61,17 +61,6 @@ public final class MatchSampleRepository {
     }
 
     /**
-     * One node's heartbeat rows in a range.
-     *
-     * @param nodeId          the node that wrote the rows
-     * @param matchCount      the sum of their counts
-     * @param firstSampleTime the earliest of their sample times
-     * @param incompleteRows  how many of them were not complete
-     */
-    public record NodeSum(String nodeId, long matchCount, Instant firstSampleTime, long incompleteRows) {
-    }
-
-    /**
      * One channel's rows in a range, from every node.
      *
      * @param channelId  the channel
@@ -81,25 +70,29 @@ public final class MatchSampleRepository {
     }
 
     /**
-     * Sums a monitor's heartbeat rows (no channel) per node, inclusive range.
+     * A monitor's heartbeat rows (no channel) in an inclusive range, without
+     * their matched lines: what the evaluator needs to count a window to the
+     * second and to see which nodes covered it.
      *
-     * @return one entry per node with a row in the range, by node id; never
-     *         {@code null}
+     * @return rows ordered by node id, then sample time, with {@code id} and
+     *         {@code samplesJson} left {@code null}; never {@code null}
      * @throws RepositoryException on persistence failure
      */
-    public static List<NodeSum> sumSamplesByNode(int monitorId, Instant from, Instant to) {
+    public static List<MatchSample> listCountRows(int monitorId, Instant from, Instant to) {
         try {
             List<Map<String, Object>> rows = SqlConfig.getInstance().getSqlSessionManager()
-                    .selectList(stmt("sumMatchSamplesByNode"), range(monitorId, from, to));
-            List<NodeSum> sums = new ArrayList<>(rows.size());
+                    .selectList(stmt("listMatchSampleCounts"), range(monitorId, from, to));
+            List<MatchSample> samples = new ArrayList<>(rows.size());
             for (Map<String, Object> row : rows) {
-                Object first = row.get("first_time");
-                sums.add(new NodeSum((String) row.get("node_id"), toLong(row.get("match_sum")),
-                        first != null ? ((Timestamp) first).toInstant() : null, toLong(row.get("incomplete_count"))));
+                Object sampleTime = row.get("sample_time");
+                samples.add(new MatchSample(null, (String) row.get("node_id"), monitorId, null,
+                        sampleTime != null ? ((Timestamp) sampleTime).toInstant() : null,
+                        toLong(row.get("match_count")), null, isTrue(row.get("complete")),
+                        (String) row.get("second_counts")));
             }
-            return sums;
+            return samples;
         } catch (Exception e) {
-            log.error("Failed to sum match samples by node for monitor {} from {} to {}", monitorId, from, to, e);
+            log.error("Failed to list match counts for monitor {} from {} to {}", monitorId, from, to, e);
             throw new RepositoryException(e);
         }
     }
@@ -180,6 +173,7 @@ public final class MatchSampleRepository {
         params.put("match_count", sample.matchCount());
         params.put("samples_json", sample.samplesJson());
         params.put("complete", sample.complete());
+        params.put("second_counts", sample.secondCounts());
         return params;
     }
 
@@ -190,7 +184,7 @@ public final class MatchSampleRepository {
         return new MatchSample(id != null ? ((Number) id).longValue() : null, (String) row.get("node_id"),
                 ((Number) row.get("monitor_id")).intValue(), (String) row.get("channel_id"),
                 sampleTime != null ? ((Timestamp) sampleTime).toInstant() : null, toLong(row.get("match_count")),
-                (String) row.get("samples_json"), isTrue(row.get("complete")));
+                (String) row.get("samples_json"), isTrue(row.get("complete")), (String) row.get("second_counts"));
     }
 
     /** Oracle's NUMBER(1) and SQL Server's BIT come back as numbers, the others as Boolean. */

@@ -526,15 +526,17 @@ class LogMonitorEvaluationTest {
         return event;
     }
 
+    /** A row whose lines were all logged in the second it was written. */
     private static MatchSample sample(String node, Instant time, long count, String matchesJson) {
-        return new MatchSample(null, node, 0, null, time, count, matchesJson, true);
+        return new MatchSample(null, node, 0, null, time, count, matchesJson, true,
+                count > 0 ? "{\"" + time.getEpochSecond() + "\":" + count + "}" : null);
     }
 
     private static void samples(Monitor monitor, MatchSample... samples) {
         List<MatchSample> rows = new ArrayList<>();
         for (MatchSample sample : samples) {
             rows.add(new MatchSample(null, sample.nodeId(), monitor.getId(), null, sample.sampleTime(),
-                    sample.matchCount(), sample.samplesJson(), true));
+                    sample.matchCount(), sample.samplesJson(), true, sample.secondCounts()));
         }
         MatchSampleRepository.insertSamples(rows);
     }

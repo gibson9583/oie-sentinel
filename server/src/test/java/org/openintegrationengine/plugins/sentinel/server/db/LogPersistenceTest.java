@@ -59,21 +59,24 @@ class LogPersistenceTest {
     }
 
     @Test
-    void heartbeatRowsSumPerNodeOverAnInclusiveRangeAndCountTheIncompleteOnes() {
+    void countRowsAreOneMonitorsHeartbeatRowsOverAnInclusiveRangeByNodeThenTime() {
         int other = database.logMonitor("other", "{}").getId();
+        String seconds = "{\"" + NOW.getEpochSecond() + "\":3}";
         MatchSampleRepository.insertSamples(List.of(
                 sample("node-a", monitor.getId(), null, NOW.minusSeconds(30), 1, null, false),
-                sample("node-a", monitor.getId(), null, NOW, 3, null, false),
+                new MatchSample(null, "node-b", monitor.getId(), null, NOW.plusSeconds(30), 0, null, true, null),
+                new MatchSample(null, "node-a", monitor.getId(), null, NOW, 3, "[\"kept\"]", false, seconds),
                 sample("node-a", monitor.getId(), null, NOW.plusSeconds(10), 0, null, true),
-                sample("node-b", monitor.getId(), null, NOW.plusSeconds(30), 0, null, true),
                 sample("node-a", monitor.getId(), CHANNEL_A, NOW, 5, null, false),
                 sample("node-a", other, null, NOW, 9, null, false)));
         MatchSampleRepository.insertSamples(List.of());
         MatchSampleRepository.insertSamples(null);
 
-        assertEquals(List.of(new MatchSampleRepository.NodeSum("node-a", 3, NOW, 1),
-                        new MatchSampleRepository.NodeSum("node-b", 0, NOW.plusSeconds(30), 0)),
-                MatchSampleRepository.sumSamplesByNode(monitor.getId(), NOW, NOW.plusSeconds(30)));
+        assertEquals(List.of(new MatchSample(null, "node-a", monitor.getId(), null, NOW, 3, null, false, seconds),
+                        new MatchSample(null, "node-a", monitor.getId(), null, NOW.plusSeconds(10), 0, null, true, null),
+                        new MatchSample(null, "node-b", monitor.getId(), null, NOW.plusSeconds(30), 0, null, true, null)),
+                MatchSampleRepository.listCountRows(monitor.getId(), NOW, NOW.plusSeconds(30)),
+                "per-second counts round-trip; the matched lines are not read");
     }
 
     @Test

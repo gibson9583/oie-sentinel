@@ -414,6 +414,55 @@ class LogMatchFlushJobTest {
     }
 
     @Test
+    void aLineOlderThanTheWindowDoesNotCountThoughItsRowWasWrittenInsideIt() throws Exception {
+        database.collectorIntervalSeconds(60);
+        database.setting("evaluator.interval.seconds", 30);
+        counting();
+        Monitor monitor = database.logMonitor("errors", "{\"windowSeconds\": 30, \"includeMatches\": true}");
+        flush();
+        matched(Level.ERROR, "x", "logged a minute ago", System.currentTimeMillis() - 60_000);
+        flush();
+
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, Instant.now());
+        assertNotEquals(EvaluationOutcome.Result.BREACH, outcome.getResult(), outcome.getValueJson());
+        JsonNode value = Json.mapper().readTree(outcome.getValueJson());
+        assertEquals(30, value.path("windowSeconds").asInt());
+        assertEquals(0, value.path("count").asLong());
+        assertFalse(outcome.getValueJson().contains("a minute ago"), outcome.getValueJson());
+
+        matched(Level.ERROR, "x", "logged just now", System.currentTimeMillis());
+        flush();
+        outcome = LogEventsEvaluator.evaluate(monitor, Instant.now());
+        assertEquals(EvaluationOutcome.Result.BREACH, outcome.getResult(), outcome.getValueJson());
+        assertEquals(1, Json.mapper().readTree(outcome.getValueJson()).path("count").asLong());
+        assertTrue(outcome.getValueJson().contains("logged just now"), outcome.getValueJson());
+        assertFalse(outcome.getValueJson().contains("a minute ago"), outcome.getValueJson());
+    }
+
+    @Test
+    void aRowWrittenLateAfterAFailedWriteCountsOnlyItsLinesInsideTheWindow() throws Exception {
+        counting();
+        Monitor monitor = database.logMonitor("errors",
+                "{\"windowSeconds\": 60, \"threshold\": 2, \"includeMatches\": true}");
+        flush();
+        matched(Level.ERROR, "x", "logged before the window", System.currentTimeMillis() - 120_000);
+        sql("RENAME TABLE sentinel_match_sample TO sentinel_match_sample_away");
+        try {
+            flush();
+        } finally {
+            sql("RENAME TABLE sentinel_match_sample_away TO sentinel_match_sample");
+        }
+        matched(Level.ERROR, "x", "logged inside the window", System.currentTimeMillis());
+        flush();
+        assertEquals(List.of(0L, 2L), counts(rows(monitor)), "one late row holds both lines");
+
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, Instant.now());
+        assertNotEquals(EvaluationOutcome.Result.BREACH, outcome.getResult(), outcome.getValueJson());
+        assertEquals(1, Json.mapper().readTree(outcome.getValueJson()).path("count").asLong());
+        assertFalse(outcome.getValueJson().contains("before the window"), outcome.getValueJson());
+    }
+
+    @Test
     void aQueueCapacitySavedOnAnotherNodeIsAppliedHereAtTheNextFlushAndKeepsWhatIsQueued() {
         database.logMonitor("errors", "{}");
         start();

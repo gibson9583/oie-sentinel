@@ -76,6 +76,8 @@ class MysqlTimestampResultMappingTest {
     private static final Shape PRESENCE = new Shape("metadata_id node_id deployed_time", "deployed_time", "", false);
     private static final Shape MATCH = new Shape("id node_id monitor_id channel_id sample_time match_count samples_json complete",
             "sample_time", "", true);
+    private static final Shape MATCH_COUNT = new Shape("node_id sample_time match_count second_counts complete",
+            "sample_time", "", false);
 
     private static List<Query> queries() {
         List<Query> queries = new ArrayList<>();
@@ -92,6 +94,7 @@ class MysqlTimestampResultMappingTest {
         add(queries, CONNECTOR, "getLatestConnectorStatusEvent", "listLatestConnectorStatusEvents", "listConnectorStatusEvents");
         add(queries, PRESENCE, "listActiveConnectorNodes");
         add(queries, MATCH, "listRecentMatchSamples");
+        add(queries, MATCH_COUNT, "listMatchSampleCounts");
         return queries;
     }
 

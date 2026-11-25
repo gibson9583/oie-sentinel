@@ -13,6 +13,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.LongAdder;
 
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
@@ -48,19 +50,27 @@ public final class LogMatchCounter {
     /**
      * What one monitor matched since the last drain. {@code complete} is false
      * when a pattern check timed out; {@code occurrences} and {@code overflow}
-     * are filled only for each-occurrence notifications.
+     * are filled only for each-occurrence notifications. {@code seconds} holds
+     * the count per epoch second of the lines' own time, in order, and adds up
+     * to {@code count}.
      */
     public record Drained(long count, List<MatchedLine> samples, boolean complete, List<MatchedLine> occurrences,
-            long overflow) {
+            long overflow, SortedMap<Long, Long> seconds) {
+
+        /** Without per-second counts. */
+        public Drained(long count, List<MatchedLine> samples, boolean complete, List<MatchedLine> occurrences,
+                long overflow) {
+            this(count, samples, complete, occurrences, overflow, new TreeMap<>());
+        }
 
         /** @return this without its occurrences, for putting back counts whose notifications were written */
         public Drained countsOnly() {
-            return new Drained(count, samples, complete, List.of(), 0);
+            return new Drained(count, samples, complete, List.of(), 0, seconds);
         }
 
         /** @return this, marked complete only when {@code rowComplete} is true, for putting back a row's counts */
         public Drained withComplete(boolean rowComplete) {
-            return new Drained(count, samples, rowComplete, occurrences, overflow);
+            return new Drained(count, samples, rowComplete, occurrences, overflow, seconds);
         }
     }
 
@@ -124,7 +134,7 @@ public final class LogMatchCounter {
         MatchedLine sample = entry.samples > 0 ? MatchedLine.of(line, true) : null;
         MatchedLine occurrence = !entry.config.notifiesEachOccurrence() ? null
                 : sample != null ? sample : MatchedLine.of(line, entry.config.includeMatches());
-        entry.tally.add(sample, entry.samples, occurrence);
+        entry.tally.add(sample, entry.samples, occurrence, line.timeMillis());
     }
 
     void internalError() {
@@ -235,9 +245,17 @@ public final class LogMatchCounter {
         private final ArrayDeque<MatchedLine> samples = new ArrayDeque<>(MAX_SAMPLES);
         /** Oldest first; the first {@link #MAX_OCCURRENCES} since the last drain. */
         private final List<MatchedLine> occurrences = new ArrayList<>();
+        /**
+         * Matches per epoch second of the lines' time. One entry per second
+         * with a match, so a collector interval holds at most that many; after
+         * failed writes it grows by at most one entry per second until a write
+         * succeeds.
+         */
+        private final TreeMap<Long, Long> seconds = new TreeMap<>();
 
-        synchronized void add(MatchedLine sample, int keep, MatchedLine occurrence) {
+        synchronized void add(MatchedLine sample, int keep, MatchedLine occurrence, long timeMillis) {
             count++;
+            seconds.merge(Math.floorDiv(timeMillis, 1000L), 1L, Long::sum);
             if (sample != null && keep > 0) {
                 while (samples.size() >= keep) {
                     samples.removeFirst();
@@ -269,12 +287,14 @@ public final class LogMatchCounter {
         }
 
         synchronized Drained drain() {
-            Drained drained = new Drained(count, List.copyOf(samples), !missed, List.copyOf(occurrences), overflow);
+            Drained drained = new Drained(count, List.copyOf(samples), !missed, List.copyOf(occurrences), overflow,
+                    new TreeMap<>(seconds));
             count = 0;
             missed = false;
             overflow = 0;
             samples.clear();
             occurrences.clear();
+            seconds.clear();
             return drained;
         }
 
@@ -282,6 +302,7 @@ public final class LogMatchCounter {
         synchronized void recredit(Drained back, int keep) {
             count += back.count();
             missed |= !back.complete();
+            back.seconds().forEach((second, matches) -> seconds.merge(second, matches, Long::sum));
             List<MatchedLine> merged = new ArrayList<>(back.samples());
             merged.addAll(samples);
             samples.clear();
