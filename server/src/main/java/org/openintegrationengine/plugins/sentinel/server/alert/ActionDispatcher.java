@@ -37,6 +37,7 @@ import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
 import org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression;
 import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
+import org.openintegrationengine.plugins.sentinel.server.log.DeliveryThreads;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionTestResult;
@@ -926,7 +927,7 @@ public final class ActionDispatcher {
 
     /** Named, daemon dispatch thread — see {@link #startDispatchExecutor()} for why both matter. */
     private static Thread newDispatchThread(Runnable task) {
-        Thread thread = new Thread(task, "sentinel-dispatch-" + DISPATCH_THREAD_SEQUENCE.incrementAndGet());
+        Thread thread = new Thread(task, DeliveryThreads.DISPATCH_PREFIX + DISPATCH_THREAD_SEQUENCE.incrementAndGet());
         thread.setDaemon(true);
         return thread;
     }
@@ -934,7 +935,7 @@ public final class ActionDispatcher {
     /** Named daemon thread for the isolated, cancellable transport call. */
     private static Thread newTransportThread(Runnable task) {
         Thread thread = new Thread(task,
-                "sentinel-transport-" + TRANSPORT_THREAD_SEQUENCE.incrementAndGet());
+                DeliveryThreads.TRANSPORT_PREFIX + TRANSPORT_THREAD_SEQUENCE.incrementAndGet());
         thread.setDaemon(true);
         return thread;
     }

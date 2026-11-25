@@ -14,6 +14,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.util.List;
@@ -33,6 +34,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.mirth.connect.server.logging.MirthLog4jFilter;
+
+import org.openintegrationengine.plugins.sentinel.server.alert.ActionDispatcher;
 
 /**
  * The appender on a real log4j2 context configured like the engine: the
@@ -122,6 +125,38 @@ class LogEventAppenderTest {
         LogEventAppender appender = (LogEventAppender) context.getConfiguration().getAppender(LogEventAppender.NAME);
         assertDoesNotThrow(() -> appender.append(hostile));
         assertEquals(1, pipeline.queue().drainInternalErrors());
+    }
+
+    @Test
+    void aLineLoggedOnASentinelDeliveryThreadIsNotQueuedAndTheSameLineFromAnotherThreadIs() throws Exception {
+        LogQueue queue = new LogQueue(100);
+        queue.setGate(List.of(LogQueueTest.matcher("{}")));
+        LogEventAppender.attach(context, queue);
+        // What the engine logs on the calling thread when a Channel action routes to an undeployed channel.
+        Logger router = context.getLogger("com.mirth.connect.server.userutil.VMRouter");
+        Runnable failedRoute = () -> router.error("Error routing message to channel id: 00000000-0000-0000-0000-000000000001");
+
+        // The dispatcher's own thread factories, so a renamed thread fails here.
+        runOn(deliveryThread("newTransportThread", failedRoute));
+        runOn(deliveryThread("newDispatchThread", failedRoute));
+        assertEquals(0, queue.depth());
+
+        runOn(new Thread(failedRoute, "qtp1234-56"));
+        failedRoute.run();
+        assertEquals(2, queue.depth());
+        assertEquals("com.mirth.connect.server.userutil.VMRouter", queue.poll().logger());
+    }
+
+    private static Thread deliveryThread(String factory, Runnable task) throws Exception {
+        Method method = ActionDispatcher.class.getDeclaredMethod(factory, Runnable.class);
+        method.setAccessible(true);
+        return (Thread) method.invoke(null, task);
+    }
+
+    private static void runOn(Thread thread) throws InterruptedException {
+        thread.start();
+        thread.join(5_000);
+        assertFalse(thread.isAlive());
     }
 
     @Test

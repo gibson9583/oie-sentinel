@@ -71,6 +71,9 @@ public final class LogQueue {
         if (!current.accepts(level, logger)) {
             return;
         }
+        if (DeliveryThreads.isDelivery(event.getThreadName())) {
+            return; // Sentinel's own delivery; see DeliveryThreads
+        }
         int cap = capacity;
         // Reserve before copying, so a full queue costs no message formatting.
         int reserved = depth.incrementAndGet();
