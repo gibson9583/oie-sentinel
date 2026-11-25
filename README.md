@@ -106,8 +106,8 @@ are written once it can.
 Each row also keeps how many lines matched in each second, so a window is judged to the second: a
 line logged before the window starts doesn't count, also when its row was written late. A count is
 also incomplete until there are rows for the whole window, from its start to now with no gap longer
-than two collector intervals. Missing rows never count as no matches, and a new or just saved
-"at most" monitor can't fire until it has counted for a full window.
+than two collector intervals. Missing rows never count as no matches, and a new, just saved or just
+enabled "at most" monitor can't fire until it has counted for a full window.
 
 The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
 any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log
@@ -132,7 +132,8 @@ A Log monitor does not count:
 - Lines logged before Sentinel starts, such as engine startup and migration errors.
 - Lines logged between saving or enabling a monitor and each node's next collector run, which is up
   to one collector interval.
-- Lines matched before the monitor was last saved. Saving a monitor starts its count afresh.
+- Lines matched before the monitor was last saved or enabled. Saving or enabling a monitor starts its
+  count afresh.
 - Lines logged by Sentinel's own threads that deliver alerts, such as the engine's error when a
   Channel action routes to a channel that isn't deployed. A failed delivery can't raise more
   notifications this way.

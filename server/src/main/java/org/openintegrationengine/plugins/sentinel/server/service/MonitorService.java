@@ -247,6 +247,12 @@ public final class MonitorService {
      * one mutation a NOC operator performs mid-incident, kept surgical so it
      * cannot clobber concurrent config edits.
      *
+     * <p>Enabling a disabled Log monitor also sets its updated time and user,
+     * in the same statement. Its count starts afresh from the updated time,
+     * as after a save, so rows written before it was disabled never count.
+     * Nothing else reads the updated time but the Monitors list, and export
+     * and import leave it out.</p>
+     *
      * @param id      database id
      * @param enabled the new enabled state
      * @param userId  the acting user, audited
@@ -255,7 +261,15 @@ public final class MonitorService {
      */
     public static Monitor setEnabled(int id, boolean enabled, int userId) {
         Monitor existing = get(id);
-        MonitorRepository.setMonitorEnabled(id, enabled);
+        boolean restartsCount = enabled && !existing.isEnabled() && existing.getMonitorType() != null
+                && existing.getMonitorType().kind() == MonitorKind.LOG;
+        if (restartsCount) {
+            existing.setUpdatedTime(Instant.now());
+            existing.setUpdatedBy(userId);
+            MonitorRepository.setMonitorEnabled(id, true, existing.getUpdatedTime(), userId);
+        } else {
+            MonitorRepository.setMonitorEnabled(id, enabled);
+        }
         existing.setEnabled(enabled);
         SentinelAuditLog.monitorEnabledChanged(userId, existing);
         return existing;

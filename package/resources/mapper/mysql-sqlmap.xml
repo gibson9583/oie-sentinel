@@ -112,8 +112,11 @@
         DELETE FROM sentinel_monitor WHERE id = #{id}
     </delete>
 
+    <!-- Enabling a Log monitor also sets updated_time and updated_by: its count starts again there. -->
     <update id="setMonitorEnabled" parameterType="map">
-        UPDATE sentinel_monitor SET enabled = #{enabled} WHERE id = #{id}
+        UPDATE sentinel_monitor SET enabled = #{enabled}
+        <if test="updated_time != null">, updated_time = #{updated_time,jdbcType=TIMESTAMP}, updated_by = #{updated_by,jdbcType=INTEGER}</if>
+        WHERE id = #{id}
     </update>
 
     <!-- ========== ALERT_EVENT (table sentinel_alert_event) ========== -->

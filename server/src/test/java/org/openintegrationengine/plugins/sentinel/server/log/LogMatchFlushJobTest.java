@@ -48,6 +48,8 @@ import org.openintegrationengine.plugins.sentinel.server.db.MatchSample;
 import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutcome;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LogEventsEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.service.MonitorService;
+import org.openintegrationengine.plugins.sentinel.server.service.SentinelAuditLog;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
@@ -411,6 +413,35 @@ class LogMatchFlushJobTest {
         assertEquals(0, Json.mapper().readTree(outcome.getValueJson()).path("count").asLong());
         assertFalse(outcome.getValueJson().contains("ALPHA"), outcome.getValueJson());
         assertEquals(List.of(0L, 1L, 0L), counts(rows(monitor)), "the line matched before the save is not written");
+    }
+
+    @Test
+    void enablingAMonitorAgainStartsItsCountAfreshAndAMonitorLeftEnabledKeepsItsRows() throws Exception {
+        counting();
+        Monitor toggled = database.logMonitor("toggled", "{}");
+        Monitor steady = database.logMonitor("steady", "{}");
+        flush();
+        matched(Level.ERROR, "x", "matched before the disable", System.currentTimeMillis());
+        flush();
+        try (MockedStatic<SentinelAuditLog> audit = mockStatic(SentinelAuditLog.class)) {
+            MonitorService.setEnabled(toggled.getId(), false, 1);
+            flush();
+            MonitorService.setEnabled(toggled.getId(), true, 1);
+            MonitorService.setEnabled(steady.getId(), true, 1);
+        }
+        flush();
+        Instant now = Instant.now();
+
+        EvaluationOutcome afresh = LogEventsEvaluator.evaluate(MonitorRepository.getMonitor(toggled.getId()), now);
+        assertNotEquals(EvaluationOutcome.Result.BREACH, afresh.getResult(), afresh.getValueJson());
+        assertEquals(0, Json.mapper().readTree(afresh.getValueJson()).path("count").asLong(),
+                "the row written before the disable no longer counts");
+
+        EvaluationOutcome kept = LogEventsEvaluator.evaluate(MonitorRepository.getMonitor(steady.getId()), now);
+        assertEquals(EvaluationOutcome.Result.BREACH, kept.getResult(), kept.getValueJson());
+        assertEquals(1, Json.mapper().readTree(kept.getValueJson()).path("count").asLong(),
+                "enabling a monitor that is already enabled changes nothing");
+        assertNull(MonitorRepository.getMonitor(steady.getId()).getUpdatedTime());
     }
 
     @Test
