@@ -1569,7 +1569,7 @@ public final class ActionDispatcher {
             if (current == null || !current.isEnabled()
                     || (requireSubscription && (!firesOnPhase(current.getOperationMode(), resolvedPhase)
                             || !ActionConditionMatcher.matches(current,
-                                    withEventType(payload, resolvedPhase ? "RESOLVED" : "PROBLEM"))))) {
+                                    withEventType(payload, payload.conditionEventType(resolvedPhase)))))) {
                 return ActionDecision.INAPPLICABLE;
             }
             // Do not splice new credentials/routing into a decision whose

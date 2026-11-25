@@ -14,6 +14,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
@@ -62,6 +63,11 @@ public final class AlertPayload {
     // Log alert by its null channel id, its "Log" channel name and monitor type.
     @JsonIgnore
     private final ProblemSubject subject;
+    // The alert's own kind. Condition matching reads it on every edge, so a
+    // notification is matched as NOTIFICATION even once a rollup has replaced
+    // its event type with "ROLLUP".
+    @JsonIgnore
+    private final AlertKind kind;
 
     /**
      * Package-private so that {@link ActionDispatcher#sendTest(org.openintegrationengine.plugins.sentinel.shared.model.Action)}
@@ -96,13 +102,13 @@ public final class AlertPayload {
             String runbookUrl) {
         this(alertEventId, monitorId, monitorName, monitorType, channelId, channelName, metadataId,
                 severity, eventType, message, openedTime, valueJson, runbookUrl, null,
-                ProblemSubject.channel(channelId));
+                ProblemSubject.channel(channelId), AlertKind.PROBLEM);
     }
 
     private AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
             String channelId, String channelName, Integer metadataId, Severity severity,
             String eventType, String message, Instant openedTime, String valueJson,
-            String runbookUrl, RollupSummary rollupSummary, ProblemSubject subject) {
+            String runbookUrl, RollupSummary rollupSummary, ProblemSubject subject, AlertKind kind) {
         this.alertEventId = alertEventId;
         this.monitorId = monitorId;
         this.monitorName = monitorName;
@@ -119,12 +125,13 @@ public final class AlertPayload {
         this.matches = MatchedLines.parse(valueJson);
         this.rollupSummary = rollupSummary;
         this.subject = subject;
+        this.kind = kind;
     }
 
     AlertPayload withRollupSummary(int sent, int windowSeconds) {
         return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
                 metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl,
-                new RollupSummary(sent, windowSeconds), subject);
+                new RollupSummary(sent, windowSeconds), subject, kind);
     }
 
     RollupSummary rollupSummary() { return rollupSummary; }
@@ -132,11 +139,24 @@ public final class AlertPayload {
     /** The dispatcher's one way to reword a payload; keeps the subject, drops the rollup summary. */
     AlertPayload copy(String eventType, String message) {
         return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
-                metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl, null, subject);
+                metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl, null, subject, kind);
     }
 
     /** @return what the alert is about; read by condition matching and rollup naming */
     ProblemSubject subject() { return subject; }
+
+    /**
+     * The event type an action's EVENT_TYPE condition sees on this edge:
+     * {@code "RESOLVED"} for the resolved edge, otherwise the alert's own kind,
+     * {@code "NOTIFICATION"} or {@code "PROBLEM"}, whatever this payload's
+     * event type has been reworded to.
+     */
+    String conditionEventType(boolean resolvedPhase) {
+        if (resolvedPhase) {
+            return "RESOLVED";
+        }
+        return kind == AlertKind.NOTIFICATION ? "NOTIFICATION" : "PROBLEM";
+    }
 
     /**
      * Builds the payload for a real alert event, resolving the subject's
@@ -179,7 +199,8 @@ public final class AlertPayload {
                 valueJson,
                 monitor != null ? monitor.getRunbookUrl() : null,
                 null,
-                subject);
+                subject,
+                AlertKind.orProblem(event.getKind()));
     }
 
     /**

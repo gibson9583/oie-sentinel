@@ -59,7 +59,9 @@ final class RollupRecipients {
                 if (monitor == null || !monitor.isEnabled()) {
                     continue;
                 }
-                AlertPayload payload = AlertPayload.of(current, monitor, resolved ? "RESOLVED" : "PROBLEM");
+                // Matched as the edge it is sent on; a notification as NOTIFICATION.
+                AlertPayload payload = AlertPayload.of(current, monitor, "PROBLEM");
+                payload = payload.copy(payload.conditionEventType(resolved), payload.getMessage());
                 if (ActionConditionMatcher.matches(action, payload)) {
                     names.put(ProblemSubject.of(current), payload.getChannelName());
                 }
