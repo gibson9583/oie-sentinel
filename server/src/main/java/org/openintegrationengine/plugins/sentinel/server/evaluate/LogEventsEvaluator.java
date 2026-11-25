@@ -33,9 +33,12 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * node's rows in {@code sentinel_match_sample}. BREACH means the condition is
  * true. A row's count covers the interval since that node's previous row.
  *
- * <p>The window starts at the start of the second {@code now - window} falls
- * in, and only lines whose own second is at or after it count, including
- * lines in a row written late (see {@link LogWindowCount}). It is
+ * <p>The window is the latest {@code window} seconds the nodes have counted:
+ * it ends at the oldest of the reporting nodes' newest rows, at most about
+ * one collector interval before now, and starts at the start of the second
+ * {@code window} seconds before that. Only lines whose own second is in it
+ * count, including lines in a row written late (see {@link LogWindowCount}).
+ * It is
  * <b>complete</b> when {@link LogWindowCount} says so: every node that was
  * counting has rows from the window's start up to now with no long gap, every
  * row in it is complete (no dropped lines, no detached appender, no timed-out
@@ -84,13 +87,17 @@ public final class LogEventsEvaluator {
         }
         SentinelSettings settings = SettingsService.get();
         long windowSeconds = windowSeconds(config, settings);
-        Instant start = now.minusSeconds(windowSeconds).truncatedTo(ChronoUnit.SECONDS);
         int collectorSeconds = settings.getCollectorIntervalSeconds();
-        // Rows from before the window too: a row's interval starts at its node's previous row.
-        Instant read = countedFrom(monitor, start.minusSeconds(COVERAGE_INTERVALS * (long) collectorSeconds));
+        long allowance = COVERAGE_INTERVALS * (long) collectorSeconds;
+        // The window ends up to one allowance before now, and its coverage needs
+        // a row up to one allowance before its start, so read two allowances back.
+        Instant read = countedFrom(monitor,
+                now.minusSeconds(windowSeconds + 2 * allowance).truncatedTo(ChronoUnit.SECONDS));
+        List<MatchSample> rows = MatchSampleRepository.listCountRows(monitor.getId(), read, now);
+        Instant end = LogWindowCount.end(rows, now, collectorSeconds);
+        Instant start = end.minusSeconds(windowSeconds).truncatedTo(ChronoUnit.SECONDS);
 
-        LogWindowCount window = LogWindowCount.of(
-                MatchSampleRepository.listCountRows(monitor.getId(), read, now), start, now, collectorSeconds);
+        LogWindowCount window = LogWindowCount.of(rows, start, end, now, collectorSeconds);
         long count = window.count();
         boolean complete = window.complete();
         ObjectNode perNode = Json.mapper().createObjectNode();
@@ -113,8 +120,8 @@ public final class LogEventsEvaluator {
             value.put("lastBreach", now.toString());
         }
         if (config.includeMatches()) {
-            value.set("matches", recentMatches(monitor.getId(), window.perNode(), start, countedFrom(monitor, start),
-                    now));
+            value.set("matches", recentMatches(monitor.getId(), window.perNode(), start, end,
+                    countedFrom(monitor, start), now));
         }
         String valueJson = Json.write(value);
 
@@ -150,11 +157,11 @@ public final class LogEventsEvaluator {
     /**
      * The newest lines in the window across all nodes, oldest first. Each
      * node's newest rows with lines hold its newest lines, so reading that
-     * many rows per node with matches is enough. A line older than the
-     * window's start, from a row that straddles it, is left out.
+     * many rows per node with matches is enough. A line outside the window,
+     * from a row that straddles its start or its end, is left out.
      */
-    private static ArrayNode recentMatches(int monitorId, Map<String, Long> perNode, Instant start, Instant from,
-            Instant now) {
+    private static ArrayNode recentMatches(int monitorId, Map<String, Long> perNode, Instant start, Instant end,
+            Instant from, Instant now) {
         List<JsonNode> lines = new ArrayList<>();
         for (Map.Entry<String, Long> node : perNode.entrySet()) {
             if (node.getValue() <= 0) {
@@ -166,7 +173,8 @@ public final class LogEventsEvaluator {
                     JsonNode stored = Json.mapper().readTree(sample.samplesJson());
                     if (stored != null && stored.isArray()) {
                         for (JsonNode line : stored) {
-                            if (!lineTime(line).isBefore(start)) {
+                            Instant time = lineTime(line);
+                            if (!time.isBefore(start) && time.getEpochSecond() <= end.getEpochSecond()) {
                                 lines.add(line);
                             }
                         }

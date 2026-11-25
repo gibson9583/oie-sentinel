@@ -281,9 +281,10 @@ class LogEventsEvaluatorTest {
         Monitor monitor = database.logMonitor("errors", "{\"threshold\": 3, \"includeMatches\": true}");
         MatchSample late = late("node-a", NOW.minusSeconds(5), START.minusSeconds(100), START.minusSeconds(1), START,
                 NOW.minusSeconds(10));
+        // A row at now, so the window ends at now and starts at START.
         rows(monitor, row("node-a", START.minusSeconds(30), 0), new MatchSample(null, "node-a", 0, null,
                 late.sampleTime(), late.matchCount(), matches("node-a", START.minusSeconds(100), START.minusSeconds(1),
-                        START, NOW.minusSeconds(10)), true, late.secondCounts()));
+                        START, NOW.minusSeconds(10)), true, late.secondCounts()), row("node-a", NOW, 0));
 
         EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
         JsonNode value = value(outcome);
@@ -360,6 +361,55 @@ class LogEventsEvaluatorTest {
         rows(errors, every("node-a", START.minusSeconds(60), NOW.minusSeconds(60), 60));
         assertEquals(EvaluationOutcome.Result.OK, result(errors),
                 "rows exactly two intervals apart, the first exactly two before the start and the last two before now");
+    }
+
+    /**
+     * Defaults: rows every 30 seconds, an evaluation every 60, a 60-second
+     * window. The row that holds a line is written up to a collector interval
+     * after the line, so the window must end where the rows end.
+     */
+    @Test
+    void aLineLoggedJustBeforeAnEvaluationIsCountedByTheNextOne() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"windowSeconds\": 60}");
+        Instant tick = NOW.minusSeconds(60);
+        Instant line = tick.minusSeconds(10);
+        rows(monitor, every("node-a", tick.minusSeconds(110), tick.minusSeconds(20), 30));
+        rows(monitor, late("node-a", tick.plusSeconds(10), line), row("node-a", tick.plusSeconds(40), 0));
+
+        assertEquals(0, value(LogEventsEvaluator.evaluate(monitor, tick)).get("count").asLong(),
+                "at the tick no row holds the line yet");
+        EvaluationOutcome next = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(1, value(next).get("count").asLong(), "the next evaluation counts it");
+        assertEquals(EvaluationOutcome.Result.BREACH, next.getResult());
+    }
+
+    @Test
+    void aLineLoggedJustAfterAnEvaluationIsCountedByTheNextOne() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"windowSeconds\": 60}");
+        Instant tick = NOW.minusSeconds(60);
+        rows(monitor, every("node-a", tick.minusSeconds(110), tick.plusSeconds(10), 30));
+        rows(monitor, late("node-a", tick.plusSeconds(40), tick.plusSeconds(10)));
+
+        EvaluationOutcome next = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(1, value(next).get("count").asLong());
+        assertEquals(EvaluationOutcome.Result.BREACH, next.getResult());
+    }
+
+    @Test
+    void theWindowEndsAtTheOldestReportingNodesNewestRowAndAStalledNodeDoesNotHoldItBack() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"threshold\": 2}");
+        rows(monitor, every("node-a", NOW.minusSeconds(365), NOW.minusSeconds(35), 30));
+        rows(monitor, late("node-a", NOW.minusSeconds(5), NOW.minusSeconds(30), NOW.minusSeconds(15)));
+        rows(monitor, every("node-b", NOW.minusSeconds(385), NOW.minusSeconds(25), 30));
+        EvaluationOutcome outcome = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(1, value(outcome).get("count").asLong(),
+                "node-b has counted up to 25 seconds ago, so the line 15 seconds ago waits for the next evaluation");
+        assertEquals(EvaluationOutcome.Result.OK, outcome.getResult());
+
+        rows(monitor, every("node-c", NOW.minusSeconds(385), NOW.minusSeconds(205), 30));
+        EvaluationOutcome stalled = LogEventsEvaluator.evaluate(monitor, NOW);
+        assertEquals(1, value(stalled).get("count").asLong(), "node-c stopped 205 seconds ago and moves nothing");
+        assertEquals(EvaluationOutcome.Result.INSUFFICIENT_DATA, stalled.getResult(), "but the window is incomplete");
     }
 
     @Test

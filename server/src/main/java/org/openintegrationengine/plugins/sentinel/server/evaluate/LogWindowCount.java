@@ -21,15 +21,22 @@ import org.openintegrationengine.plugins.sentinel.server.util.Json;
  * What a Log monitor's count rows say about one window: how many matched
  * lines fall inside it, per node, and whether that count is complete.
  *
+ * <p>The window ends where the rows end: at the oldest of the reporting
+ * nodes' newest rows (see {@link #end}), at most about one collector interval
+ * before now. A line is written in a row up to a collector interval after it
+ * is logged, so a window that ended at now would miss the lines logged just
+ * before each evaluation; ending at the rows, every line falls in some window.</p>
+ *
  * <p>A row counts what its node matched since that node's previous row, and
  * every line in it is older than the row. Rows written since schema v15 carry
  * their count per second of the lines' own time, so only lines whose second
- * is at or after the window's first second are counted, however late the row
- * was written. A row without per-second counts (written before v15, or one
- * whose lines fall in more than {@code LogMatchCounter.MAX_SECONDS} seconds
- * after long failed writes) is counted only when the node's previous row is
- * inside the window too, so all of its lines are; otherwise it is left out and
- * the window is incomplete. A row without matches needs neither.</p>
+ * is from the window's first second to its last are counted, however late
+ * the row was written. A row without per-second counts (written before v15,
+ * or one whose lines fall in more than {@code LogMatchCounter.MAX_SECONDS}
+ * seconds after long failed writes) is counted only when its whole interval,
+ * from the node's previous row to the row, is inside the window; one wholly
+ * after the window counts nothing, and any other is left out and makes the
+ * window incomplete. A row without matches needs neither.</p>
  *
  * <p>A low count is evidence only when every node that was counting watched
  * the whole window. The nodes expected are those with a row in the window or
@@ -56,14 +63,38 @@ final class LogWindowCount {
     }
 
     /**
-     * @param rows             a monitor's count rows, ordered by node and then
-     *                         time, read from the coverage allowance before
-     *                         the window's start (or the monitor's last save)
+     * Where a window ends: the oldest newest-row time among the nodes still
+     * reporting (newest row within the coverage allowance of now), or now when
+     * none is. A node that has stopped doesn't hold the window back; the
+     * coverage check makes the window incomplete instead.
+     *
+     * @param rows a monitor's count rows up to now, ordered by node and then time
+     */
+    static Instant end(List<MatchSample> rows, Instant now, int collectorSeconds) {
+        Instant reporting = now.minusSeconds(LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds);
+        Instant end = null;
+        for (int i = 0; i < rows.size(); i++) {
+            MatchSample row = rows.get(i);
+            boolean newestOfNode = i + 1 == rows.size() || !rows.get(i + 1).nodeId().equals(row.nodeId());
+            if (newestOfNode && !row.sampleTime().isBefore(reporting)
+                    && (end == null || row.sampleTime().isBefore(end))) {
+                end = row.sampleTime();
+            }
+        }
+        return end != null && end.isBefore(now) ? end : now;
+    }
+
+    /**
+     * @param rows             a monitor's count rows up to now, ordered by node
+     *                         and then time, read from the coverage allowance
+     *                         before the window's start (or the monitor's last
+     *                         save)
      * @param start            the window's first second
-     * @param now              the evaluation time, the window's end
+     * @param end              the window's end, from {@link #end}
+     * @param now              the evaluation time
      * @param collectorSeconds the collector interval now
      */
-    static LogWindowCount of(List<MatchSample> rows, Instant start, Instant now, int collectorSeconds) {
+    static LogWindowCount of(List<MatchSample> rows, Instant start, Instant end, Instant now, int collectorSeconds) {
         long allowance = LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds;
         Map<String, Long> perNode = new TreeMap<>();
         long count = 0L;
@@ -83,7 +114,7 @@ final class LogWindowCount {
                 continue; // every line in it is older than the window
             }
             rowsComplete &= row.complete();
-            Long inside = linesInside(row, before, start);
+            Long inside = linesInside(row, before, start, end);
             if (inside == null) {
                 rowsComplete = false;
                 inside = 0L;
@@ -135,9 +166,9 @@ final class LogWindowCount {
      * @param before the same node's previous row, or {@code null} when it was
      *               not read
      * @return the row's lines whose second is in the window, or {@code null}
-     *         when they cannot be told apart from older lines
+     *         when they cannot be told apart from lines outside it
      */
-    private static Long linesInside(MatchSample row, MatchSample before, Instant start) {
+    private static Long linesInside(MatchSample row, MatchSample before, Instant start, Instant end) {
         if (row.matchCount() <= 0) {
             return 0L;
         }
@@ -145,14 +176,18 @@ final class LogWindowCount {
         if (seconds != null) {
             long inside = 0L;
             for (Map.Entry<Long, Long> second : seconds.entrySet()) {
-                if (second.getKey() >= start.getEpochSecond()) {
+                if (second.getKey() >= start.getEpochSecond() && second.getKey() <= end.getEpochSecond()) {
                     inside += second.getValue();
                 }
             }
             return inside;
         }
-        // No usable per-second counts: the whole interval, if it is inside.
-        return before != null && !before.sampleTime().isBefore(start) ? row.matchCount() : null;
+        // No usable per-second counts: the whole interval, from the previous row to this one.
+        if (before != null && !before.sampleTime().isBefore(end)) {
+            return 0L; // wholly after the window
+        }
+        boolean inside = before != null && !before.sampleTime().isBefore(start) && !row.sampleTime().isAfter(end);
+        return inside ? row.matchCount() : null;
     }
 
     /** @return the row's per-second counts, or {@code null} when absent, unreadable or not adding up to its count */
