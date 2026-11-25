@@ -44,6 +44,14 @@ public final class LogMatchCounter {
      */
     public static final int MAX_OCCURRENCES = 100;
 
+    /**
+     * Most distinct seconds a pending tally keeps per-second counts for. A
+     * collector interval needs at most one per second; only counts held back
+     * by failed writes for over an hour go past it, and then the tally keeps
+     * its total alone, so its row is judged by its whole interval.
+     */
+    public static final int MAX_SECONDS = 3_600;
+
     /** Longest message, and longest logger name, kept in a matched line. */
     public static final int MAX_SAMPLE_CHARS = 1000;
 
@@ -52,7 +60,8 @@ public final class LogMatchCounter {
      * when a pattern check timed out; {@code occurrences} and {@code overflow}
      * are filled only for each-occurrence notifications. {@code seconds} holds
      * the count per epoch second of the lines' own time, in order, and adds up
-     * to {@code count}.
+     * to {@code count}; it is {@code null} when the lines spread over more than
+     * {@link #MAX_SECONDS} seconds.
      */
     public record Drained(long count, List<MatchedLine> samples, boolean complete, List<MatchedLine> occurrences,
             long overflow, SortedMap<Long, Long> seconds) {
@@ -246,16 +255,19 @@ public final class LogMatchCounter {
         /** Oldest first; the first {@link #MAX_OCCURRENCES} since the last drain. */
         private final List<MatchedLine> occurrences = new ArrayList<>();
         /**
-         * Matches per epoch second of the lines' time. One entry per second
-         * with a match, so a collector interval holds at most that many; after
-         * failed writes it grows by at most one entry per second until a write
-         * succeeds.
+         * Matches per epoch second of the lines' time, one entry per second
+         * with a match, at most {@link #MAX_SECONDS} of them; past that it is
+         * emptied and {@link #secondsDropped} is set until the next drain.
          */
         private final TreeMap<Long, Long> seconds = new TreeMap<>();
+        private boolean secondsDropped;
 
         synchronized void add(MatchedLine sample, int keep, MatchedLine occurrence, long timeMillis) {
             count++;
-            seconds.merge(Math.floorDiv(timeMillis, 1000L), 1L, Long::sum);
+            if (!secondsDropped) {
+                seconds.merge(Math.floorDiv(timeMillis, 1000L), 1L, Long::sum);
+                capSeconds();
+            }
             if (sample != null && keep > 0) {
                 while (samples.size() >= keep) {
                     samples.removeFirst();
@@ -264,6 +276,13 @@ public final class LogMatchCounter {
             }
             if (occurrence != null) {
                 keepOccurrence(occurrence);
+            }
+        }
+
+        private void capSeconds() {
+            if (seconds.size() > MAX_SECONDS) {
+                seconds.clear();
+                secondsDropped = true;
             }
         }
 
@@ -288,13 +307,14 @@ public final class LogMatchCounter {
 
         synchronized Drained drain() {
             Drained drained = new Drained(count, List.copyOf(samples), !missed, List.copyOf(occurrences), overflow,
-                    new TreeMap<>(seconds));
+                    secondsDropped ? null : new TreeMap<>(seconds));
             count = 0;
             missed = false;
             overflow = 0;
             samples.clear();
             occurrences.clear();
             seconds.clear();
+            secondsDropped = false;
             return drained;
         }
 
@@ -302,7 +322,13 @@ public final class LogMatchCounter {
         synchronized void recredit(Drained back, int keep) {
             count += back.count();
             missed |= !back.complete();
-            back.seconds().forEach((second, matches) -> seconds.merge(second, matches, Long::sum));
+            if (back.seconds() == null) {
+                seconds.clear();
+                secondsDropped = true;
+            } else if (!secondsDropped) {
+                back.seconds().forEach((second, matches) -> seconds.merge(second, matches, Long::sum));
+                capSeconds();
+            }
             List<MatchedLine> merged = new ArrayList<>(back.samples());
             merged.addAll(samples);
             samples.clear();

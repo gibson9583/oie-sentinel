@@ -27,8 +27,9 @@ import java.time.Instant;
  * @param secondCounts the matches per second of the lines' own time, as a
  *                    JSON object of epoch second to count, for example
  *                    {@code {"1764072000":3}}; only seconds with matches.
- *                    {@code null} when the count is zero, and for rows
- *                    written before schema v15
+ *                    {@code null} when the count is zero, when the lines
+ *                    fall in more than 3,600 seconds, and for rows written
+ *                    before schema v15
  */
 public record MatchSample(Long id, String nodeId, int monitorId, String channelId, Instant sampleTime,
         long matchCount, String samplesJson, boolean complete, String secondCounts) {

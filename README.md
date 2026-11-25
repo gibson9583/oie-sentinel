@@ -104,10 +104,12 @@ or fire an "at most" monitor. If the engine database can't be written, the count
 are written once it can.
 
 Each row also keeps how many lines matched in each second, so a window is judged to the second: a
-line logged before the window starts doesn't count, also when its row was written late. A count is
-also incomplete until there are rows for the whole window, from its start to now with no gap longer
-than two collector intervals. Missing rows never count as no matches, and a new, just saved or just
-enabled "at most" monitor can't fire until it has counted for a full window.
+line logged before the window starts doesn't count, also when its row was written late. If writes
+fail for so long that one row's lines fall in more than 3,600 different seconds, that row keeps only
+its total, and a window that starts inside its interval is incomplete. A count is also incomplete
+until there are rows for the whole window, from its start to now with no gap longer than two
+collector intervals. Missing rows never count as no matches, and a new, just saved or just enabled
+"at most" monitor can't fire until it has counted for a full window.
 
 The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
 any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log

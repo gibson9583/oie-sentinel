@@ -25,10 +25,11 @@ import org.openintegrationengine.plugins.sentinel.server.util.Json;
  * every line in it is older than the row. Rows written since schema v15 carry
  * their count per second of the lines' own time, so only lines whose second
  * is at or after the window's first second are counted, however late the row
- * was written. A row from before v15 has no per-second counts: it is counted
- * only when the node's previous row is inside the window too, so all of its
- * lines are; otherwise it is left out and the window is incomplete. A row
- * without matches needs neither.</p>
+ * was written. A row without per-second counts (written before v15, or one
+ * whose lines fall in more than {@code LogMatchCounter.MAX_SECONDS} seconds
+ * after long failed writes) is counted only when the node's previous row is
+ * inside the window too, so all of its lines are; otherwise it is left out and
+ * the window is incomplete. A row without matches needs neither.</p>
  *
  * <p>A low count is evidence only when every node that was counting watched
  * the whole window. The nodes expected are those with a row in the window or

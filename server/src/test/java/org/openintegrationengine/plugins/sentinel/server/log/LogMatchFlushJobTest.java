@@ -445,6 +445,34 @@ class LogMatchFlushJobTest {
     }
 
     @Test
+    void aRowWithMoreThan3600SecondsOfMatchesIsWrittenWithoutPerSecondCounts() throws Exception {
+        counting();
+        Monitor monitor = database.logMonitor("errors", "{}");
+        flush();
+        long start = System.currentTimeMillis() - 4_000_000L;
+        for (int second = 0; second < 3_600; second++) {
+            matched(Level.ERROR, "x", "at the cap", start + second * 1_000L);
+        }
+        flush();
+        for (int second = 0; second <= 3_600; second++) {
+            matched(Level.ERROR, "x", "over the cap", start + second * 1_000L);
+        }
+        flush();
+        assertEquals(List.of(0L, 3_600L, 3_601L), counts(rows(monitor)));
+        List<String> stored = new ArrayList<>();
+        try (Connection connection = database.connection(); Statement sql = connection.createStatement();
+                ResultSet result = sql.executeQuery("SELECT second_counts FROM sentinel_match_sample WHERE monitor_id = "
+                        + monitor.getId() + " ORDER BY sample_time, id")) {
+            while (result.next()) {
+                stored.add(result.getString(1));
+            }
+        }
+        assertNull(stored.get(0), "nothing matched");
+        assertEquals(3_600, Json.mapper().readTree(stored.get(1)).size());
+        assertNull(stored.get(2), "past the cap only the total is kept");
+    }
+
+    @Test
     void aLineOlderThanTheWindowDoesNotCountThoughItsRowWasWrittenInsideIt() throws Exception {
         database.collectorIntervalSeconds(60);
         database.setting("evaluator.interval.seconds", 30);

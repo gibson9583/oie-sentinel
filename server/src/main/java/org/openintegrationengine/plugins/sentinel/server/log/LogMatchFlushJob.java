@@ -197,9 +197,13 @@ public class LogMatchFlushJob implements Job {
         }
     }
 
-    /** @return {@code {"epochSecond": count, ...}} in second order, or {@code null} when nothing matched */
+    /**
+     * @return {@code {"epochSecond": count, ...}} in second order, or
+     *         {@code null} when nothing matched or the tally kept no per-second
+     *         counts (more than {@link LogMatchCounter#MAX_SECONDS} seconds)
+     */
     static String secondCountsJson(SortedMap<Long, Long> seconds) {
-        if (seconds.isEmpty()) {
+        if (seconds == null || seconds.isEmpty()) {
             return null;
         }
         ObjectNode counts = Json.mapper().createObjectNode();

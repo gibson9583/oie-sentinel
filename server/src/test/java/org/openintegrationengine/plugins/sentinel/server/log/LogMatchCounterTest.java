@@ -85,6 +85,49 @@ class LogMatchCounterTest {
     }
 
     @Test
+    void aTallyKeepsPerSecondCountsUpTo3600SecondsAndOnlyItsTotalBeyond() {
+        counter.refresh(List.of(monitor(1, "{}")));
+        for (int second = 0; second < 3_600; second++) {
+            counter.record(line(second * 1_000L, Level.ERROR, "at the cap"));
+        }
+        LogMatchCounter.Drained atCap = counter.drain().get(1);
+        assertEquals(3_600, atCap.count());
+        assertEquals(3_600, atCap.seconds().size());
+        assertEquals(3_600, LogMatchFlushJob.secondCountsJson(atCap.seconds()).split(",").length);
+
+        for (int second = 0; second <= 3_600; second++) {
+            counter.record(line(second * 1_000L, Level.ERROR, "over the cap"));
+        }
+        LogMatchCounter.Drained over = counter.drain().get(1);
+        assertEquals(3_601, over.count(), "the total is still counted");
+        assertNull(LogMatchFlushJob.secondCountsJson(over.seconds()), "written without per-second counts");
+
+        counter.record(line(5_000L, Level.ERROR, "the next interval"));
+        assertEquals(Map.of(5L, 1L), counter.drain().get(1).seconds(), "a drain starts keeping them again");
+    }
+
+    @Test
+    void aRecreditThatTakesATallyOverTheCapKeepsOnlyItsTotal() {
+        counter.refresh(List.of(monitor(1, "{}")));
+        for (int second = 0; second < 2_000; second++) {
+            counter.record(line(second * 1_000L, Level.ERROR, "failed write"));
+        }
+        LogMatchCounter.Drained failed = counter.drain().get(1);
+        for (int second = 2_000; second <= 3_600; second++) {
+            counter.record(line(second * 1_000L, Level.ERROR, "after the failed write"));
+        }
+        counter.recredit(Map.of(1, failed));
+        LogMatchCounter.Drained retried = counter.drain().get(1);
+        assertEquals(3_601, retried.count());
+        assertNull(LogMatchFlushJob.secondCountsJson(retried.seconds()));
+
+        counter.record(line(1L, Level.ERROR, "one more"));
+        counter.recredit(Map.of(1, retried));
+        assertNull(LogMatchFlushJob.secondCountsJson(counter.drain().get(1).seconds()),
+                "counts put back without per-second detail keep none");
+    }
+
+    @Test
     void refreshDecidesWhatCountsAndAConfigChangeStartsTheTallyAfresh() {
         Monitor disabled = monitor(2, "{}");
         disabled.setEnabled(false);
