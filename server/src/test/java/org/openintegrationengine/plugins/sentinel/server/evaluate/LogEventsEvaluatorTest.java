@@ -413,6 +413,19 @@ class LogEventsEvaluatorTest {
     }
 
     @Test
+    void linesLoggedBeforeTheMonitorWasSavedDoNotCountEvenInARowWrittenAfterTheSave() throws Exception {
+        Monitor monitor = database.logMonitor("errors", "{\"threshold\": 5}");
+        Instant saved = NOW.minusSeconds(100);
+        monitor.setUpdatedTime(saved.plusMillis(400));
+        // A flush that listed the monitors before the save and stamped its row after it.
+        rows(monitor, late("node-a", saved.plusSeconds(1), saved.minusSeconds(5), saved.plusMillis(200),
+                saved.plusSeconds(3)), row("node-a", NOW, 0));
+
+        assertEquals(2, value(LogEventsEvaluator.evaluate(monitor, NOW)).get("count").asLong(),
+                "the line from before the save is left out; the save's own second still counts");
+    }
+
+    @Test
     void matchesAreTheNewestTenAcrossNodesOldestFirst() throws Exception {
         Monitor monitor = database.logMonitor("errors", "{\"threshold\": 100, \"includeMatches\": true}");
         Instant t = START.plusSeconds(30);

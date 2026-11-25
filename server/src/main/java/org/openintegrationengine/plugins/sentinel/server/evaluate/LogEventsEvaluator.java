@@ -97,7 +97,12 @@ public final class LogEventsEvaluator {
         Instant end = LogWindowCount.end(rows, now, collectorSeconds);
         Instant start = end.minusSeconds(windowSeconds).truncatedTo(ChronoUnit.SECONDS);
 
-        LogWindowCount window = LogWindowCount.of(rows, start, end, now, collectorSeconds);
+        // Rows from before the save are not read, but a row written just after
+        // it can hold lines the old definition matched before it; their seconds
+        // are left out too.
+        Instant saved = monitor.getUpdatedTime();
+        Instant counted = saved != null && saved.isAfter(start) ? saved.truncatedTo(ChronoUnit.SECONDS) : start;
+        LogWindowCount window = LogWindowCount.of(rows, start, counted, end, now, collectorSeconds);
         long count = window.count();
         boolean complete = window.complete();
         ObjectNode perNode = Json.mapper().createObjectNode();
@@ -120,7 +125,7 @@ public final class LogEventsEvaluator {
             value.put("lastBreach", now.toString());
         }
         if (config.includeMatches()) {
-            value.set("matches", recentMatches(monitor.getId(), window.perNode(), start, end,
+            value.set("matches", recentMatches(monitor.getId(), window.perNode(), counted, end,
                     countedFrom(monitor, start), now));
         }
         String valueJson = Json.write(value);

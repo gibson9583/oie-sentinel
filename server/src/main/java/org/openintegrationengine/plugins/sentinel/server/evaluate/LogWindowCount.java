@@ -90,11 +90,15 @@ final class LogWindowCount {
      *                         before the window's start (or the monitor's last
      *                         save)
      * @param start            the window's first second
+     * @param counted          the first second whose lines count: the
+     *                         window's start, or the second of the monitor's
+     *                         last save when that is later
      * @param end              the window's end, from {@link #end}
      * @param now              the evaluation time
      * @param collectorSeconds the collector interval now
      */
-    static LogWindowCount of(List<MatchSample> rows, Instant start, Instant end, Instant now, int collectorSeconds) {
+    static LogWindowCount of(List<MatchSample> rows, Instant start, Instant counted, Instant end, Instant now,
+            int collectorSeconds) {
         long allowance = LogEventsEvaluator.COVERAGE_INTERVALS * (long) collectorSeconds;
         Map<String, Long> perNode = new TreeMap<>();
         long count = 0L;
@@ -114,7 +118,7 @@ final class LogWindowCount {
                 continue; // every line in it is older than the window
             }
             rowsComplete &= row.complete();
-            Long inside = linesInside(row, before, start, end);
+            Long inside = linesInside(row, before, counted, end);
             if (inside == null) {
                 rowsComplete = false;
                 inside = 0L;
