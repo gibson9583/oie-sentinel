@@ -35,6 +35,7 @@ import com.mirth.connect.server.api.MirthServlet;
 import com.mirth.connect.server.controllers.ControllerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.SentinelServicePlugin;
+import org.openintegrationengine.plugins.sentinel.server.alert.ServerAlertReach;
 import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
@@ -307,7 +308,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String createAction(String actionJson) {
         try {
-            return Json.write(ActionService.create(readBody(actionJson, Action.class), getCurrentUserId()));
+            Action action = readBody(actionJson, Action.class);
+            requireUnrestrictedForServerAlerts(action);
+            return Json.write(ActionService.create(action, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("createAction", e);
         }
@@ -323,7 +326,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String updateAction(int id, String actionJson) {
         try {
-            return Json.write(ActionService.update(id, readBody(actionJson, Action.class), getCurrentUserId()));
+            Action action = readBody(actionJson, Action.class);
+            if (doesUserHaveChannelRestrictions()) {
+                action.setId(id);
+                requireUnrestrictedForServerAlerts(ActionService.get(id), action);
+            }
+            return Json.write(ActionService.update(id, action, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("updateAction", e);
         }
@@ -336,6 +344,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String removeAction(int id) {
         try {
+            if (doesUserHaveChannelRestrictions()) {
+                requireUnrestrictedForServerAlerts(ActionService.get(id));
+            }
             ActionService.delete(id, getCurrentUserId());
             return EMPTY_JSON;
         } catch (Exception e) {
@@ -809,12 +820,14 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * {@inheritDoc}
      * <p>Exports global configuration under {@code PERMISSION_MANAGE}.
      * This is a configuration-management capability, broader than the
-     * channel-scoped monitor reads available with {@code PERMISSION_VIEW}.</p>
+     * channel-scoped monitor reads available with {@code PERMISSION_VIEW}.
+     * Log monitors read the whole engine's log, so a caller with channel
+     * restrictions gets the export without them.</p>
      */
     @Override
     public String exportConfiguration() {
         try {
-            return Json.write(ExportImportService.export());
+            return Json.write(ExportImportService.export(!doesUserHaveChannelRestrictions()));
         } catch (Exception e) {
             throw translate("exportConfiguration", e);
         }
@@ -838,6 +851,11 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
                 if (type == null || type.kind() != MonitorKind.CHANNEL) {
                     // Fail closed: an entry this check can't read is refused too.
                     requireUnrestrictedForLogMonitors();
+                }
+            }
+            if (doesUserHaveChannelRestrictions()) {
+                for (JsonNode entry : document.path("actions")) {
+                    requireUnrestrictedForServerAlerts(importedActions(entry));
                 }
             }
             if (!document.path("maintenanceWindows").isEmpty()
@@ -872,6 +890,41 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             throw apiError(Status.FORBIDDEN,
                     "Only users without channel restrictions can create or change Log monitors");
         }
+    }
+
+    /**
+     * An action that can receive Log alerts delivers server-wide data, Log
+     * problems, notifications and their matched lines, to recipients its
+     * author chooses. So, like a Log monitor, only a caller without channel
+     * restrictions may create, change, delete or import one. See
+     * {@link ServerAlertReach} for "can receive".
+     */
+    private void requireUnrestrictedForServerAlerts(Action... actions) {
+        if (!doesUserHaveChannelRestrictions()) {
+            return;
+        }
+        for (Action action : actions) {
+            if (action == null || ServerAlertReach.canReceive(action)) {
+                throw apiError(Status.FORBIDDEN, "Only users without channel restrictions can create, change or "
+                        + "delete an action that can receive Log alerts");
+            }
+        }
+    }
+
+    /**
+     * What an import action entry would write and the stored action it would
+     * replace, as the import itself binds them; an entry that can't be read is
+     * {@code null}, so the check fails closed.
+     */
+    private static Action[] importedActions(JsonNode entry) {
+        Action incoming;
+        try {
+            incoming = ExportImportService.readImportedAction(entry);
+        } catch (Exception unreadable) {
+            return new Action[] {null};
+        }
+        return incoming.getId() == null ? new Action[] {incoming}
+                : new Action[] {incoming, ActionService.get(incoming.getId())};
     }
 
     /** An import entry's type as the import itself reads it, or {@code null} when it can't be read. */

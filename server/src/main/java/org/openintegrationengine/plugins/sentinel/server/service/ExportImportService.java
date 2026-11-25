@@ -34,6 +34,7 @@ import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
+import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 
 /**
  * Renders Sentinel's whole configuration surface — monitors, alert actions,
@@ -290,7 +291,21 @@ public final class ExportImportService {
      * @return the export document, ready for {@code Json.write}
      */
     public static ObjectNode export() {
-        MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
+        return export(true);
+    }
+
+    /**
+     * {@link #export()}, with or without the monitors whose subject is the
+     * server (Log monitors). Without them, an action's MONITOR condition that
+     * names one is exported as an unresolved id, so the document never names
+     * a monitor the caller may not see.
+     */
+    public static ObjectNode export(boolean includeServerMonitors) {
+        List<Monitor> all = MonitorService.list();
+        MonitorIndex monitors = MonitorIndex.of(includeServerMonitors ? all : all.stream()
+                .filter(monitor -> monitor.getMonitorType() != null
+                        && monitor.getMonitorType().subjectType() == SubjectType.CHANNEL)
+                .toList());
 
         ObjectNode root = Json.mapper().createObjectNode();
         root.put("schemaVersion", SCHEMA_VERSION);
@@ -699,6 +714,28 @@ public final class ExportImportService {
      */
     public static Monitor readMonitor(JsonNode node) throws JsonProcessingException {
         return Json.mapper().treeToValue(node, Monitor.class);
+    }
+
+    /**
+     * Reads one action entry the way the import binds it, for the servlet's
+     * check of actions that can receive Log alerts: MONITOR condition values
+     * become the id of this server's monitor of that name (a name with no
+     * monitor stays as written), and the id is that of the stored action the
+     * entry would replace by name, or {@code null}.
+     *
+     * @throws JsonProcessingException  when the entry is not an action definition
+     * @throws IllegalArgumentException when Jackson rejects the entry outright
+     */
+    public static Action readImportedAction(JsonNode node) throws JsonProcessingException {
+        Action incoming = Json.mapper().treeToValue(node, Action.class);
+        MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
+        incoming.setConditionJson(mapMonitorConditionValues(incoming.getConditionJson(), value -> {
+            Integer id = monitors.idOf(value);
+            return id != null ? String.valueOf(id) : null;
+        }));
+        Action existing = ActionIndex.of(ActionService.list()).byName(textOrNull(node, "name"));
+        incoming.setId(existing != null ? existing.getId() : null);
+        return incoming;
     }
 
     private static String monitorReferenceProblem(JsonNode node) {
