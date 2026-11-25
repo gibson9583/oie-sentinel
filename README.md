@@ -103,6 +103,12 @@ still fire an "at least" monitor or clear an "at most" problem. It can't clear a
 or fire an "at most" monitor. If the engine database can't be written, the counts wait in memory and
 are written once it can.
 
+Each row also keeps how many lines matched in each second, so a window is judged to the second: a
+line logged before the window starts doesn't count, also when its row was written late. A count is
+also incomplete until there are rows for the whole window, from its start to now with no gap longer
+than two collector intervals. Missing rows never count as no matches, and a new or just saved
+"at most" monitor can't fire until it has counted for a full window.
+
 The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
 any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log
 capture as not counting, the queue fills, and new lines are dropped and counted.
@@ -112,10 +118,12 @@ A Log monitor watches no channel:
   included. They carry no channel id and add nothing to the Dashboard's channel badges.
 - Only users with Manage Monitoring and no channel restrictions can create, change, enable, disable,
   delete or import Log monitors. Users with channel restrictions don't see Log monitors, their
-  problems and notifications, or the log capture status on the Dashboard.
+  problems and notifications, or the log capture status on the Dashboard. They don't get Log
+  monitors in an export, and they can't create, change, delete or import an action that can receive
+  Log alerts.
 - Channel, channel group and channel tag action conditions never match them, whatever the operator.
   An action gets them through a **Monitor type** (Log lines) or **Monitor** condition, or by having
-  no channel conditions.
+  no channel conditions. An action that such an action escalates to gets its Log problems too.
 - Schedules cover them only when scoped to all channels, and only another Log monitor can suppress
   one.
 - A saved monitor can't change between Channel and Log.
@@ -124,6 +132,10 @@ A Log monitor does not count:
 - Lines logged before Sentinel starts, such as engine startup and migration errors.
 - Lines logged between saving or enabling a monitor and each node's next collector run, which is up
   to one collector interval.
+- Lines matched before the monitor was last saved. Saving a monitor starts its count afresh.
+- Lines logged by Sentinel's own threads that deliver alerts, such as the engine's error when a
+  Channel action routes to a channel that isn't deployed. A failed delivery can't raise more
+  notifications this way.
 - Lines dropped because the queue was full.
 - Lines the engine's log configuration drops: below a logger's level, or removed by the engine's own
   filter for mirth.log.
@@ -414,6 +426,13 @@ uses user IDs for any remaining attribution. Action and schedule definitions rem
 global configuration reads. **Manage Monitoring** grants global configuration authoring and export;
 **Manage Schedules** grants global schedule authoring. These management grants are broader than a
 channel-scoped monitoring view and should be assigned accordingly.
+
+With channel restrictions, Manage Monitoring doesn't reach Log data. A restricted user can't create,
+change, enable, disable, delete or import Log monitors, gets an export without them, and can't
+create, change, delete or import an action that can receive Log alerts. An action can receive them
+when its conditions let a Log monitor through (an action with no conditions does), and when such an
+action escalates to it. Actions with a channel, channel group or channel tag condition stay open to
+restricted users.
 
 Without an authorization plugin installed, the engine permits everything.
 
