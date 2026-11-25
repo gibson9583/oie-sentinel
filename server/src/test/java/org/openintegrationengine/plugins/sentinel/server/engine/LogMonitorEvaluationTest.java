@@ -11,9 +11,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -218,6 +221,25 @@ class LogMonitorEvaluationTest {
         assertEquals(AlertStatus.RESOLVED, AlertEventRepository.getAlertEvent(id).getStatus());
         assertEquals(1, events(monitor, AlertKind.PROBLEM).size());
         assertEquals(1, resolved.size());
+    }
+
+    @Test
+    void aBreachThatAdoptsTheHeldProblemAgainUpdatesItOnce() {
+        Monitor monitor = database.logMonitor("Log errors", "{\"clearMode\":\"TIMEOUT\",\"clearAfterSeconds\":600}");
+        monitor.setMinConsecutiveBreaches(2);
+        evaluate(monitor, NOW, breach(NOW));
+        evaluate(monitor, NOW.plusSeconds(60), breach(NOW.plusSeconds(60)));
+        long id = logState(monitor).getOpenAlertEventId();
+        evaluate(monitor, NOW.plusSeconds(120), ok());
+        evaluate(monitor, NOW.plusSeconds(180), breach(NOW.plusSeconds(180)));
+
+        try (MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class, CALLS_REAL_METHODS)) {
+            evaluate(monitor, NOW.plusSeconds(240), breach(NOW.plusSeconds(240)));
+            assertEquals(TriggerStatus.PROBLEM, logState(monitor).getState(), "the second breach adopts it again");
+            alerts.verify(() -> AlertEventRepository.updateAlertEventDetails(anyLong(), anyString()), times(1));
+        }
+        assertEquals(1, events(monitor, AlertKind.PROBLEM).size());
+        assertEquals(id, (long) logState(monitor).getOpenAlertEventId());
     }
 
     @Test

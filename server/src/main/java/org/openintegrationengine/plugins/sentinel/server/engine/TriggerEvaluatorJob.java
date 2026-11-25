@@ -642,7 +642,7 @@ public class TriggerEvaluatorJob implements Job {
             if (retained != null && retained.getStatus() == AlertStatus.PROBLEM) {
                 state.setState(TriggerStatus.PROBLEM);
                 state.setLastChangeTime(now);
-                LogMonitorEvaluation.addTo(monitor, state, outcome);
+                // This breach has already updated it, before the threshold.
                 stillOpenPass(monitor, state, afterCommit);
                 return;
             }
