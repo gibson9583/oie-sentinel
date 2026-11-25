@@ -144,6 +144,11 @@ A Log monitor does not count:
 - Lines the engine's log configuration drops: below a logger's level, or removed by the engine's own
   filter for mirth.log.
 
+A Log monitor does count what a channel logs while it processes an alert that a Channel action
+delivered to it. A monitor broad enough to match that channel's own errors therefore feeds itself:
+each alert makes the channel log another line, which raises another alert. Narrow the monitor with
+a logger prefix or a pattern, or give the action a **Storm control** ceiling.
+
 With **Include matched items in alerts** on, a monitor keeps up to 10 of the newest matching lines,
 each cut to 1,000 characters. They show in the Matches panel of the problem or notification, and
 actions send them: in the email body, as `matches` in the webhook, SNS and Channel payloads (the
