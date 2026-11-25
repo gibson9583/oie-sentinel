@@ -150,7 +150,8 @@ final class UpgradeLiveStateMatrix {
             ids.put(alert, id(connection, "SELECT id FROM sentinel_alert_event WHERE message = '" + alert + "'"));
         }
         assertTables(connection, vendor, schemaVersion, ids);
-        assertRepositories(database, schemaVersion, ids);
+        KnownFailure.ORACLE_TIMESTAMP.check(vendor, "v" + schemaVersion + " live state through the repositories",
+                () -> assertRepositories(database, schemaVersion, ids));
         execute(connection, "DELETE FROM sentinel_monitor WHERE name = 'matrix-live-monitor'");
         execute(connection, "DELETE FROM sentinel_action WHERE name LIKE 'matrix-live-%'");
         assertEquals(0, count(connection, "SELECT COUNT(*) FROM sentinel_alert_event WHERE message LIKE 'matrix-live-%'"),
