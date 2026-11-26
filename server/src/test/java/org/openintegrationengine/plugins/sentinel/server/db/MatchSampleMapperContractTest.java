@@ -115,6 +115,7 @@ class MatchSampleMapperContractTest {
         Configuration mapper = mapper(vendor);
         Map<String, List<String>> columns = Map.of(
                 "insertAlertEvent", List.of("monitor_id", "subject_type", "event_kind", "channel_id"),
+                "insertAlertEventInBatch", List.of("monitor_id", "subject_type", "event_kind", "channel_id"),
                 "insertTriggerState", List.of("monitor_id", "subject_type", "channel_id"));
         for (Map.Entry<String, List<String>> statement : columns.entrySet()) {
             Map<String, Object> row = new HashMap<>();

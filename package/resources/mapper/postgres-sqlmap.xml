@@ -112,6 +112,17 @@
              #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed}, #{problem_pending}, #{resolution_pending})
     </insert>
 
+    <!-- The same insert under a BATCH session, one batch per flush of Log notifications. No generated
+         keys: nothing reads a notification's id when it is written. -->
+    <insert id="insertAlertEventInBatch" parameterType="map">
+        INSERT INTO sentinel_alert_event
+            (monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
+             resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending)
+        VALUES
+            (#{monitor_id}, #{subject_type}, #{event_kind}, #{channel_id,jdbcType=VARCHAR}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
+             #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed}, #{problem_pending}, #{resolution_pending})
+    </insert>
+
     <update id="acknowledgeAlertEvent" parameterType="map">
         UPDATE sentinel_alert_event
         SET acknowledged_by = #{acknowledged_by,jdbcType=INTEGER},

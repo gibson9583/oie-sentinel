@@ -136,6 +136,24 @@ class LogMatchFlushJobTest {
                 .filter(event -> monitor.getId().equals(event.getMonitorId())).toList();
     }
 
+    /**
+     * Runs a flush that reads this monitor without a severity, so the database
+     * refuses its notification rows (the column is NOT NULL) in the middle of
+     * the batch.
+     */
+    private static void refusingNotificationsOf(Monitor refused, Runnable flush) {
+        try (MockedStatic<MonitorRepository> monitors = mockStatic(MonitorRepository.class, CALLS_REAL_METHODS)) {
+            monitors.when(() -> MonitorRepository.listMonitors(any(), any(), any(), any())).thenAnswer(call -> {
+                @SuppressWarnings("unchecked")
+                List<Monitor> listed = (List<Monitor>) call.callRealMethod();
+                listed.stream().filter(monitor -> refused.getId().equals(monitor.getId()))
+                        .forEach(monitor -> monitor.setSeverity(null));
+                return listed;
+            });
+            flush.run();
+        }
+    }
+
     private void sql(String statement) throws SQLException {
         try (Connection connection = database.connection(); Statement sql = connection.createStatement()) {
             sql.execute(statement);
@@ -288,22 +306,35 @@ class LogMatchFlushJobTest {
     }
 
     @Test
-    void aFailedNotificationWriteWritesNothingAndKeepsEverythingForTheNextFlush() {
+    void aFlushWritesItsNotificationsInOneBatchNotOneInsertEach() {
         counting();
         Monitor monitor = database.logMonitor("each", EACH_NOTIFICATION);
         flush();
         matched(Level.ERROR, "x", "first", 1L);
         matched(Level.ERROR, "x", "second", 2L);
+        matched(Level.ERROR, "x", "third", 3L);
         try (MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class, CALLS_REAL_METHODS)) {
-            alerts.when(() -> AlertEventRepository.insertAlertEvent(any()))
-                    .thenCallRealMethod().thenThrow(new IllegalStateException("database unavailable"));
             flush();
+            alerts.verify(() -> AlertEventRepository.insertAlertEvent(any()), never());
         }
-        assertEquals(List.of(), notifications(monitor), "the first insert rolled back with the second");
+        assertEquals(3, notifications(monitor).size());
+    }
+
+    @Test
+    void aFailedNotificationWriteWritesNothingAndKeepsEverythingForTheNextFlush() {
+        counting();
+        Monitor monitor = database.logMonitor("each", EACH_NOTIFICATION);
+        Monitor refused = database.logMonitor("refused", EACH_NOTIFICATION);
+        flush();
+        matched(Level.ERROR, "x", "first", 1L);
+        matched(Level.ERROR, "x", "second", 2L);
+        refusingNotificationsOf(refused, this::flush);
+        assertEquals(List.of(), notifications(monitor), "the batch rolled back with the refused rows");
         assertEquals(List.of(0L), counts(rows(monitor)), "no counts without their notifications");
 
         flush();
         assertEquals(2, notifications(monitor).size());
+        assertEquals(2, notifications(refused).size());
         assertEquals(List.of(0L, 2L), counts(rows(monitor)));
     }
 
@@ -363,11 +394,7 @@ class LogMatchFlushJobTest {
         flush();
         droppedOneOf101();
 
-        try (MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class, CALLS_REAL_METHODS)) {
-            alerts.when(() -> AlertEventRepository.insertAlertEvent(any()))
-                    .thenThrow(new IllegalStateException("database unavailable"));
-            flush();
-        }
+        refusingNotificationsOf(monitor, this::flush);
         flush();
         assertEquals(List.of(0L, 0L, 100L), counts(rows(monitor)), "101 lines, one dropped");
         assertEquals(List.of(false, true, false), completes(rows(monitor)));
@@ -615,11 +642,7 @@ class LogMatchFlushJobTest {
         start();
         flush();
         matched(Level.ERROR, "x", "matched before the stop", 1L);
-        try (MockedStatic<AlertEventRepository> alerts = mockStatic(AlertEventRepository.class, CALLS_REAL_METHODS)) {
-            alerts.when(() -> AlertEventRepository.insertAlertEvent(any()))
-                    .thenThrow(new IllegalStateException("database unavailable"));
-            assertDoesNotThrow(pipeline::stop);
-        }
+        refusingNotificationsOf(monitor, () -> assertDoesNotThrow(pipeline::stop));
         assertEquals(List.of(0L), counts(rows(monitor)), "no counts without their notifications");
         assertEquals(List.of(), notifications(monitor));
         assertTrue(pipeline.counter().drain().isEmpty());

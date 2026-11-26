@@ -98,6 +98,25 @@ public final class AlertEventRepository {
         }
     }
 
+    /**
+     * Inserts several alert events in one JDBC batch, all or nothing, with no
+     * leadership fence (see {@link BatchInsert}). Their ids are not read back.
+     *
+     * @throws RepositoryException on persistence failure, not logged here
+     */
+    public static void insertAlertEvents(List<AlertEvent> events) {
+        if (events == null || events.isEmpty()) {
+            return;
+        }
+        try {
+            List<Map<String, Object>> rows = new ArrayList<>(events.size());
+            for (AlertEvent event : events) rows.add(toColumnMap(event));
+            BatchInsert.run(stmt("insertAlertEventInBatch"), rows, LeaseFence.unmanaged(), "alert event batch");
+        } catch (Exception e) {
+            throw new RepositoryException(e);
+        }
+    }
+
     /** Replaces an open problem's details; a resolved row is left as it is. */
     public static boolean updateAlertEventDetails(long id, String detailsJson) {
         try {

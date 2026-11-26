@@ -12,7 +12,6 @@ import java.util.List;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
@@ -81,11 +80,9 @@ public final class LogNotifications {
         return events;
     }
 
-    /** All or nothing, without a leadership fence: each node writes only its own new rows. */
+    /** One batch, all or nothing, without a leadership fence: each node writes only its own new rows. */
     static void insert(List<AlertEvent> events) {
-        if (!events.isEmpty()) {
-            AlertLifecycleTransaction.execute(afterCommit -> events.forEach(AlertEventRepository::insertAlertEvent));
-        }
+        AlertEventRepository.insertAlertEvents(events);
     }
 
     /** The message column is VARCHAR(1024). */
