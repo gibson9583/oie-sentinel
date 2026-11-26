@@ -115,8 +115,8 @@ export function MatchesPanel({ details }) {
             <div className="sn-tile-label" style={{ margin: '12px 0 2px' }}>Matched lines</div>
             {matches === null ? (
                 <div className="sn-hint">
-                    This monitor does not include matched items. Turn on Include matched items in alerts
-                    on the monitor to see them.
+                    No matched lines were kept for this alert. A monitor keeps them only while Include matched
+                    items in alerts is on.
                 </div>
             ) : matches.length === 0 ? (
                 <div className="sn-hint">No matched lines were kept.</div>

@@ -42,12 +42,28 @@ test('the Matches panel shows condition, count, window, nodes, last breach and t
     assert.equal(html.includes('<img') || html.includes('<b>'), false);
 
     const { matches, ...withoutMatches } = details;
-    assert.match(textOf(problems.MatchesPanel({ details: withoutMatches })), /does not include matched items/);
+    assert.match(textOf(problems.MatchesPanel({ details: withoutMatches })), /No matched lines were kept for this alert/);
     assert.match(textOf(problems.MatchesPanel({ details: { ...details, matches: [] } })), /No matched lines were kept/);
     const each = textOf(problems.MatchesPanel({ details: { condition: 'EACH', count: 1, node: 'node-a' } }));
     assert.match(each, /Each occurrence/);
     assert.match(each, /node-a/);
     assert.doesNotMatch(each, /in the last/, 'an each-occurrence notification has no window');
+});
+
+test('the Matches panel never says the option is off when it cannot know', () => {
+    // The summary notification for occurrences past the cap keeps no lines, whatever the option.
+    const summary = { condition: 'EACH', count: 3, node: 'node-a', notSentIndividually: 3 };
+    const shown = textOf(problems.MatchesPanel({ details: summary }));
+    assert.match(shown, /No matched lines were kept for this alert/);
+    assert.doesNotMatch(shown, /does not include/);
+
+    // A deleted monitor: the server strips the lines, and the detail has no monitor type.
+    const deleted = { ...logEvent, detailsJson: JSON.stringify({ condition: 'AT_LEAST', count: 4, threshold: 2 }) };
+    const fromDeleted = problems.matchDetailsOf(deleted, null);
+    assert.equal(fromDeleted.count, 4, 'still read as a Log alert');
+    const text = textOf(problems.MatchesPanel({ details: fromDeleted }));
+    assert.match(text, /No matched lines were kept for this alert/);
+    assert.doesNotMatch(text, /does not include/);
 });
 
 test('a Log problem shows "Log" in the Problems grid and detail and on the Dashboard, never "Server"', () => {
