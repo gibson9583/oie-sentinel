@@ -61,22 +61,24 @@ immediately.
 ### Log monitors watch the engine log
 
 The monitor editor asks for the kind first: **Channel** for the seven channel types above, or
-**Log** for the Log lines type. A Log monitor fires on each matching line, on at least N matching
-lines within a window (too many), or on at most N within a window (too few, such as a missing
-heartbeat). Actions send its notifications and problems alike, except that an action whose mode is
-**On resolve** never gets a notification.
+**Log** for the Log lines type. A Log monitor's condition is **Each occurrence** (each matching
+line), **At least** N matching lines within a window (too many), or **At most** N within a window
+(too few, such as a missing heartbeat). Its result is a notification or a problem. Actions send
+both, except that an action set to **On resolve**, which sends only when a problem resolves, never
+gets a notification.
 
 A notification is a one-off entry in the **Notifications** tab. It can't be acknowledged or
-resolved. With each occurrence as the condition, every matching line gets its own notification, up
-to 100 per monitor on each node in each collector interval, and one summary notification covers the
-rest.
+resolved. With **Each occurrence**, every matching line gets its own notification, up to 100 per
+monitor on each node in each collector interval, and one summary notification covers the rest.
 
-A problem stays open in the Problems tab until it clears. **Clears** in the editor picks one way:
-when the condition goes away (the default), only when a person resolves it, or after a set time
-(**Clear after**, counted from the last evaluation at which the condition was true, even when it
-went away sooner). A person can resolve any problem by hand. Lines that match while it is open are
-added to it. With each occurrence as the condition, a problem opens when at least one matching line
-is within the window.
+A problem stays open in the Problems tab until it clears the way the editor's **Clears** setting
+says: **When the condition goes away** (the default), **When a person resolves it**, or **After a
+set time**. After a set time clears it once **Clear after** seconds have passed since the last
+evaluation at which the condition was true, even if the condition went away earlier. In every mode a
+person can also resolve a problem by hand. Lines that match while it is open are added to it.
+**Each occurrence** with a problem as the result works as at least 1 within the window: the problem
+opens on a matching line, and with When the condition goes away it clears once the window has
+none.
 
 For example, a heartbeat monitor opens a problem when no line matching `HEARTBEAT` arrives in 10
 minutes (at most 0) and clears when one does. A deploy monitor sends a notification for each line
@@ -114,15 +116,15 @@ written late. If the engine database can't be written for so long that one row's
 more than 3,600 different seconds, that row keeps only its line count, and a window that starts
 within the period that row covers is incomplete.
 
-A window is the latest stretch of its length that has been counted. A count row is written up to
-one collector interval after the lines in it were logged, so a window ends where the newest rows
-end, up to one collector interval before the evaluation. A line logged just before one evaluation
-is counted by a later one.
+A 10-minute window covers the latest 10 minutes that have been counted. Each count row is written
+up to one collector interval after its lines were logged, so a window ends at the newest written
+rows, which can be up to one collector interval before the evaluation. A line logged just before an
+evaluation is counted at a later evaluation.
 
-A window is also incomplete until count rows cover all of it, from its start to now, with no gap
-longer than two collector intervals. An incomplete window works as described above. So a monitor
-that was just saved or enabled can't fire an "at most" condition until it has counted for a full
-window.
+A window is also incomplete until count rows cover all of it with no gap longer than two collector
+intervals, and while a node's newest row is more than two collector intervals old. An incomplete
+window works as described above. So a monitor that was just saved or enabled can't fire an "at
+most" condition until it has counted for a full window.
 
 The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
 any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log
@@ -168,10 +170,10 @@ retention, and with the problem or notification, kept for the **Resolved alert r
 the option off hides them in the UI and in what actions send, and the stored copies stay until
 retention removes them. The option is off by default.
 
-Matched lines are the engine's log text as it was logged, cut to length and otherwise unchanged. A
-script or connector that logs message content puts that content in them. Sentinel doesn't filter or
-mask it, and actions send it to their recipients, `${matches}` in an email subject included (there,
-line breaks and other control characters become spaces).
+Matched lines are the engine's log text, cut to 1,000 characters and otherwise unchanged. If a
+script or connector logs message content, that content appears in the matched lines. Sentinel
+doesn't filter or mask them. Actions send them to their recipients, including through `${matches}`
+in an email subject, where line breaks and other control characters become spaces.
 
 **Problems**
 - Problem list with server-side filtering/paging, bulk acknowledge, and a detail pane with the
