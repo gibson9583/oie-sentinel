@@ -64,7 +64,9 @@ function NotificationTable({ items, monitorNames, channelNames, onOpen }) {
             </thead>
             <tbody>
                 {items.map((n) => (
-                    <tr key={n.id} className="sn-row-link" tabIndex={0} title="Show details"
+                    <tr key={n.id} className="sn-row-link" tabIndex={0} title="Show details" role="button"
+                        aria-label={`Show details of the notification at ${fmtTime(n.openedTime)} from `
+                            + `${monitorNames[n.monitorId] || `monitor #${n.monitorId}`}`}
                         onClick={() => onOpen(n)} onKeyDown={(e) => openOnKey(e, () => onOpen(n))}>
                         <td title={fmtAgo(n.openedTime)}>{fmtTime(n.openedTime)}</td>
                         <td>{monitorNames[n.monitorId] || `#${n.monitorId}`}</td>

@@ -2,7 +2,7 @@
 // Published under the terms of the Mozilla Public License 2.0.
 //
 // A saved monitor's alerting history under its editor. Moved out of
-// monitors.jsx unchanged.
+// monitors.jsx.
 
 import { platform } from '@oie/web-shell';
 import {

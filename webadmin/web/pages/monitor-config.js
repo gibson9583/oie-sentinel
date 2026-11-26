@@ -3,7 +3,7 @@
 //
 // Monitor config state: the state lists the channel types match, and the
 // conversion between a monitor's configJson and the editor's per-type state.
-// Moved out of monitors.jsx unchanged; the Log type's rules live in
+// Moved out of monitors.jsx; the Log type's rules live in
 // log-monitor-fields.jsx.
 
 import { MONITOR_TYPE_ORDER, MONITOR_TYPE_META } from '../ui.jsx';
@@ -50,7 +50,7 @@ export function stateLabel(s) {
 /* ---- config seeding / building ------------------------------------------ */
 
 /** Numbers become strings so they can live in controlled inputs. */
-export function editableConfig(cfg) {
+function editableConfig(cfg) {
     const out = {};
     for (const k of Object.keys(cfg || {})) {
         const v = cfg[k];

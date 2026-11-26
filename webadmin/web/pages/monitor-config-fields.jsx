@@ -2,8 +2,8 @@
 // Published under the terms of the Mozilla Public License 2.0.
 //
 // The per-type settings fieldsets of the monitor editor, matching the
-// server's config shapes. Moved out of monitors.jsx unchanged; the Log type's
-// fields live in log-monitor-fields.jsx.
+// server's config shapes. Moved out of monitors.jsx; the Log type's fields
+// live in log-monitor-fields.jsx.
 
 import { platform } from '@oie/web-shell';
 import {

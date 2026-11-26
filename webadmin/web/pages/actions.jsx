@@ -184,9 +184,10 @@ function SectionLabel({ children }) {
 
 /* ---- template token chips ------------------------------------------------ */
 
-/* ${var} tokens the EMAIL subject template substitutes — exactly the set
-   EmailAlertSender.render() replaces. Anything else is left verbatim in the
-   sent subject, so the chips offer only these. ${matches} holds a Log
+/* ${var} tokens the EMAIL subject template substitutes, as
+   EmailAlertSender.render() replaces them; it also replaces ${runbookUrl},
+   which has no chip. Anything else is left verbatim in the sent subject, so
+   the chips offer only tokens it replaces. ${matches} holds a Log
    alert's matched lines when its monitor includes them, and is empty for
    every other alert. */
 const EMAIL_SUBJECT_TOKENS = ['monitorName', 'channelName', 'severity', 'status', 'message', 'matches'];

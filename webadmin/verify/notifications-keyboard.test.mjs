@@ -25,6 +25,8 @@ test('a notification row is focusable and opens with Enter or Space', async () =
         onOpen: (n) => opened.push(n) }));
     const row = table.find((n) => n.type === 'tr' && n.props.onClick);
     assert.equal(row.props.tabIndex, 0, 'reachable with Tab');
+    assert.equal(row.props.role, 'button', 'announced as something to press');
+    assert.match(row.props['aria-label'], /^Show details of the notification at .+ from Deploys$/);
     assert.match(String(row.props.className), /\bsn-row-link\b/);
     let prevented = 0;
     for (const key of ['Enter', ' ', 'a', 'Tab']) {

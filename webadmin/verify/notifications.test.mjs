@@ -83,3 +83,54 @@ test('the Notifications list filters by monitor and date and shows its detail as
     assert.equal(html.split('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &lt;b&gt;x&lt;/b&gt;').length - 1, 3,
         'the message and the matched line in the detail, the message in the list');
 });
+
+test('the Notifications list pages through the results 25 at a time', () => {
+    const items = (n) => Array.from({ length: n }, (_, i) => ({ ...note, id: 100 + i }));
+    const state = [];
+    /* Keeps the page's own state across renders; each render gets fresh list, monitors and channels results. */
+    const render = (shown, total) => {
+        const results = [{ data: { items: items(shown), total }, error: null, loading: false },
+            { data: [], error: null, loading: false }, { data: [], error: null, loading: false }];
+        let k = 0;
+        const original = React.useState;
+        React.useState = (init) => {
+            if (init && typeof init === 'object' && 'loading' in init) return [results.shift(), () => {}];
+            const i = k++;
+            if (!(i in state)) state[i] = typeof init === 'function' ? init() : init;
+            return [state[i], (v) => { state[i] = typeof v === 'function' ? v(state[i]) : v; }];
+        };
+        try {
+            return nodes(mod.NotificationsPage());
+        } finally {
+            React.useState = original;
+        }
+    };
+    const button = (tree, label) => tree.find((n) => n.type === 'button' && nodes(n.children).includes(label));
+    const range = (tree) => tree.find((n) => n.type === 'span' && /of \d+$/.test(nodes(n.children).join('')));
+
+    let tree = render(25, 60);
+    assert.equal(nodes(range(tree).children).join(''), '1-25 of 60');
+    assert.equal(button(tree, '‹ Prev').props.disabled, true);
+    assert.equal(button(tree, 'Next ›').props.disabled, false);
+    button(tree, 'Next ›').props.onClick();
+
+    tree = render(25, 60);
+    assert.equal(nodes(range(tree).children).join(''), '26-50 of 60');
+    assert.equal(button(tree, '‹ Prev').props.disabled, false);
+    button(tree, 'Next ›').props.onClick();
+
+    tree = render(10, 60);
+    assert.equal(nodes(range(tree).children).join(''), '51-60 of 60');
+    assert.equal(button(tree, 'Next ›').props.disabled, true, 'no page after the last');
+    button(tree, '‹ Prev').props.onClick();
+    tree = render(25, 60);
+    assert.equal(nodes(range(tree).children).join(''), '26-50 of 60');
+
+    tree.find((n) => n.type === 'select').props.onChange({ target: { value: '7' } });
+    tree = render(5, 5);
+    assert.equal(nodes(range(tree).children).join(''), '1-5 of 5', 'a filter change goes back to the first page');
+    assert.equal(button(tree, 'Next ›').props.disabled, true);
+
+    tree = render(0, 0);
+    assert.equal(nodes(range(tree).children).join(''), '0 of 0');
+});
