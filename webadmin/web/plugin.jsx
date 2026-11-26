@@ -12,6 +12,7 @@ import { canManage, canManageSettings } from './ui.jsx';
 import { INTENT_KEY, clearIntent, readIntent, registerHostSurfaces } from './host.jsx';
 import { DashboardPage } from './pages/dashboard.jsx';
 import { ProblemsPage } from './pages/problems.jsx';
+import { NotificationsPage } from './pages/notifications.jsx';
 import { MonitorsPage } from './pages/monitors.jsx';
 import { ActionsPage } from './pages/actions.jsx';
 import { MaintenancePage } from './pages/maintenance.jsx';
@@ -67,6 +68,10 @@ const SENTINEL_CSS = `
 /* Empty state for lists. */
 .sn-view .sn-empty { color: var(--text-dim); padding: 18px 0; text-align: center; }
 
+/* A table row that opens a detail, by click or by Enter/Space once focused. */
+.sn-view .sn-row-link { cursor: pointer; }
+.sn-view .sn-row-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; box-shadow: inset 0 0 0 2px var(--accent); }
+
 /* Open-problem row tint (Problems / Recent problems tables). */
 .sn-view table.dt tbody tr.sn-problem,
 .sn-view table.dt tbody tr.sn-problem:hover {
@@ -78,6 +83,7 @@ const SENTINEL_CSS = `
 const TABS = [
     { key: 'dashboard', label: 'Dashboard', component: DashboardPage },
     { key: 'problems', label: 'Problems', component: ProblemsPage },
+    { key: 'notifications', label: 'Notifications', component: NotificationsPage },
     { key: 'monitors', label: 'Monitors', component: MonitorsPage },
     { key: 'actions', label: 'Actions', component: ActionsPage },
     { key: 'schedules', label: 'Schedules', component: MaintenancePage },

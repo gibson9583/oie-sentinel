@@ -32,6 +32,7 @@ public class DashboardSummary {
     private Instant lastCollectorRun;
     private Instant lastEvaluatorRun;
     private Instant lastConnectorEvent;
+    private LogPipelineStatus logPipeline;
 
     public DashboardSummary() {
     }
@@ -199,5 +200,20 @@ public class DashboardSummary {
      */
     public void setLastConnectorEvent(Instant lastConnectorEvent) {
         this.lastConnectorEvent = lastConnectorEvent;
+    }
+
+    /**
+     * @return the serving node's log capture for Log monitors, or {@code null}
+     *         for a channel-restricted caller
+     */
+    public LogPipelineStatus getLogPipeline() {
+        return logPipeline;
+    }
+
+    /**
+     * @param logPipeline the serving node's log capture status
+     */
+    public void setLogPipeline(LogPipelineStatus logPipeline) {
+        this.logPipeline = logPipeline;
     }
 }

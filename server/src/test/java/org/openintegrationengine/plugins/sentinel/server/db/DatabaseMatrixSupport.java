@@ -8,6 +8,7 @@ package org.openintegrationengine.plugins.sentinel.server.db;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -51,7 +52,7 @@ final class DatabaseMatrixSupport {
         void run(VersionState schemaVersion) throws Exception;
     }
 
-    private record VersionState(AtomicReference<String> value, AtomicInteger writes) {
+    private record VersionState(AtomicReference<String> value, AtomicInteger writes, List<String> history) {
         String get() {
             return value.get();
         }
@@ -69,6 +70,7 @@ final class DatabaseMatrixSupport {
             "sentinel_action_dispatch_log",
             "sentinel_trigger_state",
             "sentinel_alert_event",
+            "sentinel_match_sample",
             "sentinel_channel_activity_trend",
             "sentinel_channel_activity_sample",
             "sentinel_connector_status_event",
@@ -97,6 +99,7 @@ final class DatabaseMatrixSupport {
 
                 if (sourceVersion > 0) {
                     insertLifecycleMarkers(connection, database.vendor(), sourceVersion);
+                    UpgradeLiveStateMatrix.insert(connection, database.vendor(), sourceVersion);
                 }
                 if (sourceVersion == 11) {
                     execute(connection, "INSERT INTO sentinel_connector_status_event "
@@ -109,6 +112,7 @@ final class DatabaseMatrixSupport {
                 migrator(connection, database.vendor()).migrate();
                 assertLatestSchema(connection, database.vendor());
                 assertEquals(String.valueOf(SentinelMigrator.LATEST_VERSION), version.get());
+                assertSubjectIdentity(connection, database.vendor());
 
                 if (sourceVersion == 11) {
                     try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
@@ -125,7 +129,17 @@ final class DatabaseMatrixSupport {
                 assertLatestSchema(connection, database.vendor());
                 assertEquals(1, version.writes().get(), database.vendor()
                         + " restart realigned the version before writing its final value");
+                // With the property gone, the first write is what detection
+                // reports, so this proves the finished schema is recognized.
+                version.clear();
+                version.history().clear();
+                migrator(connection, database.vendor()).migrate();
+                assertEquals(String.valueOf(SentinelMigrator.LATEST_VERSION), version.history().get(0),
+                        database.vendor() + " detection did not recognize the complete latest schema");
                 if (sourceVersion > 0) {
+                    // After the upgrade and both restarts: the live state is unchanged, then it is removed so the
+                    // marker row counts below stay exact.
+                    UpgradeLiveStateMatrix.verifyAndRemove(database, connection, sourceVersion);
                     assertLifecycleMarkers(connection, sourceVersion);
                 }
                 MatrixEvidenceSupport.database(connection, database.vendor(), "upgrade-from-" + sourceVersion);
@@ -401,16 +415,143 @@ final class DatabaseMatrixSupport {
         assertTrue(indexExists(connection, "sentinel_connector_status_event", "idx_sentinel_conn_node_id"), vendor + " missing connector index");
         assertTrue(indexExists(connection, "sentinel_alert_event", "idx_sentinel_alert_problem"), vendor + " missing problem outbox index");
         assertTrue(indexExists(connection, "sentinel_alert_event", "idx_sentinel_alert_resolution"), vendor + " missing resolution outbox index");
+        for (String table : new String[] {"sentinel_alert_event", "sentinel_trigger_state"}) {
+            assertTrue(columnExists(connection, table, "subject_type"), vendor + " missing " + table + ".subject_type");
+            assertEquals(DatabaseMetaData.columnNullable, nullability(connection, table, "channel_id"),
+                    vendor + " " + table + ".channel_id still rejects server-wide rows");
+        }
+        assertTrue(columnExists(connection, "sentinel_alert_event", "event_kind"), vendor + " missing alert kind");
+        assertTrue(indexExists(connection, "sentinel_alert_event", "idx_sentinel_alert_kind"), vendor + " missing kind index");
+        // SQL Server drops and recreates this index to relax channel_id.
+        assertTrue(indexExists(connection, "sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel"),
+                vendor + " lost the alert-event channel index");
+        assertTrue(indexExists(connection, "sentinel_match_sample", "idx_sentinel_match_monitor_time"),
+                vendor + " missing match sample lookup index");
+        assertTrue(indexExists(connection, "sentinel_match_sample", "idx_sentinel_match_time"),
+                vendor + " missing match sample prune index");
+        assertTrue(columnExists(connection, "sentinel_match_sample", "complete"), vendor + " missing match sample complete");
+        assertTrue(columnExists(connection, "sentinel_match_sample", "second_counts"),
+                vendor + " missing match sample per-second counts");
+    }
+
+    /**
+     * Probes the v14 identity rules with real rows: a server row with no
+     * channel and no connector is accepted in both subject tables, and the
+     * trigger-state key still rejects a duplicate channel row. On SQL Server
+     * that second half proves the recreated unique constraint exists. The probe
+     * removes its rows by deleting its monitor, which also checks the new
+     * table's cascade.
+     */
+    static void assertSubjectIdentity(Connection connection, String vendor) throws Exception {
+        execute(connection, "INSERT INTO sentinel_monitor (name, monitor_type, scope_type, config_json, created_time) "
+                + "VALUES ('matrix-subject-probe', 'LOG_EVENTS', 'ALL', '{}', CURRENT_TIMESTAMP)");
+        long monitorId;
+        try (Statement sql = connection.createStatement(); ResultSet row = sql.executeQuery(
+                "SELECT id FROM sentinel_monitor WHERE name = 'matrix-subject-probe'")) {
+            assertTrue(row.next());
+            monitorId = row.getLong(1);
+        }
+        try {
+            execute(connection, "INSERT INTO sentinel_trigger_state (monitor_id, subject_type, channel_id, metadata_id) "
+                    + "VALUES (" + monitorId + ", 'SERVER', NULL, NULL)");
+            execute(connection, "INSERT INTO sentinel_alert_event (monitor_id, subject_type, channel_id, metadata_id, "
+                    + "severity, status, message, opened_time) VALUES (" + monitorId
+                    + ", 'SERVER', NULL, NULL, 'HIGH', 'PROBLEM', 'matrix server problem', CURRENT_TIMESTAMP)");
+            execute(connection, "INSERT INTO sentinel_match_sample (node_id, monitor_id, sample_time, match_count) "
+                    + "VALUES ('matrix-node', " + monitorId + ", CURRENT_TIMESTAMP, 0)");
+            String channelRow = "INSERT INTO sentinel_trigger_state (monitor_id, subject_type, channel_id, metadata_id) "
+                    + "VALUES (" + monitorId + ", 'CHANNEL', 'matrix-unique-probe', 1)";
+            execute(connection, channelRow);
+            assertThrows(SQLException.class, () -> execute(connection, channelRow),
+                    vendor + " lost the trigger-state unique key on (monitor_id, channel_id, metadata_id)");
+        } finally {
+            execute(connection, "DELETE FROM sentinel_monitor WHERE id = " + monitorId);
+        }
+        for (String table : new String[] {"sentinel_trigger_state", "sentinel_alert_event", "sentinel_match_sample"}) {
+            try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                    "SELECT COUNT(*) FROM " + table + " WHERE monitor_id = " + monitorId)) {
+                assertTrue(rows.next());
+                assertEquals(0, rows.getInt(1), vendor + " monitor delete did not cascade to " + table);
+            }
+        }
+    }
+
+    /**
+     * Simulates v14 stopping after its riskiest committed steps: the table,
+     * one subject column and the kind column exist with nothing backfilled,
+     * trigger_state.channel_id is already relaxed, and on SQL Server the
+     * trigger-state unique constraint and the alert-event channel index are
+     * gone. The next start must rebuild exactly what is missing and leave the
+     * existing rows as channel problems.
+     */
+    static void verifyInterruptedSubjectMigration(MatrixDatabase database) throws Exception {
+        String vendor = database.vendor();
+        withVersionProperty((version) -> {
+            try (Connection connection = database.open()) {
+                resetDatabase(connection, vendor);
+                migrator(connection, vendor).migrateTo(13);
+                insertLifecycleMarkers(connection, vendor, 13);
+                try (java.io.InputStream resource = DatabaseMatrixSupport.class.getResourceAsStream(
+                        "/" + vendor + "-sentinel-v14.sql")) {
+                    assertNotNull(resource);
+                    execute(connection, new String(resource.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+                }
+                boolean oracle = "oracle".equals(vendor);
+                boolean sqlserver = "sqlserver".equals(vendor);
+                for (String column : new String[] {"subject_type", "event_kind"}) {
+                    execute(connection, "ALTER TABLE sentinel_alert_event" + (oracle || sqlserver ? " ADD " : " ADD COLUMN ")
+                            + column + " " + (oracle ? "VARCHAR2" : "VARCHAR") + "(16)");
+                }
+                if (sqlserver) {
+                    List<String> constraints = new ArrayList<>();
+                    try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                            "SELECT name FROM sys.key_constraints WHERE type = 'UQ' "
+                                    + "AND parent_object_id = OBJECT_ID(N'sentinel_trigger_state')")) {
+                        while (rows.next()) constraints.add(rows.getString(1));
+                    }
+                    assertEquals(1, constraints.size(), "v1 creates one system-named trigger-state unique constraint");
+                    execute(connection, "ALTER TABLE sentinel_trigger_state DROP CONSTRAINT [" + constraints.get(0) + "]");
+                    execute(connection, "DROP INDEX idx_sentinel_alert_event_monitor_channel ON sentinel_alert_event");
+                }
+                execute(connection, "ALTER TABLE sentinel_trigger_state " + switch (vendor) {
+                    case "derby" -> "ALTER COLUMN channel_id NULL";
+                    case "postgres" -> "ALTER COLUMN channel_id DROP NOT NULL";
+                    case "mysql" -> "MODIFY channel_id CHAR(36) NULL";
+                    case "oracle" -> "MODIFY (channel_id NULL)";
+                    case "sqlserver" -> "ALTER COLUMN channel_id CHAR(36) NULL";
+                    default -> throw new IllegalArgumentException("Unsupported matrix vendor " + vendor);
+                });
+
+                migrator(connection, vendor).migrate();
+                assertLatestSchema(connection, vendor);
+                assertSubjectIdentity(connection, vendor);
+                if (sqlserver) {
+                    try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                            "SELECT COUNT(*) FROM sys.key_constraints WHERE type = 'UQ' AND name = 'uq_sentinel_trigger_state' "
+                                    + "AND parent_object_id = OBJECT_ID(N'sentinel_trigger_state')")) {
+                        assertTrue(rows.next());
+                        assertEquals(1, rows.getInt(1), "SQL Server trigger-state unique constraint was not recreated by name");
+                    }
+                }
+                version.resetWrites();
+                migrator(connection, vendor).migrate();
+                assertEquals(1, version.writes().get(), vendor + " completed v14 was not a no-op on restart");
+                assertLifecycleMarkers(connection, 13);
+                MatrixEvidenceSupport.database(connection, vendor, "interrupted-v14");
+            }
+        });
     }
 
     private static void withVersionProperty(VersionedWork work) throws Exception {
-        VersionState version = new VersionState(new AtomicReference<>(), new AtomicInteger());
+        VersionState version = new VersionState(new AtomicReference<>(), new AtomicInteger(),
+                new java.util.concurrent.CopyOnWriteArrayList<>());
         ConfigurationController controller = mock(ConfigurationController.class);
         when(controller.getProperty(anyString(), anyString()))
                 .thenAnswer((ignored) -> version.value().get());
         doAnswer((invocation) -> {
             version.value().set(invocation.getArgument(2));
             version.writes().incrementAndGet();
+            version.history().add(invocation.getArgument(2));
             return null;
         }).when(controller).saveProperty(anyString(), anyString(), anyString());
 
@@ -450,11 +591,17 @@ final class DatabaseMatrixSupport {
         execute(connection, "INSERT INTO sentinel_monitor (name, monitor_type, scope_type, config_json, "
                 + "suppressed_by_monitor_id, created_time) SELECT 'matrix-dependent-monitor', 'INACTIVITY', "
                 + "'ALL', '{}', id, CURRENT_TIMESTAMP FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
+        // From v14 the application always writes a subject and a kind; before it the columns do not exist.
+        String subjectColumn = schemaVersion >= 14 ? ", subject_type" : "";
+        String subjectValue = schemaVersion >= 14 ? ", 'CHANNEL'" : "";
+        String kindColumn = schemaVersion >= 14 ? ", event_kind" : "";
+        String kindValue = schemaVersion >= 14 ? ", 'PROBLEM'" : "";
         execute(connection, "INSERT INTO sentinel_alert_event (monitor_id, channel_id, severity, status, "
-                + "message, opened_time) SELECT id, 'matrix-channel', 'HIGH', 'PROBLEM', "
-                + "'matrix-history-marker', CURRENT_TIMESTAMP FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
-        execute(connection, "INSERT INTO sentinel_trigger_state (monitor_id, channel_id, open_alert_event_id) "
-                + "SELECT monitor_id, channel_id, id FROM sentinel_alert_event");
+                + "message, opened_time" + subjectColumn + kindColumn + ") SELECT id, 'matrix-channel', 'HIGH', 'PROBLEM', "
+                + "'matrix-history-marker', CURRENT_TIMESTAMP" + subjectValue + kindValue
+                + " FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
+        execute(connection, "INSERT INTO sentinel_trigger_state (monitor_id, channel_id, open_alert_event_id"
+                + subjectColumn + ") SELECT monitor_id, channel_id, id" + subjectValue + " FROM sentinel_alert_event");
         execute(connection, "INSERT INTO sentinel_action (name, action_type, condition_json, config_json, created_time) "
                 + "VALUES ('matrix-action', 'EMAIL', '{}', '{}', CURRENT_TIMESTAMP)");
         execute(connection, "INSERT INTO sentinel_action_dispatch_log (alert_event_id, action_id, dispatch_time, success) "
@@ -480,6 +627,14 @@ final class DatabaseMatrixSupport {
             execute(connection, "INSERT INTO sentinel_channel_presence (channel_id, node_id, metadata_id, deployed_time) "
                     + "VALUES ('matrix-channel', 'matrix-node', 0, CURRENT_TIMESTAMP)");
         }
+        if (schemaVersion >= 14) {
+            // From v15 the application writes each row's per-second counts.
+            String secondsColumn = schemaVersion >= 15 ? ", second_counts" : "";
+            String secondsValue = schemaVersion >= 15 ? ", '{\"1788000000\":3}'" : "";
+            execute(connection, "INSERT INTO sentinel_match_sample (node_id, monitor_id, sample_time, match_count"
+                    + secondsColumn + ") SELECT 'matrix-node', id, CURRENT_TIMESTAMP, 3" + secondsValue
+                    + " FROM sentinel_monitor WHERE name = 'matrix-uninstall-marker'");
+        }
     }
 
     private static void assertLifecycleMarkers(Connection connection, int sourceVersion) throws Exception {
@@ -488,9 +643,26 @@ final class DatabaseMatrixSupport {
         for (String table : LIVE_TABLES) {
             if ("sentinel_monitor".equals(table)) continue;
             int expected = "sentinel_node_lease".equals(table) && sourceVersion < 4
-                    || "sentinel_channel_presence".equals(table) && sourceVersion < 11 ? 0
+                    || "sentinel_channel_presence".equals(table) && sourceVersion < 11
+                    || "sentinel_match_sample".equals(table) && sourceVersion < 14 ? 0
                     : "sentinel_connector_status_event".equals(table) && sourceVersion == 11 ? 2 : 1;
             assertEquals(expected, rowCount(connection, table), "Upgrade lost existing data in " + table);
+        }
+        // Every row from before v14 is a channel row, and relaxing channel_id
+        // must not have touched its value.
+        for (String table : new String[] {"sentinel_alert_event", "sentinel_trigger_state"}) {
+            try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                    "SELECT subject_type, channel_id FROM " + table)) {
+                assertTrue(rows.next(), table);
+                assertEquals("CHANNEL", rows.getString(1), "Upgrade did not classify the existing " + table + " row");
+                assertEquals("matrix-channel", rows.getString(2).trim(), "Upgrade changed the channel id in " + table);
+                assertFalse(rows.next(), table);
+            }
+        }
+        try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
+                "SELECT event_kind FROM sentinel_alert_event")) {
+            assertTrue(rows.next());
+            assertEquals("PROBLEM", rows.getString(1), "Upgrade did not classify the existing alert event");
         }
         try (Statement sql = connection.createStatement(); ResultSet rows = sql.executeQuery(
                 "SELECT COUNT(*) FROM sentinel_monitor child JOIN sentinel_monitor parent "
@@ -618,6 +790,18 @@ final class DatabaseMatrixSupport {
             }
         }
         return false;
+    }
+
+    private static int nullability(Connection connection, String table, String column) throws Exception {
+        DatabaseMetaData metadata = connection.getMetaData();
+        for (String tableName : candidates(table)) {
+            for (String columnName : candidates(column)) {
+                try (ResultSet rows = metadata.getColumns(connection.getCatalog(), null, tableName, columnName)) {
+                    if (rows.next()) return rows.getInt("NULLABLE");
+                }
+            }
+        }
+        throw new AssertionError("Missing column " + table + "." + column);
     }
 
     private static boolean indexExists(Connection connection, String table, String index)

@@ -19,9 +19,10 @@ import {
 import {
     canAcknowledge, toast, useApi, useDataTable, useUsernames, FilterBar,
     ChannelActivityPanel, DEFAULT_PROBLEM_FILTERS, SeverityChip, severityChipNode,
-    MONITOR_TYPE_META, fmtTime, fmtAgo,
+    MONITOR_TYPE_META, fmtTime, fmtAgo, isLogAlert, LOG_LABEL,
 } from '../ui.jsx';
 import { readIntent, clearIntent } from '../host.jsx';
+import { MatchesPanel, matchDetailsOf } from './matches-panel.jsx';
 
 const React = platform.React;
 const { h, modal } = platform.ui;
@@ -157,7 +158,8 @@ function buildColumns(namesRef) {
         },
         {
             key: 'channel', label: 'Channel',
-            render: (r) => namesRef.current.channels[r.channelId] || r.channelId || '—',
+            render: (r) => (isLogAlert(r) ? LOG_LABEL
+                : namesRef.current.channels[r.channelId] || r.channelId || '—'),
             sortValue: (r) => r.channelId || '',
         },
         {
@@ -651,6 +653,7 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
             : null);
 
     const parsed = detail ? parseDetails(ev.detailsJson) : null;
+    const logDetails = detail ? matchDetailsOf(ev, detail.monitorType) : null;
     const dispatches = (detail && detail.dispatches) || [];
     const typeMeta = detail && MONITOR_TYPE_META[detail.monitorType];
     const runbookUrl = (detail && detail.runbookUrl ? String(detail.runbookUrl).trim() : '') || null;
@@ -721,7 +724,7 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
                                         </DetailRow>
                                     ) : null}
                                     <DetailRow label="Channel">
-                                        {detail.channelName || ev.channelId || '—'}
+                                        {detail.channelName || (isLogAlert(ev) ? LOG_LABEL : ev.channelId) || '—'}
                                         {ev.channelId ? <span className="text-text-faint mono"> ({ev.channelId})</span> : null}
                                     </DetailRow>
                                     {ev.metadataId != null ? (
@@ -756,6 +759,8 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
                         </div>
                     </div>
 
+                    {/* A Log problem has no channel and no throughput. */}
+                    {isLogAlert(ev) ? null : (
                     <ChannelActivityPanel
                         title={`Channel activity${detail.channelName ? ` — ${detail.channelName}` : ''}`}
                         channelId={ev.channelId}
@@ -764,11 +769,14 @@ function ProblemDetailPane({ id, onBack, onChanged }) {
                         markers={activityMarkers}
                         hint={activityHint}
                         unavailable={activityUnavailable} />
+                    )}
 
                     <div className="panel mb-3">
-                        <div className="panel-header">Last Value</div>
+                        <div className="panel-header">{logDetails ? 'Matches' : 'Last Value'}</div>
                         <div className="panel-body">
-                            {parsed ? (
+                            {logDetails ? (
+                                <MatchesPanel details={logDetails} />
+                            ) : parsed ? (
                                 <table className="dt">
                                     <tbody>
                                         {Object.entries(parsed).map(([k, v]) => (

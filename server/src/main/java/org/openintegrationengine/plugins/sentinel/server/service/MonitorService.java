@@ -34,12 +34,15 @@ import org.openintegrationengine.plugins.sentinel.server.evaluate.EvaluationOutc
 import org.openintegrationengine.plugins.sentinel.server.evaluate.InactivityEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.LowVolumeEvaluator;
 import org.openintegrationengine.plugins.sentinel.server.evaluate.QueueDepthEvaluator;
+import org.openintegrationengine.plugins.sentinel.server.log.LogEventsConfig;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelTestOutcome;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorTestResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
+import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 /**
  * Business rules for monitor CRUD plus the "test this monitor" dry run.
@@ -203,7 +206,7 @@ public final class MonitorService {
     /** Import defers the audit event until its entry transaction commits. */
     static Monitor update(int id, Monitor monitor, int userId, Consumer<Runnable> afterCommit) {
         Monitor existing = get(id);
-        validate(monitor, id);
+        validate(monitor, existing);
         monitor.setId(id);
         monitor.setCreatedBy(existing.getCreatedBy());
         monitor.setCreatedTime(existing.getCreatedTime());
@@ -244,6 +247,12 @@ public final class MonitorService {
      * one mutation a NOC operator performs mid-incident, kept surgical so it
      * cannot clobber concurrent config edits.
      *
+     * <p>Enabling a disabled Log monitor also sets its updated time and user,
+     * in the same statement. Its count starts afresh from the updated time,
+     * as after a save, so rows written before it was disabled never count.
+     * Nothing else reads the updated time but the Monitors list, and export
+     * and import leave it out.</p>
+     *
      * @param id      database id
      * @param enabled the new enabled state
      * @param userId  the acting user, audited
@@ -252,7 +261,15 @@ public final class MonitorService {
      */
     public static Monitor setEnabled(int id, boolean enabled, int userId) {
         Monitor existing = get(id);
-        MonitorRepository.setMonitorEnabled(id, enabled);
+        boolean restartsCount = enabled && !existing.isEnabled() && existing.getMonitorType() != null
+                && existing.getMonitorType().kind() == MonitorKind.LOG;
+        if (restartsCount) {
+            existing.setUpdatedTime(Instant.now());
+            existing.setUpdatedBy(userId);
+            MonitorRepository.setMonitorEnabled(id, true, existing.getUpdatedTime(), userId);
+        } else {
+            MonitorRepository.setMonitorEnabled(id, enabled);
+        }
         existing.setEnabled(enabled);
         SentinelAuditLog.monitorEnabledChanged(userId, existing);
         return existing;
@@ -287,7 +304,8 @@ public final class MonitorService {
      * Dry-runs only channels the caller may read. A null set means an
      * unrestricted internal caller; an empty set means no channels. Filter
      * before evaluation so neither measurements nor per-channel errors from
-     * unauthorized channels can enter the response.
+     * unauthorized channels can enter the response. A Log monitor counts lines
+     * as they are logged, so there is nothing to preview.
      */
     public static MonitorTestResult test(Monitor monitor, Set<String> authorizedChannelIds) {
         if (monitor == null) {
@@ -295,6 +313,14 @@ public final class MonitorService {
         }
         if (monitor.getMonitorType() == null) {
             throw new IllegalArgumentException("Monitor type is required");
+        }
+        if (monitor.getMonitorType().kind() == MonitorKind.LOG) {
+            MonitorTestResult result = new MonitorTestResult();
+            result.setOk(true);
+            result.setMessage("Log monitors can't be previewed: they count lines as the engine logs them, "
+                    + "from the first collector run after the monitor is saved");
+            result.setOutcomes(List.of());
+            return result;
         }
         if (monitor.getScopeType() == null) {
             throw new IllegalArgumentException("Scope type is required");
@@ -399,11 +425,12 @@ public final class MonitorService {
      * defaulted threshold.
      *
      * @param monitor the candidate definition
-     * @param selfId  the monitor's own id on update, {@code null} on create
-     *                (used to exempt itself from the uniqueness and cycle
-     *                checks)
+     * @param existing the stored monitor on update, {@code null} on create;
+     *                 its id exempts it from the uniqueness and cycle checks,
+     *                 and its type decides which type changes are allowed
      */
-    private static void validate(Monitor monitor, Integer selfId) {
+    private static void validate(Monitor monitor, Monitor existing) {
+        Integer selfId = existing != null ? existing.getId() : null;
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
         }
@@ -422,9 +449,13 @@ public final class MonitorService {
         if (monitor.getSeverity() == null) {
             throw new IllegalArgumentException("Severity is required");
         }
+        MonitorSubjectRules.requireScope(monitor);
         if (monitor.getScopeType() != ScopeType.ALL && isBlank(monitor.getScopeId())) {
             throw new IllegalArgumentException("A scope id (channel or group) is required for "
                     + monitor.getScopeType().name() + " scope");
+        }
+        if (existing != null) {
+            MonitorSubjectRules.requireSameKind(existing, monitor);
         }
         // Normalize rather than reject: 0 is what an omitted JSON int
         // deserializes to, so treating it as "no hysteresis" (1) matches the
@@ -434,7 +465,7 @@ public final class MonitorService {
         }
         monitor.setRunbookUrl(validateRunbookUrl(monitor.getRunbookUrl()));
         validateConfig(monitor);
-        requireValidSuppression(monitor.getSuppressedByMonitorId(), selfId);
+        requireValidSuppression(monitor.getSuppressedByMonitorId(), selfId, monitor.getMonitorType());
         requireUniqueName(monitor.getName(), selfId);
     }
 
@@ -575,6 +606,11 @@ public final class MonitorService {
                 requireNonNegativeIfPresent(config, "minDurationSeconds");
                 validateDeployedStates(config);
                 break;
+            case LOG_EVENTS:
+                SentinelSettings settings = SettingsService.get();
+                LogEventsConfig.parse(config).requireWindowWithin(settings.getEvaluatorIntervalSeconds(),
+                        settings.getSampleRetentionDays());
+                break;
         }
     }
 
@@ -707,19 +743,22 @@ public final class MonitorService {
      * cycle. The cycle check walks the parent chain (not a full graph DFS —
      * each monitor has at most one parent, so the "graph" is a functional
      * chain) with a visited set so a pre-existing cycle introduced by direct
-     * DB edits cannot loop this validation forever.
+     * DB edits cannot loop this validation forever. A parent of the other
+     * subject kind is rejected too; see {@link MonitorSubjectRules}.
      */
-    private static void requireValidSuppression(Integer suppressedByMonitorId, Integer selfId) {
+    private static void requireValidSuppression(Integer suppressedByMonitorId, Integer selfId, MonitorType type) {
         if (suppressedByMonitorId == null) {
             return;
         }
         if (suppressedByMonitorId.equals(selfId)) {
             throw new IllegalArgumentException("A monitor cannot be suppressed by itself");
         }
-        if (MonitorRepository.getMonitor(suppressedByMonitorId) == null) {
+        Monitor parent = MonitorRepository.getMonitor(suppressedByMonitorId);
+        if (parent == null) {
             throw new IllegalArgumentException("Suppressing monitor " + suppressedByMonitorId
                     + " does not exist");
         }
+        MonitorSubjectRules.requireSameKindParent(type, parent);
         Set<Integer> visited = new HashSet<>();
         Integer cursor = suppressedByMonitorId;
         while (cursor != null && visited.add(cursor)) {

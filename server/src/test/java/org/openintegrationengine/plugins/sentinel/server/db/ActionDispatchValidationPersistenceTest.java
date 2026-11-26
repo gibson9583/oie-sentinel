@@ -90,9 +90,11 @@ class ActionDispatchValidationPersistenceTest {
                     }
                 }
             }
-            // These two migrations use portable Java DDL rather than shipped scripts.
+            // These migrations use portable Java DDL rather than shipped scripts.
             sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN problem_pending BOOLEAN");
             sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN resolution_pending BOOLEAN");
+            sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN subject_type VARCHAR(16)");
+            sql.execute("ALTER TABLE sentinel_alert_event ADD COLUMN event_kind VARCHAR(16)");
         }
         source = new DBCPConnectionPool(url, null, null, 1, false).getDataSource();
         pool = pool(source);

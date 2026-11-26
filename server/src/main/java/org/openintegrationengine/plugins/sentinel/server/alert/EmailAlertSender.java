@@ -5,6 +5,8 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
+import java.util.Map;
+
 import com.fasterxml.jackson.databind.JsonNode;
 
 import com.mirth.connect.server.util.ServerSMTPConnectionFactory;
@@ -30,7 +32,7 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
  * — passed straight through, because the engine's
  * {@code ServerSMTPConnection.send} splits on commas itself. The subject
  * template supports simple {@code ${var}} substitution (monitorName,
- * channelName, severity, status, message, runbookUrl); deliberately not
+ * channelName, severity, status, message, runbookUrl, matches); deliberately not
  * Velocity — alert subjects need value interpolation, not scripting, and a
  * template typo must never be able to break dispatch.</p>
  */
@@ -116,8 +118,8 @@ public final class EmailAlertSender implements AlertSender {
     }
 
     /**
-     * Substitutes the supported {@code ${var}} tokens. Plain
-     * {@code String.replace} per token: unknown tokens are left verbatim
+     * Substitutes the supported {@code ${var}} tokens. Plain substitution,
+     * no scripting: unknown tokens are left verbatim
      * (visible in the subject, so the operator notices the typo) rather than
      * throwing, because a bad template must never cost the notification.
      *
@@ -137,15 +139,21 @@ public final class EmailAlertSender implements AlertSender {
      * URL from somewhere other than a validated monitor — an import path, a
      * hand-edited row — so the token carries no special case. An absent runbook
      * substitutes to the empty string, matching every other absent value.</p>
+     *
+     * <p>{@code ${matches}} is a Log alert's matched lines on the one subject
+     * line, empty for every other alert. All tokens are substituted in one
+     * pass ({@link TemplateTokens}), so logged text that contains a token is
+     * never expanded.</p>
      */
     private static String render(String template, AlertPayload payload) {
-        return template
-                .replace("${monitorName}", AlertSender.singleLine(payload.getMonitorName()))
-                .replace("${channelName}", AlertSender.singleLine(payload.getChannelName()))
-                .replace("${severity}", payload.getSeverity() != null ? payload.getSeverity().name() : "")
-                .replace("${status}", AlertSender.singleLine(payload.getEventType()))
-                .replace("${message}", AlertSender.singleLine(payload.getMessage()))
-                .replace("${runbookUrl}", AlertSender.singleLine(payload.getRunbookUrl()));
+        return TemplateTokens.render(template, Map.of(
+                "monitorName", AlertSender.singleLine(payload.getMonitorName()),
+                "channelName", AlertSender.singleLine(payload.getChannelName()),
+                "severity", payload.getSeverity() != null ? payload.getSeverity().name() : "",
+                "status", AlertSender.singleLine(payload.getEventType()),
+                "message", AlertSender.singleLine(payload.getMessage()),
+                "runbookUrl", AlertSender.singleLine(payload.getRunbookUrl()),
+                "matches", AlertSender.singleLine(payload.matchesText())));
     }
 
     /**
@@ -162,6 +170,10 @@ public final class EmailAlertSender implements AlertSender {
      * body text, not a header, where a newline is a line break rather than a
      * structural delimiter, and mail clients linkify a bare URL on its own
      * line.</p>
+     *
+     * <p>A Log alert with matches gets a "Matches:" block after the message,
+     * whatever {@code includeDetails} says: including them is the monitor's
+     * setting. Every other alert's body is unchanged.</p>
      */
     private static String buildBody(AlertPayload payload, boolean includeDetails) {
         StringBuilder body = new StringBuilder(256);
@@ -191,6 +203,10 @@ public final class EmailAlertSender implements AlertSender {
         }
         if (payload.getMessage() != null) {
             body.append('\n').append(payload.getMessage()).append('\n');
+        }
+        String matches = payload.matchesText();
+        if (!matches.isEmpty()) {
+            body.append("\nMatches:\n").append(matches).append('\n');
         }
         if (includeDetails && payload.getValueJson() != null && !payload.getValueJson().isBlank()) {
             body.append("\nDetails:\n").append(payload.getValueJson()).append('\n');

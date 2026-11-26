@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import com.mirth.connect.server.util.SqlConfig;
 
+import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerState;
 import org.openintegrationengine.plugins.sentinel.shared.model.TriggerStatus;
 
@@ -47,7 +48,7 @@ public final class TriggerStateRepository {
 
     /**
      * Fetches the trigger state for one {@code (monitor, channel, metadata_id)}
-     * triple.
+     * triple of a {@link SubjectType#CHANNEL} subject.
      *
      * @param monitorId  id of the owning {@code sentinel_monitor}
      * @param channelId  the OIE channel id (a UUID string)
@@ -59,9 +60,29 @@ public final class TriggerStateRepository {
      * @throws RepositoryException on persistence failure
      */
     public static TriggerState getTriggerState(int monitorId, String channelId, Integer metadataId) {
+        return getTriggerState(monitorId, SubjectType.CHANNEL, channelId, metadataId);
+    }
+
+    /**
+     * Fetches the trigger state for one subject of a monitor. A {@code null}
+     * channel or metadata id matches only a row whose column is NULL, so a
+     * {@link SubjectType#SERVER} state is looked up as
+     * {@code (monitor, SERVER, null, null)} and never matches a channel row.
+     *
+     * @param monitorId   id of the owning {@code sentinel_monitor}
+     * @param subjectType what the state tracks; {@code null} means
+     *                    {@link SubjectType#CHANNEL}
+     * @param channelId   the OIE channel id, or {@code null} for a server state
+     * @param metadataId  the connector metadata id, or {@code null}
+     * @return the matching trigger state, or {@code null} if no row exists yet
+     * @throws RepositoryException on persistence failure
+     */
+    public static TriggerState getTriggerState(int monitorId, SubjectType subjectType, String channelId,
+            Integer metadataId) {
         try {
             Map<String, Object> params = new HashMap<>();
             params.put("monitorId", monitorId);
+            params.put("subjectType", SubjectType.orChannel(subjectType).name());
             params.put("channelId", channelId);
             params.put("metadataId", metadataId);
 
@@ -73,8 +94,8 @@ public final class TriggerStateRepository {
             }
             return toTriggerState(row);
         } catch (Exception e) {
-            log.error("Failed to get trigger state for monitor {}, channel {}, metadata {}",
-                    monitorId, channelId, metadataId, e);
+            log.error("Failed to get {} trigger state for monitor {}, channel {}, metadata {}",
+                    SubjectType.orChannel(subjectType), monitorId, channelId, metadataId, e);
             throw new RepositoryException(e);
         }
     }
@@ -85,6 +106,13 @@ public final class TriggerStateRepository {
      * @param triggerState the state to persist; its {@code id} field is
      *                     ignored (the database assigns it)
      * @return the same instance with {@code id} populated from the generated key
+     * <p>A server subject's row has a NULL {@code channel_id} and
+     * {@code metadata_id}. SQL Server and Oracle compare those NULLs as equal
+     * in the unique key, so they allow one such row per monitor; Derby, MySQL
+     * and PostgreSQL treat each NULL as distinct and would allow several. The
+     * leader inserts a server state only after reading none, under its fence,
+     * so there is one on every database.</p>
+     *
      * @throws RepositoryException on persistence failure, including a
      *                             unique-constraint violation on
      *                             {@code (monitor_id, channel_id, metadata_id)}
@@ -171,6 +199,7 @@ public final class TriggerStateRepository {
         Map<String, Object> params = new HashMap<>();
         params.put("id", triggerState.getId());
         params.put("monitor_id", triggerState.getMonitorId());
+        params.put("subject_type", SubjectType.orChannel(triggerState.getSubjectType()).name());
         params.put("channel_id", triggerState.getChannelId());
         params.put("metadata_id", triggerState.getMetadataId());
         params.put("state", triggerState.getState() != null ? triggerState.getState().name() : null);
@@ -186,6 +215,7 @@ public final class TriggerStateRepository {
         TriggerState triggerState = new TriggerState();
         triggerState.setId(toInteger(row.get("id")));
         triggerState.setMonitorId(toInteger(row.get("monitor_id")));
+        triggerState.setSubjectType(SubjectType.fromStored(row.get("subject_type")));
         triggerState.setChannelId((String) row.get("channel_id"));
         triggerState.setMetadataId(toInteger(row.get("metadata_id")));
 

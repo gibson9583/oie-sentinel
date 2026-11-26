@@ -174,10 +174,22 @@ public final class MonitorRepository {
      * @throws RepositoryException on persistence failure
      */
     public static void setMonitorEnabled(int id, boolean enabled) {
+        setMonitorEnabled(id, enabled, null, null);
+    }
+
+    /**
+     * Sets the enabled flag and, when {@code updatedTime} is non-null, the
+     * updated time and user too, in one statement.
+     *
+     * @throws RepositoryException on persistence failure
+     */
+    public static void setMonitorEnabled(int id, boolean enabled, Instant updatedTime, Integer updatedBy) {
         try {
             Map<String, Object> params = new HashMap<>();
             params.put("id", id);
             params.put("enabled", enabled);
+            params.put("updated_time", toTimestamp(updatedTime));
+            params.put("updated_by", updatedBy);
             SqlConfig.getInstance().getSqlSessionManager().update(stmt("setMonitorEnabled"), params);
         } catch (Exception e) {
             log.error("Failed to set enabled={} for monitor {}", enabled, id, e);

@@ -18,9 +18,13 @@ import java.util.Set;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.CollectorState;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
+import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
+import org.openintegrationengine.plugins.sentinel.server.log.LogPipeline;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelInfo;
+import org.openintegrationengine.plugins.sentinel.shared.model.LogPipelineStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
 
 /**
@@ -35,6 +39,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
  * <li>Per-channel throughput reads {@link CollectorState}'s in-memory counter
  * snapshots — zero queries.</li>
  * <li>Heartbeat ages are two {@code volatile} field reads — zero queries.</li>
+ * <li>The log pipeline series are in-memory reads of the serving node, for
+ * unrestricted callers only, as Log monitors are.</li>
  * <li>The open-problem breakdown is one {@code COUNT} per severity (five
  * total, exact). Deliberately <i>not</i> reused from {@link DashboardService},
  * whose single scan-and-group-in-Java pass is capped at its scan limit: a
@@ -105,6 +111,12 @@ public final class MetricsService {
     /** Seconds since the evaluator job last completed a tick. Gauge. */
     private static final String EVALUATOR_HEARTBEAT = "sentinel_evaluator_heartbeat_age_seconds";
 
+    private static final String LOG_QUEUE_CAPACITY = "sentinel_log_queue_capacity";
+    private static final String LOG_QUEUE_DEPTH = "sentinel_log_queue_depth";
+    private static final String LOG_LINES_DROPPED = "sentinel_log_lines_dropped_total";
+    private static final String LOG_MATCHER_ALIVE = "sentinel_log_matcher_alive";
+    private static final String LOG_APPENDER_ATTACHED = "sentinel_log_appender_attached";
+
     /**
      * Page size for the per-severity counts. Only the paged result's
      * {@code total()} is read, but the repository pairs a {@code LIMIT} query
@@ -129,6 +141,9 @@ public final class MetricsService {
         appendOpenProblems(out, visibleChannelIds);
         appendChannelThroughput(out, visibleChannelIds);
         appendHeartbeats(out, Instant.now());
+        if (visibleChannelIds == null) {
+            appendLogPipeline(out, LogPipeline.get().status(SentinelLeadership.nodeId()));
+        }
         return out.toString();
     }
 
@@ -167,6 +182,7 @@ public final class MetricsService {
     private static long countOpenProblems(Severity severity, List<String> channelIdIn) {
         AlertEventFilter filter = new AlertEventFilter();
         filter.setStatus(AlertStatus.PROBLEM);
+        filter.setKind(AlertKind.PROBLEM);
         filter.setSeverityIn(List.of(severity));
         if (channelIdIn != null) {
             filter.setChannelIdIn(channelIdIn);
@@ -292,6 +308,22 @@ public final class MetricsService {
         }
         double seconds = Math.max(0d, Duration.between(lastRun, now).toMillis() / 1000d);
         sample(out, name, labels(), String.format(Locale.ROOT, "%.3f", seconds));
+    }
+
+    /** The serving node's log queue and matcher for Log monitors, labelled by node. */
+    private static void appendLogPipeline(StringBuilder out, LogPipelineStatus status) {
+        Map<String, String> node = labels("node", status.getNodeId());
+        family(out, LOG_QUEUE_CAPACITY, "gauge", "Log lines this node queues for Log monitors before dropping.");
+        sample(out, LOG_QUEUE_CAPACITY, node, Integer.toString(status.getQueueCapacity()));
+        family(out, LOG_QUEUE_DEPTH, "gauge", "Log lines waiting for this node's matcher thread.");
+        sample(out, LOG_QUEUE_DEPTH, node, Integer.toString(status.getQueueDepth()));
+        family(out, LOG_LINES_DROPPED, "counter",
+                "Log lines dropped because the queue was full, since Sentinel started on this node.");
+        sample(out, LOG_LINES_DROPPED, node, Long.toString(status.getDroppedSinceStart()));
+        family(out, LOG_MATCHER_ALIVE, "gauge", "1 when this node's log matcher thread runs and is not stuck.");
+        sample(out, LOG_MATCHER_ALIVE, node, status.isMatcherAlive() ? "1" : "0");
+        family(out, LOG_APPENDER_ATTACHED, "gauge", "1 when Sentinel's appender is on the engine's root logger.");
+        sample(out, LOG_APPENDER_ATTACHED, node, status.isAppenderAttached() ? "1" : "0");
     }
 
     // ========== Text format ==========

@@ -6,10 +6,16 @@
 package org.openintegrationengine.plugins.sentinel.server.alert;
 
 import java.time.Instant;
-import com.fasterxml.jackson.annotation.JsonIgnore;
+import java.util.List;
+import java.util.Objects;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
@@ -48,10 +54,20 @@ public final class AlertPayload {
     private final Instant openedTime;
     private final String valueJson;
     private final String runbookUrl;
+    private final List<MatchedLines.Line> matches;
     // Internal delivery context, deliberately without a public JSON getter.
     record RollupSummary(int sent, int windowSeconds) { }
     @JsonIgnore
     private final RollupSummary rollupSummary;
+    // Not serialized, so channel alerts' JSON is unchanged; a receiver tells a
+    // Log alert by its null channel id, its "Log" channel name and monitor type.
+    @JsonIgnore
+    private final ProblemSubject subject;
+    // The alert's own kind. Condition matching reads it on every edge, so a
+    // notification is matched as NOTIFICATION even once a rollup has replaced
+    // its event type with "ROLLUP".
+    @JsonIgnore
+    private final AlertKind kind;
 
     /**
      * Package-private so that {@link ActionDispatcher#sendTest(org.openintegrationengine.plugins.sentinel.shared.model.Action)}
@@ -65,6 +81,9 @@ public final class AlertPayload {
      * monitor behind it to carry one, and because the callers that build test
      * payloads should not have to name a field that is only ever null for
      * them.</p>
+     *
+     * <p>Both package-private constructors build a channel subject. A Log
+     * payload comes only from {@link #of}; {@link #copy} keeps its subject.</p>
      */
     AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
             String channelId, String channelName, Integer metadataId, Severity severity,
@@ -82,13 +101,14 @@ public final class AlertPayload {
             String eventType, String message, Instant openedTime, String valueJson,
             String runbookUrl) {
         this(alertEventId, monitorId, monitorName, monitorType, channelId, channelName, metadataId,
-                severity, eventType, message, openedTime, valueJson, runbookUrl, null);
+                severity, eventType, message, openedTime, valueJson, runbookUrl, null,
+                ProblemSubject.channel(channelId), AlertKind.PROBLEM);
     }
 
     private AlertPayload(long alertEventId, int monitorId, String monitorName, MonitorType monitorType,
             String channelId, String channelName, Integer metadataId, Severity severity,
             String eventType, String message, Instant openedTime, String valueJson,
-            String runbookUrl, RollupSummary rollupSummary) {
+            String runbookUrl, RollupSummary rollupSummary, ProblemSubject subject, AlertKind kind) {
         this.alertEventId = alertEventId;
         this.monitorId = monitorId;
         this.monitorName = monitorName;
@@ -102,22 +122,59 @@ public final class AlertPayload {
         this.openedTime = openedTime;
         this.valueJson = valueJson;
         this.runbookUrl = runbookUrl;
+        this.matches = MatchedLines.parse(valueJson);
         this.rollupSummary = rollupSummary;
+        this.subject = subject;
+        this.kind = kind;
     }
 
     AlertPayload withRollupSummary(int sent, int windowSeconds) {
         return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
                 metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl,
-                new RollupSummary(sent, windowSeconds));
+                new RollupSummary(sent, windowSeconds), subject, kind);
     }
 
     RollupSummary rollupSummary() { return rollupSummary; }
 
+    /** This payload with another value JSON, and the matches parsed from it; everything else is kept. */
+    AlertPayload withValueJson(String newValueJson) {
+        if (Objects.equals(newValueJson, valueJson)) {
+            return this;
+        }
+        return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
+                metadataId, severity, eventType, message, openedTime, newValueJson, runbookUrl, rollupSummary,
+                subject, kind);
+    }
+
+    /** The dispatcher's one way to reword a payload; keeps the subject, drops the rollup summary. */
+    AlertPayload copy(String eventType, String message) {
+        return new AlertPayload(alertEventId, monitorId, monitorName, monitorType, channelId, channelName,
+                metadataId, severity, eventType, message, openedTime, valueJson, runbookUrl, null, subject, kind);
+    }
+
+    /** @return what the alert is about; read by condition matching and rollup naming */
+    ProblemSubject subject() { return subject; }
+
     /**
-     * Builds the payload for a real alert event, resolving the channel's
-     * display name via {@link ScopeResolver#channelName(String)} (which falls
-     * back to {@code "(unknown)"} for deleted channels, so senders never have
-     * to null-check the name).
+     * The event type an action's EVENT_TYPE condition sees on this edge:
+     * {@code "RESOLVED"} for the resolved edge, otherwise the alert's own kind,
+     * {@code "NOTIFICATION"} or {@code "PROBLEM"}, whatever this payload's
+     * event type has been reworded to.
+     */
+    String conditionEventType(boolean resolvedPhase) {
+        if (resolvedPhase) {
+            return "RESOLVED";
+        }
+        return kind == AlertKind.NOTIFICATION ? "NOTIFICATION" : "PROBLEM";
+    }
+
+    /**
+     * Builds the payload for a real alert event, resolving the subject's
+     * display name via {@link ProblemSubject#displayName()}: the
+     * channel's name from {@link ScopeResolver#channelName(String)} (which
+     * falls back to {@code "(unknown)"} for deleted channels, so senders never
+     * have to null-check the name), or "Log" for a Log alert. A Log alert
+     * carries matches only while its monitor's {@code includeMatches} is on now.
      *
      * <p>The monitor may be {@code null} or nameless when it was deleted
      * between the alert opening and this dispatch — the payload then carries
@@ -130,24 +187,30 @@ public final class AlertPayload {
      * @param monitor   the monitor that owns the event, or {@code null} if it
      *                  has been deleted
      * @param eventType which lifecycle edge this dispatch is for:
-     *                  {@code "PROBLEM"} or {@code "RESOLVED"}
+     *                  {@code "PROBLEM"}, {@code "RESOLVED"} or {@code "NOTIFICATION"}
      * @return an immutable payload ready for every sender
      */
     public static AlertPayload of(AlertEvent event, Monitor monitor, String eventType) {
+        ProblemSubject subject = ProblemSubject.of(event);
+        MonitorType type = monitor != null ? monitor.getMonitorType() : null;
+        String valueJson = MatchedLines.visibleDetails(event, monitor);
         return new AlertPayload(
                 event.getId() != null ? event.getId() : 0L,
                 event.getMonitorId(),
                 monitor != null && monitor.getName() != null ? monitor.getName() : "(deleted monitor)",
-                monitor != null ? monitor.getMonitorType() : null,
-                event.getChannelId(),
-                ScopeResolver.channelName(event.getChannelId()),
+                type,
+                subject.channelId(),
+                subject.displayName(),
                 event.getMetadataId(),
                 event.getSeverity(),
                 eventType,
                 event.getMessage(),
                 event.getOpenedTime(),
-                event.getDetailsJson(),
-                monitor != null ? monitor.getRunbookUrl() : null);
+                valueJson,
+                monitor != null ? monitor.getRunbookUrl() : null,
+                null,
+                subject,
+                AlertKind.orProblem(event.getKind()));
     }
 
     /**
@@ -183,8 +246,8 @@ public final class AlertPayload {
     }
 
     /**
-     * @return id of the channel the alert is about, or {@code null} for
-     *         synthetic test payloads
+     * @return id of the channel the alert is about, or {@code null} for a
+     *         server alert and for synthetic test payloads
      */
     public String getChannelId() {
         return channelId;
@@ -192,7 +255,8 @@ public final class AlertPayload {
 
     /**
      * @return the channel's display name resolved at dispatch time
-     *         ({@code "(unknown)"} for deleted channels); never {@code null}
+     *         ({@code "(unknown)"} for deleted channels, "Log" for a Log
+     *         alert); never {@code null}
      */
     public String getChannelName() {
         return channelName;
@@ -216,9 +280,10 @@ public final class AlertPayload {
 
     /**
      * @return which lifecycle edge this dispatch is for: {@code "PROBLEM"}
-     *         when the alert opened, {@code "RESOLVED"} when it cleared
-     *         (test sends use {@code "TEST"} so recipients can never mistake
-     *         a wiring check for a real alert)
+     *         when the alert opened, {@code "RESOLVED"} when it cleared,
+     *         {@code "NOTIFICATION"} for a one-off notification (test sends
+     *         use {@code "TEST"} so recipients can never mistake a wiring
+     *         check for a real alert)
      */
     public String getEventType() {
         return eventType;
@@ -272,5 +337,21 @@ public final class AlertPayload {
      */
     public String getRunbookUrl() {
         return runbookUrl;
+    }
+
+    /**
+     * The matched lines of a Log alert whose monitor includes matches.
+     * Serialized only when present, so every other alert's JSON is unchanged.
+     *
+     * @return the lines, oldest first, or {@code null} when there are none
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public List<MatchedLines.Line> getMatches() {
+        return matches;
+    }
+
+    /** @return the matches as text for the {@code ${matches}} token and the mail body, or {@code ""} */
+    String matchesText() {
+        return MatchedLines.text(matches);
     }
 }

@@ -21,11 +21,12 @@ import org.slf4j.LoggerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.db.ActionDispatchLogRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
-import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEventFilter;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 
 /**
@@ -444,7 +445,11 @@ final class AlertStormControl {
      */
     static FlapCheck flapCheck(AlertEvent event, Instant now, boolean resolvedPhase) {
         try {
-            if (event == null || event.getChannelId() == null) {
+            // A Log problem has a history too (one monitor, one subject); a
+            // channel event without a channel id has none, and a notification
+            // never clears, so it cannot flap.
+            if (event == null || event.getKind() == AlertKind.NOTIFICATION
+                    || !ProblemSubject.of(event).isIdentified()) {
                 return FlapCheck.NOT_FLAPPING;
             }
 
@@ -569,11 +574,13 @@ final class AlertStormControl {
         Instant from = now.minusSeconds(windowSeconds);
         Map<Integer, List<Instant>> sends = new HashMap<>();
         Map<Integer, Instant> rollups = new HashMap<>();
-        // Keyed on channel id, not on the resolved name: two channels can
+        // Keyed on the subject, not on the resolved name: two channels can
         // share a display name, and every deleted channel resolves to the
         // same "(unknown)" placeholder, so deduplicating on the name would
-        // undercount exactly the storm the rollup is reporting.
-        Map<String, String> affected = new TreeMap<>();
+        // undercount exactly the storm the rollup is reporting. Subject order
+        // is channel id order with the server, named "Log", after them.
+        // Notifications count: they spend the same budget.
+        Map<ProblemSubject, String> affected = new TreeMap<>();
 
         List<AlertEvent> recent = AlertEventRepository.listRecentAlertEvents(SCAN_EVENT_LIMIT);
         int scanned = 0;
@@ -586,8 +593,9 @@ final class AlertStormControl {
             if (!openedInWindow && !stillOpen) {
                 continue;
             }
-            if (openedInWindow && !event.isSuppressed() && event.getChannelId() != null) {
-                affected.computeIfAbsent(event.getChannelId(), ScopeResolver::channelName);
+            ProblemSubject subject = ProblemSubject.of(event);
+            if (openedInWindow && !event.isSuppressed() && subject.isIdentified()) {
+                affected.computeIfAbsent(subject, key -> key.displayName());
             }
 
             scanned++;
@@ -624,12 +632,18 @@ final class AlertStormControl {
      * matched here because the filter has no column for it (the Problems list
      * never needed one) and adding one would mean touching all five mappers.
      * The channel filter already reduces the row count to a single channel's
-     * events, so the in-Java pass is over a handful of rows.</p>
+     * events, so the in-Java pass is over a handful of rows. A server event has
+     * no channel to filter on; its monitor's rows are all server rows, short
+     * of a direct edit, and the kind comparison below drops any that are not.
+     * Only the kind is compared in Java: the channel id comparison stays the
+     * SQL filter's, as it always was.</p>
      */
     private static List<AlertEvent> identityHistory(AlertEvent event, Instant now) {
+        ProblemSubject subject = ProblemSubject.of(event);
         AlertEventFilter filter = new AlertEventFilter();
         filter.setMonitorId(event.getMonitorId());
-        filter.setChannelIdIn(List.of(event.getChannelId()));
+        filter.setKind(AlertKind.PROBLEM);
+        filter.setChannelIdIn(subject.isServer() ? null : List.of(subject.channelId()));
         filter.setFrom(now.minus(FLAP_WINDOW.multipliedBy(FLAP_LOOKBACK_WINDOWS)));
         filter.setSortColumn("opened_time");
         filter.setSortDir("DESC");
@@ -641,7 +655,8 @@ final class AlertStormControl {
             if (Objects.equals(candidate.getId(), event.getId())) {
                 continue;
             }
-            if (!Objects.equals(candidate.getMetadataId(), event.getMetadataId())) {
+            if (!Objects.equals(candidate.getMetadataId(), event.getMetadataId())
+                    || ProblemSubject.of(candidate).type() != subject.type()) {
                 continue;
             }
             history.add(candidate);

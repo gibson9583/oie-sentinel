@@ -34,14 +34,16 @@ import org.openintegrationengine.plugins.sentinel.server.db.ActionRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertLifecycleTransaction;
 import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
-import org.openintegrationengine.plugins.sentinel.server.db.TriggerStateRepository;
 import org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.SentinelLeadership;
+import org.openintegrationengine.plugins.sentinel.server.log.DeliveryThreads;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionTestResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionType;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
+import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.OperationMode;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
@@ -414,6 +416,11 @@ public final class ActionDispatcher {
      * delivery attempt, each attempt logged. Returns as soon as the task is
      * enqueued — the sends themselves happen on the dispatch pool (see class
      * Javadoc). Never throws.
+     *
+     * <p>A NOTIFICATION row (already RESOLVED, opened edge pending) takes this
+     * edge only, once: schedules and ceilings apply as to a problem, but a
+     * suppressed notification, or one past the ceiling (covered by the
+     * window's rollup), is consumed rather than sent later.</p>
      *
      * @param event   the freshly opened alert event (already persisted, id set)
      * @param payload the display-resolved snapshot built by the evaluator;
@@ -920,7 +927,7 @@ public final class ActionDispatcher {
 
     /** Named, daemon dispatch thread — see {@link #startDispatchExecutor()} for why both matter. */
     private static Thread newDispatchThread(Runnable task) {
-        Thread thread = new Thread(task, "sentinel-dispatch-" + DISPATCH_THREAD_SEQUENCE.incrementAndGet());
+        Thread thread = new Thread(task, DeliveryThreads.DISPATCH_PREFIX + DISPATCH_THREAD_SEQUENCE.incrementAndGet());
         thread.setDaemon(true);
         return thread;
     }
@@ -928,7 +935,7 @@ public final class ActionDispatcher {
     /** Named daemon thread for the isolated, cancellable transport call. */
     private static Thread newTransportThread(Runnable task) {
         Thread thread = new Thread(task,
-                "sentinel-transport-" + TRANSPORT_THREAD_SEQUENCE.incrementAndGet());
+                DeliveryThreads.TRANSPORT_PREFIX + TRANSPORT_THREAD_SEQUENCE.incrementAndGet());
         thread.setDaemon(true);
         return thread;
     }
@@ -978,6 +985,14 @@ public final class ActionDispatcher {
                     throw new DispatchDeferredException("Cannot verify rollup recipient scope before delivery", uncertainty);
                 }
                 beforeTransport.run();
+                // Matched lines go out only while the monitor includes them at
+                // this last check; the option may have been turned off since.
+                try {
+                    currentPayload = MatchedLines.disclosedNow(currentPayload);
+                } catch (Exception uncertainty) {
+                    throw new DispatchDeferredException("Cannot verify matched-line disclosure before delivery",
+                            uncertainty);
+                }
                 if (Thread.currentThread().isInterrupted()) {
                     throw new DispatchDeferredException("Transport was cancelled before delivery");
                 }
@@ -1091,8 +1106,9 @@ public final class ActionDispatcher {
         boolean problemReplayClaimed = false;
         try {
             AlertEvent current = AlertEventRepository.getAlertEvent(id);
-            AlertStatus expected = resolvedPhase ? AlertStatus.RESOLVED : AlertStatus.PROBLEM;
-            if (current == null || current.getStatus() != expected) {
+            boolean notification = current != null && current.getKind() == AlertKind.NOTIFICATION;
+            AlertStatus expected = resolvedPhase || notification ? AlertStatus.RESOLVED : AlertStatus.PROBLEM;
+            if (current == null || current.getStatus() != expected || (notification && resolvedPhase)) {
                 return;
             }
             event = current;
@@ -1117,8 +1133,8 @@ public final class ActionDispatcher {
             boolean notifyOnWindowEntry = entryPending(event);
             NotificationSuppression.Decision policy = currentDecision(event);
             if (policy != NotificationSuppression.Decision.ALLOW) {
-                if (resolvedPhase && policy == NotificationSuppression.Decision.SUPPRESS) {
-                    if (completeProblem(event)) {
+                if ((resolvedPhase || notification) && policy == NotificationSuppression.Decision.SUPPRESS) {
+                    if (completeProblem(event) && resolvedPhase) {
                         completeResolution(event);
                     }
                 }
@@ -1373,7 +1389,7 @@ public final class ActionDispatcher {
                                 + "window's rollup; alert event {} produces no notification",
                         action.getId(), action.getName(), verdict.sent(), verdict.windowSeconds(),
                         event.getId());
-                return false;
+                return event.getKind() == AlertKind.NOTIFICATION;
         }
         if (!receipt.transportAttempted) {
             AlertStormControl.releaseReservation(verdict);
@@ -1409,12 +1425,7 @@ public final class ActionDispatcher {
                         + "rollup for {} affected channel(s) instead of individual notifications",
                 action.getId(), action.getName(), verdict.sent(), verdict.windowSeconds(),
                 verdict.channels().size());
-        AlertPayload rollup = new AlertPayload(
-                payload.getAlertEventId(), payload.getMonitorId(), payload.getMonitorName(),
-                payload.getMonitorType(), payload.getChannelId(), payload.getChannelName(),
-                payload.getMetadataId(), payload.getSeverity(), "ROLLUP",
-                AlertStormControl.rollupMessage(verdict), payload.getOpenedTime(),
-                payload.getValueJson(), payload.getRunbookUrl())
+        AlertPayload rollup = payload.copy("ROLLUP", AlertStormControl.rollupMessage(verdict))
                 .withRollupSummary(verdict.sent(), verdict.windowSeconds());
         String marker = resolvedPhase
                 ? AlertStormControl.ROLLUP_MARKER + " " + RESOLUTION_MARKER
@@ -1567,7 +1578,7 @@ public final class ActionDispatcher {
             if (current == null || !current.isEnabled()
                     || (requireSubscription && (!firesOnPhase(current.getOperationMode(), resolvedPhase)
                             || !ActionConditionMatcher.matches(current,
-                                    withEventType(payload, resolvedPhase ? "RESOLVED" : "PROBLEM"))))) {
+                                    withEventType(payload, payload.conditionEventType(resolvedPhase)))))) {
                 return ActionDecision.INAPPLICABLE;
             }
             // Do not splice new credentials/routing into a decision whose
@@ -1668,8 +1679,8 @@ public final class ActionDispatcher {
      */
     private static Boolean supersededByNewerProblem(AlertEvent event) {
         try {
-            TriggerState state = TriggerStateRepository.getTriggerState(
-                    event.getMonitorId(), event.getChannelId(), event.getMetadataId());
+            TriggerState state = ProblemSubject.of(event).loadTriggerState(
+                    event.getMonitorId(), event.getMetadataId());
             if (state == null || state.getOpenAlertEventId() == null
                     || state.getOpenAlertEventId().equals(event.getId())) {
                 return false;
@@ -1701,6 +1712,9 @@ public final class ActionDispatcher {
             AlertEvent current = AlertEventRepository.getAlertEvent(event.getId());
             if (current == null) {
                 return false;
+            }
+            if (current.getKind() == AlertKind.NOTIFICATION) {
+                return !resolvedPhase && current.isProblemPending();
             }
             if (resolvedPhase) {
                 return current.getStatus() == AlertStatus.RESOLVED
@@ -1940,20 +1954,12 @@ public final class ActionDispatcher {
      * produced it, so conditions and templates behave identically.
      */
     private static AlertPayload withMessage(AlertPayload payload, String message) {
-        return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(),
-                payload.getMonitorName(), payload.getMonitorType(), payload.getChannelId(),
-                payload.getChannelName(), payload.getMetadataId(), payload.getSeverity(),
-                payload.getEventType(), message, payload.getOpenedTime(), payload.getValueJson(),
-                payload.getRunbookUrl());
+        return payload.copy(payload.getEventType(), message);
     }
 
     /** Copies a payload for the other lifecycle edge without changing its incident facts. */
     private static AlertPayload withEventType(AlertPayload payload, String eventType) {
-        return new AlertPayload(payload.getAlertEventId(), payload.getMonitorId(),
-                payload.getMonitorName(), payload.getMonitorType(), payload.getChannelId(),
-                payload.getChannelName(), payload.getMetadataId(), payload.getSeverity(),
-                eventType, payload.getMessage(), payload.getOpenedTime(), payload.getValueJson(),
-                payload.getRunbookUrl());
+        return payload.copy(eventType, payload.getMessage());
     }
 
     /**

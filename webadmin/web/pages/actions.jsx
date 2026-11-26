@@ -184,10 +184,16 @@ function SectionLabel({ children }) {
 
 /* ---- template token chips ------------------------------------------------ */
 
-/* ${var} tokens the EMAIL subject template substitutes — exactly the set
-   EmailAlertSender.render() replaces. Anything else is left verbatim in the
-   sent subject, so the chips offer only these. */
-const EMAIL_SUBJECT_TOKENS = ['monitorName', 'channelName', 'severity', 'status', 'message'];
+/* ${var} tokens the EMAIL subject template substitutes, as
+   EmailAlertSender.render() replaces them; it also replaces ${runbookUrl},
+   which has no chip. Anything else is left verbatim in the sent subject, so
+   the chips offer only tokens it replaces. ${matches} holds a Log
+   alert's matched lines when its monitor includes them, and is empty for
+   every other alert. */
+const EMAIL_SUBJECT_TOKENS = ['monitorName', 'channelName', 'severity', 'status', 'message', 'matches'];
+
+const MATCHES_NOTE = '${matches} holds the matched log lines of Log monitors that include them, '
+    + 'and is empty otherwise.';
 
 /* The same set plus the two WebhookAlertSender.render() adds: ${valueJson}
    (the evaluator's measurement evidence, substituted as raw JSON so it embeds
@@ -311,7 +317,7 @@ function EmailConfigFields({ config, setConfig }) {
                     onChange={(e) => setConfig({ subjectTemplate: e.target.value })}
                     {...TOKEN_TARGET_PROPS} />
                 <TokenChips tokens={EMAIL_SUBJECT_TOKENS} inputRef={subjectRef}
-                    note="Empty = default subject." />
+                    note={`Empty = default subject. ${MATCHES_NOTE}`} />
             </div>
             <label className="check">
                 <input type="checkbox" checked={!!config.includeDetails}
@@ -479,7 +485,7 @@ function WebhookConfigFields({ config, setConfig }) {
                 <TokenChips tokens={bodyMasked ? [] : WEBHOOK_BODY_TOKENS} inputRef={bodyRef}
                     note={`Stored encrypted. Leave ${REDACTED} unchanged to keep the template; `
                         + 'replace it in full to edit it or insert tokens. Empty = the full alert payload as JSON. Values are JSON-escaped; '
-                        + '${valueJson} is inserted raw.'} />
+                        + '${valueJson} is inserted raw. ' + MATCHES_NOTE} />
             </div>
 
             <div className="field span-2">

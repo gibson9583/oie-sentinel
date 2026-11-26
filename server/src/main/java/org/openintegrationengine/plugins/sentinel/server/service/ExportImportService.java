@@ -20,6 +20,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.UnaryOperator;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
@@ -33,6 +34,7 @@ import org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
+import org.openintegrationengine.plugins.sentinel.shared.model.SubjectType;
 
 /**
  * Renders Sentinel's whole configuration surface — monitors, alert actions,
@@ -289,7 +291,21 @@ public final class ExportImportService {
      * @return the export document, ready for {@code Json.write}
      */
     public static ObjectNode export() {
-        MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
+        return export(true);
+    }
+
+    /**
+     * {@link #export()}, with or without the monitors whose subject is the
+     * server (Log monitors). Without them, an action's MONITOR condition that
+     * names one is exported as an unresolved id, so the document never names
+     * a monitor the caller may not see.
+     */
+    public static ObjectNode export(boolean includeServerMonitors) {
+        List<Monitor> all = MonitorService.list();
+        MonitorIndex monitors = MonitorIndex.of(includeServerMonitors ? all : all.stream()
+                .filter(monitor -> monitor.getMonitorType() != null
+                        && monitor.getMonitorType().subjectType() == SubjectType.CHANNEL)
+                .toList());
 
         ObjectNode root = Json.mapper().createObjectNode();
         root.put("schemaVersion", SCHEMA_VERSION);
@@ -642,7 +658,7 @@ public final class ExportImportService {
 
         Monitor incoming;
         try {
-            incoming = Json.mapper().treeToValue(node, Monitor.class);
+            incoming = readMonitor(node);
         } catch (Exception e) {
             return entry.skipped("Not a valid monitor definition: " + rootMessage(e));
         }
@@ -684,6 +700,53 @@ public final class ExportImportService {
             return unchanged ? entry.skipped(REASON_UNCHANGED) : existing == null ? entry.created() : entry.updated();
         } catch (IllegalArgumentException | NoSuchElementException e) {
             return entry.skipped(rootMessage(e));
+        }
+    }
+
+    /**
+     * Reads one monitor entry the way the import saves it. The servlet's Log
+     * monitor check reads entries with this too, so the check and the import
+     * cannot disagree about an entry's type.
+     *
+     * @return the monitor as the import would save it
+     * @throws JsonProcessingException  when the entry is not a monitor definition
+     * @throws IllegalArgumentException when Jackson rejects the entry outright
+     */
+    public static Monitor readMonitor(JsonNode node) throws JsonProcessingException {
+        return Json.mapper().treeToValue(node, Monitor.class);
+    }
+
+    /**
+     * An import action entry as the import would write it, and the stored
+     * action it would replace by name, or {@code null}.
+     */
+    public record ImportedAction(Action incoming, Action replaced) {
+    }
+
+    /**
+     * Reads action entries the way the import binds them, for the servlet's
+     * check of actions that can receive Log alerts, against one read of this
+     * server's monitors and actions: MONITOR condition values become the id
+     * of the monitor of that name (a name with no monitor stays as written),
+     * and the incoming action takes the id of the one it would replace.
+     */
+    public static final class ImportedActionReader {
+        private final MonitorIndex monitors = MonitorIndex.of(MonitorService.list());
+        private final ActionIndex actions = ActionIndex.of(ActionService.list());
+
+        /**
+         * @throws JsonProcessingException  when the entry is not an action definition
+         * @throws IllegalArgumentException when Jackson rejects the entry outright
+         */
+        public ImportedAction read(JsonNode node) throws JsonProcessingException {
+            Action incoming = Json.mapper().treeToValue(node, Action.class);
+            incoming.setConditionJson(mapMonitorConditionValues(incoming.getConditionJson(), value -> {
+                Integer id = monitors.idOf(value);
+                return id != null ? String.valueOf(id) : null;
+            }));
+            Action existing = actions.byName(textOrNull(node, "name"));
+            incoming.setId(existing != null ? existing.getId() : null);
+            return new ImportedAction(incoming, existing);
         }
     }
 

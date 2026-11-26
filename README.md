@@ -22,10 +22,13 @@ console, riding its existing session (no separate login).
   window, with a minimum-volume guard so one error on a quiet channel is not 100%), **Queue
   depth** (destination queue at or above a threshold for a sustained period), and **Channel
   state** (see below).
+- One more type, **Log lines**, makes a **Log** monitor: it watches the lines the engine logs,
+  matched by level, logger name and pattern, and raises a notification or a problem (see below).
 - Connection-status monitors roll up per connector or once per channel, so one channel losing its
   upstream pages once instead of once per destination.
-- Scoped to a single channel, a channel group, a **channel tag**, or all channels — group and tag
-  membership resolve live, so reorganizing channels never requires touching monitors.
+- Channel monitors are scoped to a single channel, a channel group, a **channel tag**, or all
+  channels — group and tag membership resolve live, so reorganizing channels never requires
+  touching monitors.
 - Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency
   suppression (a parent monitor's open problem silences its dependents on the same channel).
 
@@ -55,9 +58,128 @@ this type exists to catch. The stamp is a lower bound: a monitor created while a
 stopped counts from its own first tick, so it breaches one minimum-duration later rather than
 immediately.
 
+### Log monitors watch the engine log
+
+The monitor editor asks for the kind first: **Channel** for the seven channel types above, or
+**Log** for the Log lines type. A Log monitor's condition is **Each occurrence** (each matching
+line), **At least** N matching lines within a window (too many), or **At most** N within a window
+(too few, such as a missing heartbeat). Its result is a notification or a problem. Actions send
+both, except that an action set to **On resolve**, which sends only when a problem resolves, never
+gets a notification.
+
+A notification is a one-off entry in the **Notifications** tab. It can't be acknowledged or
+resolved. With **Each occurrence**, every matching line gets its own notification, up to 100 per
+monitor on each node in each collector interval, and one summary notification covers the rest.
+
+A problem stays open in the Problems tab until it clears the way the editor's **Clears** setting
+says: **When the condition goes away** (the default), **When a person resolves it**, or **After a
+set time**. After a set time clears it once **Clear after** seconds have passed since the last
+evaluation at which the condition was true, even if the condition went away earlier. In every mode a
+person can also resolve a problem by hand. Lines that match while it is open are added to it.
+**Each occurrence** with a problem as the result works as at least 1 within the window: the problem
+opens on a matching line, and with When the condition goes away it clears once the window has
+none.
+
+For example, a heartbeat monitor opens a problem when no line matching `HEARTBEAT` arrives in 10
+minutes (at most 0) and clears when one does. A deploy monitor sends a notification for each line
+matching `deployed`.
+
+A line matches when its level (TRACE, DEBUG, INFO, WARN, ERROR or FATAL) is at or above the
+monitor's minimum level, its logger name starts with the logger prefix (if one is set), and the
+pattern (a Java regular expression, if one is set) is found in the message or in the exception's
+one-line summary (its class and message). A pattern sees the first 4,096 characters of each. A
+mirth.log line shows its logger name just before the message, as in `[thread] js-connector: DB
+access failed`. Channel scripts log under logger names such as `transformer`, `filter`, `deploy`,
+`db-connector` and `js-connector`, so a transformer that catches a failed query and calls
+`logger.error(...)` can be watched.
+
+On each node, Sentinel adds a Log4j appender, a hook that receives every line the engine logs (log
+capture, on the Dashboard). It copies each line that passes some Log monitor's level and logger
+checks into a queue and returns. One Sentinel thread per node, the matcher, runs the patterns. Each
+line's pattern checks stop after 20 ms in total and count as no match. The queue has room for 1,000
+lines by default (**Log queue capacity** in Settings, 100 to 10,000). When it is full, new lines are
+dropped and counted. For the node serving the page, the Dashboard shows how full the queue is, how
+many lines were dropped, and whether log capture is counting. When it isn't, the Dashboard says why.
+Prometheus has the same numbers as `sentinel_log_*`.
+
+Every collector interval (set in Settings), each node writes one count row per Log monitor to
+`sentinel_match_sample`, zero counts included. A node marks a row incomplete
+when lines may have gone uncounted: lines were dropped, a pattern check hit its time limit, log
+capture was not attached, or the node restarted. An incomplete count can only be too low, so it can
+still fire an "at least" monitor or clear an "at most" problem. It can't clear an "at least" problem
+or fire an "at most" monitor. If the engine database can't be written, the counts wait in memory and
+are written once it can.
+
+Each count row also keeps how many lines matched in each second, so a window's edges are exact to
+the second: a line logged before the window starts doesn't count, even when its count row was
+written late. If the engine database can't be written for so long that one row's lines fall in
+more than 3,600 different seconds, that row keeps only its line count, and a window that starts
+within the period that row covers is incomplete.
+
+A 10-minute window covers the latest 10 minutes that have been counted. Each count row is written
+up to one collector interval after its lines were logged, so a window ends at the newest written
+rows, which can be up to one collector interval before the evaluation. A line logged just before an
+evaluation is counted at a later evaluation.
+
+A window is also incomplete until count rows cover all of it with no gap longer than two collector
+intervals, and while a node's newest row is more than two collector intervals old. An incomplete
+window works as described above. So a monitor that was just saved or enabled can't fire an "at
+most" condition until it has counted for a full window.
+
+The 20 ms limit is checked as the pattern reads characters, so a pattern that loops without reading
+any can still stall the matcher on that node. After 5 seconds on one line the Dashboard shows log
+capture as not counting, the queue fills, and new lines are dropped and counted.
+
+A Log monitor watches no channel:
+- Its problems and notifications show "Log" where a channel name would be, `${channelName}`
+  included. They carry no channel id and add nothing to the Dashboard's channel badges.
+- Only users with Manage Monitoring and no channel restrictions can create, change, enable, disable,
+  delete or import Log monitors. Users with channel restrictions don't see Log monitors, their
+  problems and notifications, or the log capture status on the Dashboard. Their exports leave Log
+  monitors out, and they can't manage actions that can receive Log alerts (see
+  [Permissions](#permissions)).
+- Channel, channel group and channel tag action conditions never match them, whatever the operator.
+  An action gets them through a **Monitor type** (Log lines) or **Monitor** condition, or by having
+  no channel conditions. If such an action escalates, the action it escalates to gets the Log
+  problems too.
+- Schedules cover them only when scoped to all channels, and only another Log monitor can suppress
+  one.
+- A saved monitor can't change between Channel and Log.
+
+A Log monitor does not count:
+- Lines logged before Sentinel starts, such as engine startup and migration errors.
+- Lines logged before the monitor's count starts. Each node starts it at its first collector run
+  after the monitor is saved or enabled, up to one collector interval later.
+- Lines logged on the threads Sentinel uses to deliver alerts, such as the error the engine logs
+  when a Channel action routes to a channel that isn't deployed.
+- Lines dropped because the queue was full.
+- Lines the engine's log configuration drops: below a logger's level, or removed by the engine's own
+  filter for mirth.log.
+
+A Log monitor does count what a channel logs while it processes an alert that a Channel action
+delivered to it. A monitor broad enough to match that channel's own errors therefore feeds itself:
+each alert makes the channel log another line, which raises another alert. Narrow the monitor with
+a logger prefix or a pattern, or give the action a **Storm control** ceiling.
+
+With **Include matched items in alerts** on, a monitor keeps up to 10 of the newest matching lines,
+each cut to 1,000 characters. They show in the Matches panel of the problem or notification, and
+actions send them: in the email body, as `matches` in the webhook, SNS and Channel payloads (the
+Channel action's source map key is `sentinelMatches`), and through the `${matches}` template token.
+Sentinel stores them with the count rows in `sentinel_match_sample`, kept for the raw-sample
+retention, and with the problem or notification, kept for the **Resolved alert retention**. Turning
+the option off hides them in the UI and in what actions send, and the stored copies stay until
+retention removes them. The option is off by default.
+
+Matched lines are the engine's log text, cut to 1,000 characters and otherwise unchanged. If a
+script or connector logs message content, that content appears in the matched lines. Sentinel
+doesn't filter or mask them. Actions send them to their recipients, including through `${matches}`
+in an email subject, where line breaks and other control characters become spaces.
+
 **Problems**
 - Problem list with server-side filtering/paging, bulk acknowledge, and a detail pane with the
   captured value and dispatched-action log.
+- A **Notifications** tab lists the notifications of Log monitors, newest first, filtered by
+  monitor and date. Each opens to its matched lines and the actions it was sent to.
 - Acknowledge and manual resolve, each confirmed in a single dialog with an optional comment;
   acknowledgments display the engine username.
 - **Acknowledging stops repeat notifications** without resolving the problem — the alarm stays open
@@ -89,7 +211,8 @@ immediately.
 - Repeat notifications per action (`repeat interval` + optional `max repeats`), paced through the
   dispatch log so repeat state survives server restarts.
 - Drag-and-drop template tokens (`${monitorName}`, `${channelName}`, `${severity}`, `${status}`,
-  `${message}`) for the email subject template.
+  `${message}`, and `${matches}` for a Log monitor's matched lines) for the email subject
+  template.
 
 **Schedules** (the *Schedules* tab)
 - **Suppress** schedules — classic maintenance windows: notification decisions made while the
@@ -151,7 +274,9 @@ through the same permission check it applies to those.
 - Optional **runbook URL** per monitor, shown on the problem and available as `${runbookUrl}` in
   every alert template.
 - **Prometheus endpoint** at `/extensions/sentinel/metrics` — open problems by severity, per-channel
-  throughput, and collector/evaluator heartbeat age, honouring channel restrictions.
+  throughput, and collector/evaluator heartbeat age, honouring channel restrictions. The
+  `sentinel_log_*` series report each node's Log queue capacity and depth, dropped lines, and
+  whether log capture and the matcher are running. Scrapes with channel restrictions don't get them.
 - **Export / import** of monitors, actions and schedules as one JSON document, matched by name and
   reported entity by entity, so configuration is promotable dev → test → prod and
   version-controllable. Export preserves all monitors, including legacy names that differ only
@@ -171,6 +296,10 @@ through the same permission check it applies to those.
   under the 7-day raw-sample retention default — in the engine's operational database, alongside
   message data. Raise the collector interval or lower the sample retention to size it down. Each
   tick is written as a single batched insert regardless of channel count.
+- **Log monitor counts** add `Log monitors × nodes × 86400 / interval` rows a day to
+  `sentinel_match_sample`, pruned with the raw-sample retention: 5 Log monitors on one node at the
+  30-second default write 14,400 rows a day. A row with matched lines carries up to 10 lines of
+  1,000 characters.
 
 ### Activity retention has two independent tiers
 
@@ -268,13 +397,13 @@ values introduced in 1.2.0. See the [upgrade procedure](docs/releases/1.2.1.md#u
    (or install from an OIE Community Store that lists this plugin).
 2. Install via the Web Administrator (Settings → Extensions) or drop the zip into the engine's
    extension install flow, then restart the server.
-3. On first start the migrator creates eleven `sentinel_*` tables in the engine database (Derby,
+3. On first start the migrator creates twelve `sentinel_*` tables in the engine database (Derby,
    PostgreSQL, MySQL, Oracle, and SQL Server DDL included); schema upgrades run automatically on
    later versions.
 
 ### Uninstalling deletes Sentinel data
 
-Explicitly uninstalling Sentinel **drops all eleven of its database tables on the next engine
+Explicitly uninstalling Sentinel **drops all twelve of its database tables on the next engine
 startup**, deleting monitors, actions, schedules, alert history, delivery records, and collected
 activity. This applies to Derby, PostgreSQL, MySQL, Oracle, and SQL Server. No new archive tables
 are created; Oracle also purges the dropped tables from its recycle bin. Reinstalling creates an
@@ -300,11 +429,11 @@ operational roles:
 | Acknowledge Problems | Acknowledge, bulk acknowledge, manual resolve |
 | Manage Schedules | Schedule create/update/delete and "activate now" (on-call tier) |
 | Manage Monitoring | Monitor and action authoring, including delivery credentials and test sends |
-| Manage Settings | Scheduler intervals and data retention only |
+| Manage Settings | Scheduler intervals, data retention and the Log queue capacity only |
 
 Delivery credentials — SNS access keys and role ARNs — and recipient lists are part of an action's
 configuration, so they belong to Manage Monitoring. Manage Settings covers only the five
-scheduler-interval and retention values on the Settings page.
+scheduler-interval and retention values and the Log queue capacity on the Settings page.
 
 Channel-restricted viewers see monitor definitions only when their complete, nonempty scope is
 within the user's authorized channels, including stopped and undeployed members. This applies to
@@ -323,6 +452,15 @@ uses user IDs for any remaining attribution. Action and schedule definitions rem
 global configuration reads. **Manage Monitoring** grants global configuration authoring and export;
 **Manage Schedules** grants global schedule authoring. These management grants are broader than a
 channel-scoped monitoring view and should be assigned accordingly.
+
+For users with channel restrictions, Manage Monitoring doesn't cover Log monitors or their alerts
+(a Log monitor's problems and notifications). They can't create, change, enable, disable, delete or
+import Log monitors, and their exports leave Log monitors out. They can't create, change (including
+enabling or disabling), delete or import an action that can receive Log alerts. An action can
+receive Log alerts if its conditions let a Log monitor through (an action with no conditions does),
+or if another action that can receive Log alerts escalates to it. Restricted users can still manage
+an action with a channel, channel group or channel tag condition, unless another action that can
+receive Log alerts escalates to it.
 
 Without an authorization plugin installed, the engine permits everything.
 

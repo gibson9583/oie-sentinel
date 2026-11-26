@@ -16,7 +16,6 @@ import java.util.function.Supplier;
 
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
-import org.apache.ibatis.session.SqlSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -184,67 +183,10 @@ public final class ActivityRepository {
             // re-read counters, choose another timestamp or acquire a new epoch.
             List<Map<String, Object>> rows = new ArrayList<>(samples.size());
             for (ActivitySample sample : samples) rows.add(toSampleColumnMap(sample));
-            SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
-            DeadlockRetry.execute(sessions, "activity sample batch", attempt -> {
-                insertActivitySampleBatch(sessions, rows, fence, attempt);
-                return null;
-            });
+            BatchInsert.run(stmt("insertActivitySample"), rows, fence, "activity sample batch");
         } catch (Exception e) {
             log.error("Failed to insert batch of {} activity samples", samples.size(), e);
             throw new RepositoryException(e);
-        }
-    }
-
-    private static void insertActivitySampleBatch(SqlSessionManager sessions, List<Map<String, Object>> rows,
-            LeaseFence fence, DeadlockRetry.Attempt attempt) {
-        SqlSession session = null;
-        Connection connection = null;
-        Throwable failure = null;
-        boolean committed = false;
-        boolean cleanupFailed = false;
-        try {
-            session = sessions.openSession(ExecutorType.BATCH, false);
-            connection = session.getConnection();
-            if (!NodeLeaseRepository.lockFence(session, fence)) {
-                throw new IllegalStateException("Sentinel leadership fence changed before sample batch");
-            }
-
-            for (Map<String, Object> row : rows) {
-                session.insert(stmt("insertActivitySample"), row);
-            }
-
-            // The fence SELECT flushes BATCH before checking expiry; commit
-            // flushes it for an unmanaged fence. Revalidate on every attempt.
-            NodeLeaseRepository.requireFence(session, fence);
-            session.commit();
-            committed = true;
-        } catch (RuntimeException | Error error) {
-            failure = error;
-        }
-        if (session != null && failure != null) {
-            try {
-                // MyBatis 3.1.1 close can swallow a JDBC rollback exception.
-                // Force rollback explicitly before considering any retry.
-                session.rollback(true);
-            } catch (RuntimeException | Error rollback) {
-                if (failure != rollback) failure.addSuppressed(rollback);
-                cleanupFailed = true;
-                if (connection != null) ReadTransaction.abortConnection(sessions, connection, failure);
-            }
-        }
-        if (session != null) {
-            try {
-                session.close();
-            } catch (RuntimeException | Error close) {
-                if (failure == null) failure = close;
-                else if (failure != close) failure.addSuppressed(close);
-                cleanupFailed = true;
-            }
-        }
-        if (failure instanceof Error) throw (Error) failure;
-        if (failure != null) {
-            if (!committed && !cleanupFailed && session != null) attempt.allowRetry();
-            throw (RuntimeException) failure;
         }
     }
 

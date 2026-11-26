@@ -335,7 +335,10 @@ async function refreshSnapshot() {
         const items = page && Array.isArray(page.items) ? page.items : [];
         const byChannel = {};
         items.forEach((event) => {
-            if (!event || !event.channelId) return;
+            // A Log problem (subjectType SERVER, channelId null) belongs to
+            // no channel row, and a notification is never open, so neither
+            // adds to a badge.
+            if (!event || event.subjectType === 'SERVER' || event.kind === 'NOTIFICATION' || !event.channelId) return;
             const entry = byChannel[event.channelId] || { count: 0, worst: null };
             entry.count += 1;
             if (severityRank(event.severity) > severityRank(entry.worst)) {

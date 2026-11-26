@@ -26,7 +26,7 @@ class SentinelMigratorTest {
 
     @Test
     void latestSchemaIncludesBothLifecycleOutboxes() {
-        assertEquals(13, SentinelMigrator.LATEST_VERSION);
+        assertEquals(15, SentinelMigrator.LATEST_VERSION);
     }
 
     @ParameterizedTest

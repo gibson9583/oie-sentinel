@@ -94,18 +94,32 @@
         DELETE FROM sentinel_monitor WHERE id = #{id}
     </delete>
 
+    <!-- Enabling a Log monitor also sets updated_time and updated_by: its count starts again there. -->
     <update id="setMonitorEnabled" parameterType="map">
-        UPDATE sentinel_monitor SET enabled = #{enabled} WHERE id = #{id}
+        UPDATE sentinel_monitor SET enabled = #{enabled}
+        <if test="updated_time != null">, updated_time = #{updated_time,jdbcType=TIMESTAMP}, updated_by = #{updated_by,jdbcType=INTEGER}</if>
+        WHERE id = #{id}
     </update>
 
     <!-- ========== ALERT_EVENT (table sentinel_alert_event) ========== -->
 
     <insert id="insertAlertEvent" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_alert_event
-            (monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+            (monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
              resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
+            (#{monitor_id}, #{subject_type}, #{event_kind}, #{channel_id,jdbcType=VARCHAR}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
+             #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed}, #{problem_pending}, #{resolution_pending})
+    </insert>
+
+    <!-- The same insert under a BATCH session, one batch per flush of Log notifications. No generated
+         keys: nothing reads a notification's id when it is written. -->
+    <insert id="insertAlertEventInBatch" parameterType="map">
+        INSERT INTO sentinel_alert_event
+            (monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
+             resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending)
+        VALUES
+            (#{monitor_id}, #{subject_type}, #{event_kind}, #{channel_id,jdbcType=VARCHAR}, #{metadata_id,jdbcType=INTEGER}, #{severity}, #{status}, #{message}, #{opened_time},
              #{resolved_time,jdbcType=TIMESTAMP}, #{acknowledged_by,jdbcType=INTEGER}, #{acknowledged_time,jdbcType=TIMESTAMP}, #{ack_comment}, #{details_json}, #{suppressed}, #{problem_pending}, #{resolution_pending})
     </insert>
 
@@ -146,8 +160,13 @@
         UPDATE sentinel_alert_event SET resolution_pending = #{resolutionPending} WHERE id = #{id}
     </update>
 
+    <!-- An open Log problem takes the latest breaching evaluation, so further matches add to it. -->
+    <update id="updateAlertEventDetails" parameterType="map">
+        UPDATE sentinel_alert_event SET details_json = #{details_json} WHERE id = #{id} AND status = 'PROBLEM'
+    </update>
+
     <select id="listPendingProblemAlertEvents" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+        SELECT id, monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
                problem_pending, resolution_pending
         FROM sentinel_alert_event
@@ -156,7 +175,7 @@
     </select>
 
     <select id="listPendingResolvedAlertEvents" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+        SELECT id, monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed,
                problem_pending, resolution_pending
         FROM sentinel_alert_event
@@ -165,18 +184,19 @@
     </select>
 
     <select id="getAlertEvent" parameterType="map" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+        SELECT id, monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         WHERE id = #{id}
     </select>
 
     <select id="listAlertEvents" parameterType="map" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+        SELECT id, monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
         <where>
             <if test="status != null">AND status = #{status}</if>
+            <if test="kind != null">AND event_kind = #{kind}</if>
             <if test="severityIn != null and !severityIn.isEmpty()">
                 AND severity IN
                 <foreach collection="severityIn" item="s" open="(" separator="," close=")">#{s}</foreach>
@@ -224,6 +244,7 @@
         FROM sentinel_alert_event
         <where>
             <if test="status != null">AND status = #{status}</if>
+            <if test="kind != null">AND event_kind = #{kind}</if>
             <if test="severityIn != null and !severityIn.isEmpty()">
                 AND severity IN
                 <foreach collection="severityIn" item="s" open="(" separator="," close=")">#{s}</foreach>
@@ -277,9 +298,10 @@
     </select>
 
     <select id="listRecentAlertEvents" parameterType="map" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, severity, status, message, opened_time,
+        SELECT id, monitor_id, subject_type, event_kind, channel_id, metadata_id, severity, status, message, opened_time,
                resolved_time, acknowledged_by, acknowledged_time, ack_comment, details_json, suppressed, problem_pending, resolution_pending
         FROM sentinel_alert_event
+        <if test="kind != null">WHERE event_kind = #{kind}</if>
         ORDER BY opened_time DESC
         LIMIT #{limit}
     </select>
@@ -319,6 +341,7 @@
                         ELSE NULL END) AS avg_resolve_seconds
         FROM sentinel_alert_event
         WHERE monitor_id = #{monitorId}
+          AND event_kind = #{kind}
           AND opened_time &gt;= #{from}
           AND opened_time &lt;= #{to}
         GROUP BY date_trunc('day', opened_time)
@@ -328,20 +351,23 @@
     <!-- ========== TRIGGER_STATE (table sentinel_trigger_state) ========== -->
 
     <select id="getTriggerState" parameterType="map" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
+        SELECT id, monitor_id, subject_type, channel_id, metadata_id, state, consecutive_breach_count,
                last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
         FROM sentinel_trigger_state
-        WHERE monitor_id = #{monitorId} AND channel_id = #{channelId}
+        WHERE monitor_id = #{monitorId}
+        <if test="channelId != null">AND channel_id = #{channelId}</if>
+        <if test="channelId == null">AND channel_id IS NULL</if>
         <if test="metadataId != null">AND metadata_id = #{metadataId}</if>
         <if test="metadataId == null">AND metadata_id IS NULL</if>
+        AND subject_type = #{subjectType}
     </select>
 
     <insert id="insertTriggerState" parameterType="map" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO sentinel_trigger_state
-            (monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
+            (monitor_id, subject_type, channel_id, metadata_id, state, consecutive_breach_count,
              last_value_json, open_alert_event_id, last_change_time, last_evaluated_time)
         VALUES
-            (#{monitor_id}, #{channel_id}, #{metadata_id,jdbcType=INTEGER}, #{state}, #{consecutive_breach_count},
+            (#{monitor_id}, #{subject_type}, #{channel_id,jdbcType=VARCHAR}, #{metadata_id,jdbcType=INTEGER}, #{state}, #{consecutive_breach_count},
              #{last_value_json}, #{open_alert_event_id,jdbcType=BIGINT}, #{last_change_time,jdbcType=TIMESTAMP}, #{last_evaluated_time,jdbcType=TIMESTAMP})
     </insert>
 
@@ -366,7 +392,7 @@
     </update>
 
     <select id="listTriggerStatesByMonitor" parameterType="map" resultType="map">
-        SELECT id, monitor_id, channel_id, metadata_id, state, consecutive_breach_count,
+        SELECT id, monitor_id, subject_type, channel_id, metadata_id, state, consecutive_breach_count,
                last_value_json, open_alert_event_id, last_change_time, last_evaluated_time
         FROM sentinel_trigger_state
         WHERE monitor_id = #{monitorId}
@@ -817,5 +843,66 @@
         WHERE presence.channel_id = #{channelId}
           AND lease.lease_name LIKE 'sentinel-presence-%' AND lease.expires_time &gt; (clock_timestamp() AT TIME ZONE 'UTC')
     </select>
+
+    <!-- ========== MATCH_SAMPLE (table sentinel_match_sample) ========== -->
+
+    <resultMap id="matchSampleResult" type="map">
+        <result property="id" column="id" />
+        <result property="node_id" column="node_id" />
+        <result property="monitor_id" column="monitor_id" />
+        <result property="channel_id" column="channel_id" />
+        <result property="sample_time" column="sample_time" javaType="java.sql.Timestamp" />
+        <result property="match_count" column="match_count" />
+        <result property="samples_json" column="samples_json" />
+        <result property="complete" column="complete" />
+    </resultMap>
+
+    <!-- MatchSampleRepository re-executes this under a BATCH session, as ActivityRepository does
+         insertActivitySample. -->
+    <insert id="insertMatchSample" parameterType="map">
+        INSERT INTO sentinel_match_sample (node_id, monitor_id, channel_id, sample_time, match_count, samples_json,
+            complete, second_counts)
+        VALUES (#{node_id}, #{monitor_id}, #{channel_id,jdbcType=VARCHAR}, #{sample_time}, #{match_count}, #{samples_json},
+            #{complete}, #{second_counts})
+    </insert>
+
+    <resultMap id="matchCountResult" type="map">
+        <result property="node_id" column="node_id" />
+        <result property="sample_time" column="sample_time" javaType="java.sql.Timestamp" />
+        <result property="match_count" column="match_count" />
+        <result property="second_counts" column="second_counts" />
+        <result property="complete" column="complete" />
+    </resultMap>
+
+    <!-- Rows without a channel are each node's heartbeat, written every flush. The evaluator reads
+         them one by one, oldest first per node, to count a window to the second and to see whether
+         each node covered it; the matched lines are not read. -->
+    <select id="listMatchSampleCounts" parameterType="map" resultMap="matchCountResult">
+        SELECT node_id, sample_time, match_count, second_counts, complete
+        FROM sentinel_match_sample
+        WHERE monitor_id = #{monitorId} AND channel_id IS NULL
+            AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
+        ORDER BY node_id, sample_time, id
+    </select>
+
+    <select id="listRecentMatchSamples" parameterType="map" resultMap="matchSampleResult">
+        SELECT id, node_id, monitor_id, channel_id, sample_time, match_count, samples_json, complete
+        FROM sentinel_match_sample
+        WHERE monitor_id = #{monitorId} AND node_id = #{nodeId}
+            AND sample_time &gt;= #{from} AND sample_time &lt;= #{to} AND samples_json IS NOT NULL
+        ORDER BY sample_time DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!-- Chunked, like deleteActivitySamplesOlderThan. PostgreSQL has no LIMIT on DELETE, so a key
+         subquery picks the chunk. chunkSize is a plugin constant (see ChunkedDelete). -->
+    <delete id="deleteMatchSamplesOlderThan" parameterType="map">
+        DELETE FROM sentinel_match_sample
+        WHERE id IN (
+            SELECT id FROM sentinel_match_sample
+            WHERE sample_time &lt; #{cutoff}
+            LIMIT ${chunkSize}
+        )
+    </delete>
 
 </mapper>

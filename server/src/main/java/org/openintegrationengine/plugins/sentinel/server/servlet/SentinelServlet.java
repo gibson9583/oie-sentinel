@@ -35,6 +35,8 @@ import com.mirth.connect.server.api.MirthServlet;
 import com.mirth.connect.server.controllers.ControllerFactory;
 
 import org.openintegrationengine.plugins.sentinel.server.SentinelServicePlugin;
+import org.openintegrationengine.plugins.sentinel.server.alert.ServerAlertReach;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.server.service.ActionService;
 import org.openintegrationengine.plugins.sentinel.server.service.ActivityQueryService;
@@ -44,6 +46,7 @@ import org.openintegrationengine.plugins.sentinel.server.service.MaintenanceWind
 import org.openintegrationengine.plugins.sentinel.server.service.MetricsService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorHistoryService;
 import org.openintegrationengine.plugins.sentinel.server.service.MonitorService;
+import org.openintegrationengine.plugins.sentinel.server.service.NotificationService;
 import org.openintegrationengine.plugins.sentinel.server.service.ProblemService;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.server.util.Json;
@@ -53,6 +56,8 @@ import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
 import org.openintegrationengine.plugins.sentinel.shared.model.ChannelInfo;
 import org.openintegrationengine.plugins.sentinel.shared.model.MaintenanceWindow;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorKind;
+import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.PagedResult;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 import org.openintegrationengine.plugins.sentinel.shared.model.UserInfo;
@@ -172,7 +177,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String createMonitor(String monitorJson) {
         try {
-            return Json.write(MonitorService.create(readBody(monitorJson, Monitor.class), getCurrentUserId()));
+            Monitor monitor = readBody(monitorJson, Monitor.class);
+            requireUnrestrictedForLog(monitor);
+            return Json.write(MonitorService.create(monitor, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("createMonitor", e);
         }
@@ -186,7 +193,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String updateMonitor(int id, String monitorJson) {
         try {
-            return Json.write(MonitorService.update(id, readBody(monitorJson, Monitor.class), getCurrentUserId()));
+            Monitor monitor = readBody(monitorJson, Monitor.class);
+            requireUnrestrictedForLog(monitor, MonitorService.get(id));
+            return Json.write(MonitorService.update(id, monitor, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("updateMonitor", e);
         }
@@ -199,6 +208,7 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String removeMonitor(int id) {
         try {
+            requireUnrestrictedForLog(MonitorService.get(id));
             MonitorService.delete(id, getCurrentUserId());
             return EMPTY_JSON;
         } catch (Exception e) {
@@ -213,6 +223,7 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String setMonitorEnabled(int id, boolean enabled) {
         try {
+            requireUnrestrictedForLog(MonitorService.get(id));
             return Json.write(MonitorService.setEnabled(id, enabled, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("setMonitorEnabled", e);
@@ -297,7 +308,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String createAction(String actionJson) {
         try {
-            return Json.write(ActionService.create(readBody(actionJson, Action.class), getCurrentUserId()));
+            Action action = readBody(actionJson, Action.class);
+            requireUnrestrictedForServerAlerts(action);
+            return Json.write(ActionService.create(action, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("createAction", e);
         }
@@ -313,7 +326,12 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String updateAction(int id, String actionJson) {
         try {
-            return Json.write(ActionService.update(id, readBody(actionJson, Action.class), getCurrentUserId()));
+            Action action = readBody(actionJson, Action.class);
+            if (doesUserHaveChannelRestrictions()) {
+                action.setId(id);
+                requireUnrestrictedForServerAlerts(ActionService.get(id), action);
+            }
+            return Json.write(ActionService.update(id, action, getCurrentUserId()));
         } catch (Exception e) {
             throw translate("updateAction", e);
         }
@@ -326,6 +344,9 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     @Override
     public String removeAction(int id) {
         try {
+            if (doesUserHaveChannelRestrictions()) {
+                requireUnrestrictedForServerAlerts(ActionService.get(id));
+            }
             ActionService.delete(id, getCurrentUserId());
             return EMPTY_JSON;
         } catch (Exception e) {
@@ -571,6 +592,19 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         }
     }
 
+    // ========== Notifications ==========
+
+    /** {@inheritDoc} */
+    @Override
+    public String getNotifications(Integer monitorId, Long from, Long to, int page, int pageSize) {
+        try {
+            return Json.write(NotificationService.list(monitorId, from, to, page, pageSize,
+                    authorizedChannelIds(null)));
+        } catch (Exception e) {
+            throw translate("getNotifications", e);
+        }
+    }
+
     // ========== Dashboard & activity ==========
 
     /**
@@ -786,12 +820,14 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * {@inheritDoc}
      * <p>Exports global configuration under {@code PERMISSION_MANAGE}.
      * This is a configuration-management capability, broader than the
-     * channel-scoped monitor reads available with {@code PERMISSION_VIEW}.</p>
+     * channel-scoped monitor reads available with {@code PERMISSION_VIEW}.
+     * Log monitors read the whole engine's log, so a caller with channel
+     * restrictions gets the export without them.</p>
      */
     @Override
     public String exportConfiguration() {
         try {
-            return Json.write(ExportImportService.export());
+            return Json.write(ExportImportService.export(!doesUserHaveChannelRestrictions()));
         } catch (Exception e) {
             throw translate("exportConfiguration", e);
         }
@@ -810,6 +846,21 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
         try {
             JsonNode document = readBodyTree(bodyJson);
             ExportImportService.validateDocument(document);
+            for (JsonNode entry : document.path("monitors")) {
+                MonitorType type = importedType(entry);
+                if (type == null || type.kind() != MonitorKind.CHANNEL) {
+                    // Fail closed: an entry this check can't read is refused too.
+                    requireUnrestrictedForLogMonitors();
+                }
+            }
+            if (doesUserHaveChannelRestrictions() && !document.path("actions").isEmpty()) {
+                // One read of the stored actions and monitors for every entry.
+                ServerAlertReach reach = ServerAlertReach.current();
+                ExportImportService.ImportedActionReader reader = new ExportImportService.ImportedActionReader();
+                for (JsonNode entry : document.path("actions")) {
+                    requireUnrestrictedForServerAlerts(reach, importedActions(reader, entry));
+                }
+            }
             if (!document.path("maintenanceWindows").isEmpty()
                     && document.path("maintenanceWindows").isArray()) {
                 requireScheduleImportPermission();
@@ -822,6 +873,79 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
     }
 
     // ========== Boundary helpers ==========
+
+    /**
+     * Log monitors read the whole engine's log, so only a caller without
+     * channel restrictions may create, change, enable, disable or delete one,
+     * import one, or turn a monitor into one.
+     */
+    private void requireUnrestrictedForLog(Monitor... monitors) {
+        for (Monitor monitor : monitors) {
+            if (monitor != null && monitor.getMonitorType() != null
+                    && monitor.getMonitorType().kind() != MonitorKind.CHANNEL) {
+                requireUnrestrictedForLogMonitors();
+            }
+        }
+    }
+
+    private void requireUnrestrictedForLogMonitors() {
+        if (doesUserHaveChannelRestrictions()) {
+            throw apiError(Status.FORBIDDEN,
+                    "Only users without channel restrictions can create or change Log monitors");
+        }
+    }
+
+    /**
+     * An action that can receive Log alerts delivers server-wide data, Log
+     * problems, notifications and their matched lines, to recipients its
+     * author chooses. So, like a Log monitor, only a caller without channel
+     * restrictions may create, change, delete or import one. See
+     * {@link ServerAlertReach} for "can receive".
+     */
+    private void requireUnrestrictedForServerAlerts(Action... actions) {
+        if (doesUserHaveChannelRestrictions()) {
+            requireUnrestrictedForServerAlerts(ServerAlertReach.current(), actions);
+        }
+    }
+
+    /** As above, against one read of the stored actions and monitors; a {@code null} action is refused. */
+    private void requireUnrestrictedForServerAlerts(ServerAlertReach reach, Action... actions) {
+        if (!doesUserHaveChannelRestrictions()) {
+            return;
+        }
+        for (Action action : actions) {
+            if (action == null || reach.receives(action)) {
+                throw apiError(Status.FORBIDDEN, "Only users without channel restrictions can create, change or "
+                        + "delete an action that can receive Log alerts");
+            }
+        }
+    }
+
+    /**
+     * What an import action entry would write and the stored action it would
+     * replace, as the import itself binds them; an entry that can't be read is
+     * {@code null}, so the check fails closed.
+     */
+    private static Action[] importedActions(ExportImportService.ImportedActionReader reader, JsonNode entry) {
+        ExportImportService.ImportedAction imported;
+        try {
+            imported = reader.read(entry);
+        } catch (Exception unreadable) {
+            return new Action[] {null};
+        }
+        return imported.replaced() == null ? new Action[] {imported.incoming()}
+                : new Action[] {imported.incoming(), imported.replaced()};
+    }
+
+    /** An import entry's type as the import itself reads it, or {@code null} when it can't be read. */
+    private static MonitorType importedType(JsonNode entry) {
+        try {
+            Monitor monitor = ExportImportService.readMonitor(entry);
+            return monitor != null ? monitor.getMonitorType() : null;
+        } catch (Exception unreadable) {
+            return null;
+        }
+    }
 
     private boolean isUserDirectoryReader() {
         Operation sentinelOperation = operation;
@@ -1042,6 +1166,8 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
      * confirm to an enumerating caller that the id exists. No-op (and no
      * extra fetch) for unrestricted callers. Runs BEFORE the service call so
      * a mutation can never take effect on a channel the caller may not see.
+     * A server problem is never visible to a restricted caller, and its
+     * missing channel id never reaches the engine's redaction check.
      *
      * @param id the alert-event id about to be read or mutated
      */
@@ -1050,15 +1176,15 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
             return;
         }
         AlertEvent event = ProblemService.get(id); // NoSuchElementException -> 404 via translate
-        if (isChannelRedacted(event.getChannelId())) {
+        if (!ProblemSubject.of(event).visibleTo(true, channelId -> !isChannelRedacted(channelId))) {
             throw new MirthApiException(Status.NOT_FOUND);
         }
     }
 
     /**
      * Bulk-acknowledge companion to {@link #assertProblemVisible}: silently
-     * drops ids whose problem is on a redacted channel (mirroring the
-     * service's skip-don't-fail semantics for the batch), along with ids
+     * drops ids whose problem is on a redacted channel or is a server problem
+     * (mirroring the service's skip-don't-fail semantics for the batch), along with ids
      * that don't resolve at all — the service would skip those anyway. The
      * returned count then honestly reports how many the caller was actually
      * allowed to acknowledge.
@@ -1073,7 +1199,8 @@ public class SentinelServlet extends MirthServlet implements SentinelServletInte
                 continue;
             }
             try {
-                if (!isChannelRedacted(ProblemService.get(id).getChannelId())) {
+                if (ProblemSubject.of(ProblemService.get(id))
+                        .visibleTo(true, channelId -> !isChannelRedacted(channelId))) {
                     visible.add(id);
                 }
             } catch (NoSuchElementException e) {

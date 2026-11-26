@@ -227,12 +227,22 @@ export const bulkAcknowledgeProblems = (ids, comment) =>
 export const bulkResolveProblems = (ids, comment) =>
     apiPost(`${BASE}/problems/_bulkResolve`, { ids: ids || [], comment: comment || '' });
 
+/* ---- Notifications ------------------------------------------------------ */
+
+/** GET /notifications -> PagedResult<AlertEvent> { items, total, page, pageSize },
+    newest first. Items are kind NOTIFICATION, status RESOLVED; suppressed=true
+    means a schedule, a Suppressed by monitor or a disabled monitor held it back.
+    params: { monitorId, from (epoch millis), to (epoch millis), page, pageSize } */
+export const getNotifications = (params) => apiGet(`${BASE}/notifications`, params);
+
 /* ---- Dashboard / activity ----------------------------------------------- */
 
 /** GET /dashboard/summary -> DashboardSummary
     { openBySeverity, openTotal, unacknowledged, monitorsEnabled, monitorsTotal,
       channelsWatched, recentProblems, topChannels, lastCollectorRun,
-      lastEvaluatorRun, lastConnectorEvent } */
+      lastEvaluatorRun, lastConnectorEvent, logPipeline }. logPipeline is
+    { nodeId, queueCapacity, queueDepth, droppedSinceStart, matcherAlive,
+      appenderAttached, notCountingReason }, sent to unrestricted callers only. */
 export const getDashboardSummary = () => apiGet(`${BASE}/dashboard/summary`);
 
 /** GET /dashboard/coverage -> { coversAll, channelIds } */
@@ -284,7 +294,7 @@ export const getCoreUsers = () => apiGet(`${BASE}/core/users`);
 
 /** GET /settings -> SentinelSettings
     { collectorIntervalSeconds, evaluatorIntervalSeconds, sampleRetentionDays,
-      trendRetentionDays, resolvedAlertRetentionDays } */
+      trendRetentionDays, resolvedAlertRetentionDays, logQueueCapacity } */
 export const getSettings = () => apiGet(`${BASE}/settings`);
 
 /** PUT /settings -> SentinelSettings (MANAGE-gated) */

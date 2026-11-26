@@ -71,6 +71,7 @@ public class AlertEventFilter {
     public static final Set<String> ALLOWED_SORT_COLUMNS = Set.of("opened_time", "severity", "channel_id");
 
     private AlertStatus status;
+    private AlertKind kind;
     private List<Severity> severityIn;
     private List<String> channelIdIn;
     private Integer monitorId;
@@ -100,6 +101,20 @@ public class AlertEventFilter {
      */
     public void setStatus(AlertStatus status) {
         this.status = status;
+    }
+
+    /**
+     * @return if non-null, restrict to events of this kind
+     */
+    public AlertKind getKind() {
+        return kind;
+    }
+
+    /**
+     * @param kind if non-null, restrict to events of this kind
+     */
+    public void setKind(AlertKind kind) {
+        this.kind = kind;
     }
 
     /**

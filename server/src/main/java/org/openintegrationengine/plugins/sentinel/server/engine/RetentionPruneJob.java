@@ -18,14 +18,15 @@ import org.openintegrationengine.plugins.sentinel.server.db.ActivityRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.AlertEventRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.ConnectorStatusRepository;
 import org.openintegrationengine.plugins.sentinel.server.db.LeaseFence;
+import org.openintegrationengine.plugins.sentinel.server.db.MatchSampleRepository;
 import org.openintegrationengine.plugins.sentinel.server.service.SettingsService;
 import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
 
 /**
- * Daily retention pruning: keeps the four unbounded-growth Sentinel tables
- * (raw activity samples, hourly trend buckets, resolved alert history, and
- * connector status transitions) within the operator-configured retention
- * windows. Without this job a busy server accretes a sample row per channel
+ * Daily retention pruning: keeps the five unbounded-growth Sentinel tables
+ * (raw activity samples, hourly trend buckets, resolved alert history,
+ * connector status transitions, and log match samples) within the
+ * operator-configured retention windows. Without this job a busy server accretes a sample row per channel
  * every collector tick — and a status row per connector transition —
  * forever.
  *
@@ -34,6 +35,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.SentinelSettings;
  * CONNECTION_STATUS evaluator works from in-memory collector state), so the
  * rows only serve ad-hoc operator diagnosis, the same freshness class as the
  * raw samples they sit beside.</p>
+ *
+ * <p>Log match samples share it too, for the reason they exist: they are the
+ * raw per-flush counts the LOG_EVENTS evaluator sums over a window, the same
+ * kind of row as an activity sample, and no rollup is built from them.</p>
  *
  * <p>Retention values are re-read from {@link SettingsService} on every run
  * rather than captured at schedule time, so a settings change takes effect
@@ -108,16 +113,23 @@ public class RetentionPruneJob implements Job {
 
             int statusDeleted = ConnectorStatusRepository.deleteConnectorStatusEventsOlderThan(sampleCutoff, fence);
 
+            if (!SentinelLeadership.recheckFence(fence)) {
+                return;
+            }
+
+            int logMatchesDeleted = MatchSampleRepository.deleteSamplesOlderThan(sampleCutoff, fence);
+
             // Counts at info: pruning is destructive, so the log should
             // always answer "what did last night's run delete" without the
             // operator having to enable debug logging first.
             log.info("Retention prune complete: {} activity sample(s) older than {}d, "
                             + "{} trend bucket(s) older than {}d, {} resolved alert(s) older than {}d, "
-                            + "{} connector status event(s) older than {}d",
+                            + "{} connector status event(s) older than {}d, {} match sample(s) older than {}d",
                     samplesDeleted, settings.getSampleRetentionDays(),
                     trendsDeleted, settings.getTrendRetentionDays(),
                     alertsDeleted, settings.getResolvedAlertRetentionDays(),
-                    statusDeleted, settings.getSampleRetentionDays());
+                    statusDeleted, settings.getSampleRetentionDays(),
+                    logMatchesDeleted, settings.getSampleRetentionDays());
         } catch (Throwable t) {
             log.error("Retention prune run failed", t);
         }

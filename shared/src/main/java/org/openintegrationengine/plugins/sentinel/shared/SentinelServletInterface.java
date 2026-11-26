@@ -601,6 +601,31 @@ public interface SentinelServletInterface extends BaseServletInterface {
     @MirthOperation(name = "sentinelBulkResolveProblems", display = "Bulk resolve Sentinel problems", permission = PERMISSION_ACKNOWLEDGE, type = ExecuteType.ASYNC)
     String bulkResolveProblems(@Param(value = "body", excludeFromAudit = true) String bodyJson) throws ClientException;
 
+    // ========== Notifications ==========
+
+    /**
+     * Lists notifications, the one-off alert events of kind NOTIFICATION,
+     * newest first. A channel-restricted caller sees only notifications on
+     * its channels, so no Log notification.
+     *
+     * @param monitorId filter on the raising monitor's id, or null for all
+     * @param from      earliest openedTime as epoch millis, or null for unbounded
+     * @param to        latest openedTime as epoch millis, or null for unbounded
+     * @param page      zero-based page index
+     * @param pageSize  rows per page
+     * @return JSON PagedResult of AlertEvent ({items, total, page, pageSize})
+     * @throws ClientException on invalid filter values or persistence failure
+     */
+    @GET
+    @Path("/notifications")
+    @Operation(summary = "Returns a paginated list of notifications, newest first")
+    @MirthOperation(name = "sentinelGetNotifications", display = "Get Sentinel notifications", permission = PERMISSION_VIEW, type = ExecuteType.ASYNC, auditable = false)
+    String getNotifications(@Param("monitorId") @QueryParam("monitorId") Integer monitorId,
+            @Param("from") @QueryParam("from") Long from,
+            @Param("to") @QueryParam("to") Long to,
+            @Param("page") @QueryParam("page") @DefaultValue("0") int page,
+            @Param("pageSize") @QueryParam("pageSize") @DefaultValue("25") int pageSize) throws ClientException;
+
     // ========== Dashboard & activity ==========
 
     /**

@@ -114,6 +114,9 @@ public final class ScopeResolver {
     /** Started-channel resolution with per-channel failure identities. */
     public static ChannelResolution resolveStartedChannelSet(Monitor monitor) {
         ChannelResolution resolution = new ChannelResolution();
+        if (watchesServer(monitor)) {
+            return resolution;
+        }
         ScopeType scopeType = monitor != null ? monitor.getScopeType() : null;
         if (scopeType == null) {
             // Validation prevents this on stored monitors, but the evaluator
@@ -146,6 +149,16 @@ public final class ScopeResolver {
                 break;
         }
         return resolution;
+    }
+
+    /**
+     * A server-wide monitor (LOG_EVENTS) resolves to no channel through
+     * either resolver. Its stored scope is ALL, the one scope that names no
+     * channel; read as a channel scope it would count every started channel
+     * as watched by a monitor that watches none of them.
+     */
+    private static boolean watchesServer(Monitor monitor) {
+        return ProblemSubject.forMonitor(monitor, null).isServer();
     }
 
     private static void addIfStarted(ChannelResolution resolution, String channelId, Monitor monitor) {
@@ -195,6 +208,9 @@ public final class ScopeResolver {
     /** All-state scope resolution with per-channel failure identities. */
     public static ChannelResolution resolveScopedChannelSet(Monitor monitor) {
         ChannelResolution resolution = new ChannelResolution();
+        if (watchesServer(monitor)) {
+            return resolution;
+        }
         ScopeType scopeType = monitor != null ? monitor.getScopeType() : null;
         if (scopeType == null) {
             log.warn("Monitor {} has no scope type; resolving to no channels",

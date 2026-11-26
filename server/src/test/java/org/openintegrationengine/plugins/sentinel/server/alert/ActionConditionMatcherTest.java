@@ -20,6 +20,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.openintegrationengine.plugins.sentinel.server.log.LogNotifications;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;
 import org.openintegrationengine.plugins.sentinel.shared.model.Severity;
@@ -488,6 +489,21 @@ class ActionConditionMatcherTest {
         @DisplayName("event type comparison is case-insensitive")
         void comparisonIsCaseInsensitive() {
             assertTrue(matches("[{'field':'EVENT_TYPE','operator':'=','value':'problem'}]"));
+        }
+
+        @Test
+        @DisplayName("a Log notification routes to NOTIFICATION rows and a problem to PROBLEM rows")
+        void notificationRoutesLikeTheOtherEdges() {
+            AlertPayload notification = payload(Severity.HIGH, MonitorType.LOG_EVENTS, 7, null,
+                    LogNotifications.EVENT_TYPE);
+            assertTrue(matches("[{'field':'EVENT_TYPE','operator':'=','value':'NOTIFICATION'}]", notification));
+            assertFalse(matches("[{'field':'EVENT_TYPE','operator':'=','value':'PROBLEM'}]", notification));
+            assertTrue(matches("[{'field':'EVENT_TYPE','operator':'=','value':'PROBLEM'}]"));
+            assertFalse(matches("[{'field':'EVENT_TYPE','operator':'=','value':'NOTIFICATION'}]"));
+            for (String operator : new String[] { "!=", "IN" }) {
+                assertFalse(matches("[{'field':'EVENT_TYPE','operator':'" + operator + "','value':'PROBLEM'}]",
+                        notification), operator + " fails closed for a notification as for any edge");
+            }
         }
 
         @ParameterizedTest

@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -614,8 +615,8 @@ public final class WebhookAlertSender implements AlertSender {
      * link straight to the responder), plus {@code ${valueJson}} (the
      * evaluator's measurement evidence) and {@code ${alertEventId}} (so a
      * receiving system can correlate a page back to a Sentinel problem, and
-     * deduplicate repeat sends of the same alert). Plain per-token
-     * {@code String.replace} for the same reason the email sender uses it:
+     * deduplicate repeat sends of the same alert). Plain token substitution
+     * for the same reason the email sender uses it:
      * unknown tokens stay verbatim in the body — visible to the operator
      * testing the action — because a template typo must never cost the
      * notification.
@@ -636,22 +637,27 @@ public final class WebhookAlertSender implements AlertSender {
      * {@link #renderHeaders} is applied to the whole rendered value and has no
      * per-token exemptions, which is the property that makes it impossible to
      * add a token that quietly skips it.</p>
+     *
+     * <p>{@code ${matches}} is a Log alert's matched lines as text, escaped
+     * like any scalar, empty for every other alert. All tokens are substituted
+     * in one pass ({@link TemplateTokens}), so logged text that contains a
+     * token, {@code ${valueJson}} included, is never expanded.</p>
      */
     private static String render(String template, AlertPayload payload, boolean escapeJson) {
         String valueJson = payload.getValueJson();
-        return template
-                .replace("${monitorName}", scalar(payload.getMonitorName(), escapeJson))
-                .replace("${channelName}", scalar(payload.getChannelName(), escapeJson))
-                .replace("${severity}", scalar(
-                        payload.getSeverity() != null ? payload.getSeverity().name() : "", escapeJson))
-                .replace("${status}", scalar(payload.getEventType(), escapeJson))
-                .replace("${message}", scalar(payload.getMessage(), escapeJson))
-                .replace("${runbookUrl}", scalar(payload.getRunbookUrl(), escapeJson))
-                .replace("${alertEventId}", String.valueOf(payload.getAlertEventId()))
-                // Raw on purpose: already a JSON document. "null" (not empty)
-                // keeps `{"details": ${valueJson}}` valid when the evaluator
-                // recorded no value.
-                .replace("${valueJson}", valueJson == null || valueJson.isBlank() ? "null" : valueJson);
+        Map<String, String> values = new HashMap<>();
+        values.put("monitorName", scalar(payload.getMonitorName(), escapeJson));
+        values.put("channelName", scalar(payload.getChannelName(), escapeJson));
+        values.put("severity", scalar(payload.getSeverity() != null ? payload.getSeverity().name() : "", escapeJson));
+        values.put("status", scalar(payload.getEventType(), escapeJson));
+        values.put("message", scalar(payload.getMessage(), escapeJson));
+        values.put("runbookUrl", scalar(payload.getRunbookUrl(), escapeJson));
+        values.put("alertEventId", String.valueOf(payload.getAlertEventId()));
+        // Raw on purpose: already a JSON document. "null" (not empty) keeps
+        // `{"details": ${valueJson}}` valid when the evaluator recorded no value.
+        values.put("valueJson", valueJson == null || valueJson.isBlank() ? "null" : valueJson);
+        values.put("matches", scalar(payload.matchesText(), escapeJson));
+        return TemplateTokens.render(template, values);
     }
 
     /** One substituted scalar: null-safe, and JSON-string-escaped for JSON bodies. */

@@ -10,6 +10,7 @@ import java.util.Set;
 
 import com.mirth.connect.model.Channel;
 import com.mirth.connect.server.controllers.ChannelController;
+import org.openintegrationengine.plugins.sentinel.server.engine.ProblemSubject;
 import org.openintegrationengine.plugins.sentinel.server.engine.ScopeResolver;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
@@ -28,10 +29,18 @@ public final class MonitorVisibility {
      * nonempty scope. Never use evaluator target resolution here: it can
      * omit stopped, deleted, or temporarily unreadable members. A null
      * authorized set denotes a trusted unrestricted caller.
+     *
+     * <p>A server-wide monitor (LOG_EVENTS) is hidden from every restricted
+     * reader, even one authorized for every channel that exists. Its ALL
+     * scope would otherwise show it to that reader while its problems, which
+     * belong to no channel, stay hidden by {@code ProblemSubject#visibleTo};
+     * and a grant covering today's channels says nothing about the server's
+     * log.</p>
      */
     public static boolean isVisible(Monitor monitor, Set<String> authorizedChannelIds) {
         if (monitor == null) return false;
         if (authorizedChannelIds == null) return true;
+        if (ProblemSubject.forMonitor(monitor, null).isServer()) return false;
         if (authorizedChannelIds.isEmpty() || monitor.getScopeType() == null) return false;
         ScopeType type = monitor.getScopeType();
         String scopeId = monitor.getScopeId();

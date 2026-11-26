@@ -112,6 +112,7 @@ class ImportScheduleAuthorizationTest {
         List<String> checked;
         public PermissionServlet() { super(null, null); }
         @Override protected int getCurrentUserId() { return 42; }
+        @Override protected boolean doesUserHaveChannelRestrictions() { return false; }
         @Override protected boolean isUserAuthorized() {
             checked.add(operation.getName());
             return schedulesAllowed;

@@ -23,7 +23,10 @@ import {
     StatTile, SeverityChip, Sparkline, useApi, useUsernames, toast,
     ChannelActivityPanel, ChannelPicker, TimeRangePicker, rangeWindow, useMonitoredChannels,
     fmtAgo, fmtTime, fmtNum, SEVERITY_ORDER, SEVERITY_META, MONITOR_TYPE_META,
+    isLogAlert, LOG_LABEL,
 } from '../ui.jsx';
+import { MatchesPanel, matchDetailsOf } from './matches-panel.jsx';
+import { LogCaptureStatus } from './log-capture-status.jsx';
 
 const React = platform.React;
 
@@ -132,6 +135,7 @@ function ProblemInline({ problem, channelNameOf, onBack }) {
     const ev = (d && d.event) || problem;
     const dispatches = (d && d.dispatches) || [];
     const typeMeta = d && MONITOR_TYPE_META[d.monitorType];
+    const logDetails = matchDetailsOf(ev, d && d.monitorType);
     return (
         <div className="panel">
             <div className="panel-header">
@@ -161,7 +165,9 @@ function ProblemInline({ problem, channelNameOf, onBack }) {
                     {d ? d.monitorName : `#${ev.monitorId}`}
                     {typeMeta ? <span className="sn-hint"> ({typeMeta.label})</span> : null}
                 </MetaRow>
-                <MetaRow label="Channel">{(d && d.channelName) || channelNameOf(ev.channelId)}</MetaRow>
+                <MetaRow label="Channel">
+                    {(d && d.channelName) || (isLogAlert(ev) ? LOG_LABEL : channelNameOf(ev.channelId))}
+                </MetaRow>
                 {d && d.connectorName ? <MetaRow label="Connector">{d.connectorName}</MetaRow> : null}
                 <MetaRow label="Opened">{fmtTime(ev.openedTime)} ({fmtAgo(ev.openedTime)})</MetaRow>
                 {ev.resolvedTime ? <MetaRow label="Resolved">{fmtTime(ev.resolvedTime)}</MetaRow> : null}
@@ -171,7 +177,9 @@ function ProblemInline({ problem, channelNameOf, onBack }) {
                         {ev.ackComment ? ` — ${ev.ackComment}` : ''}
                     </MetaRow>
                 ) : null}
-                <LastValue detailsJson={ev.detailsJson} />
+                {logDetails ? (
+                    <div style={{ marginTop: 8 }}><MatchesPanel details={logDetails} /></div>
+                ) : <LastValue detailsJson={ev.detailsJson} />}
                 <div style={{ marginTop: 12 }}>
                     <div style={LABEL_STYLE}>Dispatched actions</div>
                     {detail.loading ? null : dispatches.length === 0 ? (
@@ -399,7 +407,7 @@ export function DashboardPage() {
                                                 title="Show details"
                                                 onClick={() => setSelected(p)}>
                                                 <td><SeverityChip severity={p.severity} /></td>
-                                                <td>{channelNameOf(p.channelId)}</td>
+                                                <td>{isLogAlert(p) ? LOG_LABEL : channelNameOf(p.channelId)}</td>
                                                 <td>{p.message}</td>
                                                 <td title={fmtTime(p.openedTime)}>{fmtAgo(p.openedTime)}</td>
                                                 <td>
@@ -486,6 +494,7 @@ export function DashboardPage() {
             </div>
 
             <HealthFootnote summary={summary} />
+            {summary.logPipeline ? <LogCaptureStatus status={summary.logPipeline} /> : null}
         </div>
     );
 }
