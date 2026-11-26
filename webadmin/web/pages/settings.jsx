@@ -60,8 +60,8 @@ const SETTINGS_FIELDS = [
         key: 'logQueueCapacity',
         label: 'Log queue capacity (lines)',
         min: 100, max: 10000,
-        hint: 'Log lines each node holds for Log monitors before it drops new ones. Changes this '
-            + 'node when saved and the other nodes within one collector interval. Range 100 to 10,000.',
+        hint: 'Log lines held for Log monitors before new ones are dropped. Takes effect within one '
+            + 'collector interval. Range 100 to 10,000.',
     },
 ];
 

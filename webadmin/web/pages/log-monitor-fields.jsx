@@ -182,8 +182,7 @@ export function LogMonitorFields({ cfg, setCfg }) {
             {shown.window ? (
                 <Num label="Window (seconds)" value={cfg.windowSeconds} min={1}
                     onChange={(v) => setCfg({ windowSeconds: v })}
-                    hint={'Counted across all cluster nodes. At least the evaluator interval and at most '
-                        + 'the sample retention.'} />
+                    hint="At least the evaluator interval and at most the sample retention." />
             ) : null}
 
             <Choice label="Result" value={c.outcome} options={OUTCOMES}

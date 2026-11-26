@@ -58,6 +58,8 @@ test('Settings shows the log queue capacity and sends it on every save', async (
     let tree = render(form({}));
     const label = tree.find((n) => n.type === 'label' && n.children.includes('Log queue capacity (lines)'));
     assert.ok(label, 'the field is shown');
+    assert.match(textOf(tree), /Takes effect within one collector interval/);
+    assert.doesNotMatch(textOf(tree), /cluster|node/i, 'no cluster talk in the Settings text');
     const input = tree.filter((n) => n.type === 'input').find((n) => n.props.value === '2500');
     assert.equal(input.props.min, 100);
     assert.equal(input.props.max, 10000);

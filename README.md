@@ -95,8 +95,7 @@ many lines were dropped, and whether log capture is counting. When it isn't, the
 Prometheus has the same numbers as `sentinel_log_*`.
 
 Every collector interval (set in Settings), each node writes one count row per Log monitor to
-`sentinel_match_sample`, zero counts included. The leader (see [Clustered
-deployments](#clustered-deployments)) adds up the rows from all nodes. A node marks a row incomplete
+`sentinel_match_sample`, zero counts included. A node marks a row incomplete
 when lines may have gone uncounted: lines were dropped, a pattern check hit its time limit, log
 capture was not attached, or the node restarted. An incomplete count can only be too low, so it can
 still fire an "at least" monitor or clear an "at most" problem. It can't clear an "at least" problem

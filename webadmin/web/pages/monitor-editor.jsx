@@ -84,7 +84,7 @@ function ScopeField({ kind, scopeType, scopeId, setScopeType, setScopeId, channe
         return (
             <div className="field span-2">
                 <label>Scope</label>
-                <div>The engine log on every cluster node</div>
+                <div>The engine log</div>
             </div>
         );
     }

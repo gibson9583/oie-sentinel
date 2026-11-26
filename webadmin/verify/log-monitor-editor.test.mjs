@@ -46,8 +46,10 @@ test('kind comes first, Log preselects its one type, and a saved monitor keeps i
     assert.equal(tree.some((n) => n.type === 'button' && flat(n.children).includes('Test')), false, 'no Test for Log');
     assert.ok(tree.includes(mod.LOG_PREVIEW_HINT));
     const shown = textOf(tree);
-    assert.match(shown, /The engine log on every cluster node/);
+    assert.match(shown, /The engine log/);
     assert.doesNotMatch(shown, /Server/);
+    assert.doesNotMatch(shown, /cluster/i, 'no cluster talk in the editor');
+    assert.doesNotMatch(textOf(field(tree, 'Kind')), /cluster/i);
 
     const saved = { ...logMonitor, scopeType: 'CHANNEL', scopeId: 'x',
         configJson: JSON.stringify({ condition: 'AT_MOST', threshold: 0, windowSeconds: 600, outcome: 'PROBLEM' }) };

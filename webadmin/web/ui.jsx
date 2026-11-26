@@ -229,7 +229,7 @@ export const MONITOR_TYPE_META = {
 /* What a monitor watches, the editor's first choice. */
 export const MONITOR_KINDS = [
     { key: 'CHANNEL', label: 'Channel', description: 'Watches channels: traffic, errors, queues, connectors and state.' },
-    { key: 'LOG', label: 'Log', description: 'Watches the lines the engine logs on every cluster node.' },
+    { key: 'LOG', label: 'Log', description: 'Watches the lines the engine logs.' },
 ];
 
 /** 'LOG' for LOG_EVENTS, 'CHANNEL' for every other type. The server refuses a
