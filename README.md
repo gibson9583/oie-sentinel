@@ -63,14 +63,20 @@ immediately.
 The monitor editor asks for the kind first: **Channel** for the seven channel types above, or
 **Log** for the Log lines type. A Log monitor fires on each matching line, on at least N matching
 lines within a window (too many), or on at most N within a window (too few, such as a missing
-heartbeat). Actions send its notifications and problems alike.
+heartbeat). Actions send its notifications and problems alike, except that an action whose mode is
+**On resolve** never gets a notification.
 
 A notification is a one-off entry in the **Notifications** tab. It can't be acknowledged or
 resolved. With each occurrence as the condition, every matching line gets its own notification, up
 to 100 per monitor on each node in each collector interval, and one summary notification covers the
-rest. A problem stays open in the Problems tab until the condition goes away, a person resolves it,
-or the **Clear after** time set in the editor has passed since the condition was last true. Lines
-that match while it is open are added to it.
+rest.
+
+A problem stays open in the Problems tab until it clears. **Clears** in the editor picks one way:
+when the condition goes away (the default), only when a person resolves it, or after a set time
+(**Clear after**, counted from the last evaluation at which the condition was true, even when it
+went away sooner). A person can resolve any problem by hand. Lines that match while it is open are
+added to it. With each occurrence as the condition, a problem opens when at least one matching line
+is within the window.
 
 For example, a heartbeat monitor opens a problem when no line matching `HEARTBEAT` arrives in 10
 minutes (at most 0) and clears when one does. A deploy monitor sends a notification for each line
@@ -107,6 +113,11 @@ the second: a line logged before the window starts doesn't count, even when its 
 written late. If the engine database can't be written for so long that one row's lines fall in
 more than 3,600 different seconds, that row keeps only its line count, and a window that starts
 within the period that row covers is incomplete.
+
+A window is the latest stretch of its length that has been counted. A count row is written up to
+one collector interval after the lines in it were logged, so a window ends where the newest rows
+end, up to one collector interval before the evaluation. A line logged just before one evaluation
+is counted by a later one.
 
 A window is also incomplete until count rows cover all of it, from its start to now, with no gap
 longer than two collector intervals. An incomplete window works as described above. So a monitor
@@ -156,6 +167,11 @@ Sentinel stores them with the count rows in `sentinel_match_sample`, kept for th
 retention, and with the problem or notification, kept for the **Resolved alert retention**. Turning
 the option off hides them in the UI and in what actions send, and the stored copies stay until
 retention removes them. The option is off by default.
+
+Matched lines are the engine's log text as it was logged, cut to length and otherwise unchanged. A
+script or connector that logs message content puts that content in them. Sentinel doesn't filter or
+mask it, and actions send it to their recipients, `${matches}` in an email subject included (there,
+line breaks and other control characters become spaces).
 
 **Problems**
 - Problem list with server-side filtering/paging, bulk acknowledge, and a detail pane with the
