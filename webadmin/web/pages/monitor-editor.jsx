@@ -16,7 +16,7 @@ import {
 import { seedConfigs, buildConfig } from './monitor-config.js';
 import { ConfigFields } from './monitor-config-fields.jsx';
 import { MonitorHistoryPanel } from './monitor-history.jsx';
-import { LOG_PREVIEW_HINT } from './log-monitor-fields.jsx';
+import { LOG_PREVIEW_HINT, normalizeLogConfig } from './log-monitor-fields.jsx';
 
 const React = platform.React;
 
@@ -157,6 +157,11 @@ export function MonitorEditor({ monitor, monitors, channels, groups, tags, manag
     const others = (monitors || []).filter((m) => (!monitor || m.id !== monitor.id)
         && monitorKind(m.monitorType) === kind);
     const scope = isLog ? 'ALL' : scopeType;
+    const logCfg = isLog ? normalizeLogConfig(cfg) : null;
+    const notifies = !!logCfg && logCfg.outcome === 'NOTIFICATION';
+    /* The history counts problems; for a saved monitor that sends notifications, say so. */
+    const savedNotifies = !isNew && monitorKind(monitor.monitorType) === 'LOG'
+        && normalizeLogConfig(seedConfigs(monitor)[monitor.monitorType] || {}).outcome === 'NOTIFICATION';
 
     /** Editor state -> Monitor wire object; throws Error on client-side issues. */
     const buildPayload = () => {
@@ -305,7 +310,9 @@ export function MonitorEditor({ monitor, monitors, channels, groups, tags, manag
                             <input type="number" min="1" step="1" value={minBreaches}
                                 onChange={(e) => setMinBreaches(e.target.value)} />
                             <div className="hint">
-                                Ticks the condition must hold before a problem opens.
+                                {!notifies ? 'Ticks the condition must hold before a problem opens.'
+                                    : logCfg.condition === 'EACH' ? 'Not used when each occurrence is a notification.'
+                                        : 'Ticks the condition must hold before a notification is sent.'}
                             </div>
                         </div>
                         <div className="field">
@@ -320,8 +327,11 @@ export function MonitorEditor({ monitor, monitors, channels, groups, tags, manag
                                 {isLog
                                     ? 'While the selected monitor has an open problem, '
                                     : 'While the selected monitor has an open problem on the same channel, '}
-                                this monitor's notifications are suppressed. Its open problems are
-                                still tracked and become eligible when the dependency clears.
+                                {notifies
+                                    ? 'this monitor\'s notifications are held back and never sent to actions. '
+                                        + 'They still appear in the Notifications tab.'
+                                    : 'this monitor\'s notifications are suppressed. Its open problems are '
+                                        + 'still tracked and become eligible when the dependency clears.'}
                                 {isLog ? ' Only Log monitors are listed.' : ''}
                             </div>
                         </div>
@@ -370,7 +380,7 @@ export function MonitorEditor({ monitor, monitors, channels, groups, tags, manag
         </div>
         {/* Only for a saved monitor: an unsaved draft has no id to query, and
             no history to have. */}
-        {!isNew ? <MonitorHistoryPanel monitorId={monitor.id} /> : null}
+        {!isNew ? <MonitorHistoryPanel monitorId={monitor.id} notifications={savedNotifies} /> : null}
         </>
     );
 }

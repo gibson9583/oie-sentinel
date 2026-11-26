@@ -96,7 +96,7 @@ function dayLabel(t) {
  * acknowledge-to-dismiss modals), and the range control sits once in the panel
  * header above everything it scopes.
  */
-export function MonitorHistoryPanel({ monitorId }) {
+export function MonitorHistoryPanel({ monitorId, notifications }) {
     const [rangeKey, setRangeKey] = React.useState('30d');
     // Memoised: these are useApi deps, so a fresh Date.now() per render would
     // refetch on every render.
@@ -151,6 +151,12 @@ export function MonitorHistoryPanel({ monitorId }) {
                 </div>
             </div>
             <div className="panel-body">
+                {notifications ? (
+                    <div className="sn-hint" style={{ marginBottom: 8 }}>
+                        The history counts problems only. This monitor sends notifications, which are listed
+                        in the Notifications tab.
+                    </div>
+                ) : null}
                 {api.error ? (
                     <div style={{ marginBottom: 8 }}>
                         <span className="text-err">Could not load history.</span>{' '}

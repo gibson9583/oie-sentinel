@@ -121,7 +121,7 @@ function NotificationBody({ event, detail, label, matchesNote }) {
             <div className="panel mb-3">
                 <div className="panel-header">Matches</div>
                 <div className="panel-body">
-                    {matches ? <MatchesPanel details={matches} />
+                    {matches ? <MatchesPanel details={matches} notification />
                         : <div className="sn-hint">{matchesNote || 'No match details were recorded.'}</div>}
                 </div>
             </div>

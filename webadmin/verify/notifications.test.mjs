@@ -72,6 +72,11 @@ test('the Notifications list filters by monitor and date and shows its detail as
         assert.ok(body.includes(expected), `${expected} is shown`);
     }
     assert.doesNotMatch(body, /Acknowledge|Resolve|Server/);
+    const windowNote = { ...note, detailsJson: JSON.stringify({ condition: 'AT_LEAST', count: 3, threshold: 2,
+        windowSeconds: 300, lastBreach: '2026-11-21T10:00:00Z' }) };
+    const windowBody = textOf(mod.NotificationBody({ event: windowNote, detail: { ...detail, event: windowNote }, label: 'Log' }));
+    assert.match(windowBody, /Condition last true/);
+    assert.doesNotMatch(windowBody, /counts from here/, 'a notification has nothing to clear');
     const html = renderHtml(mod, mod.NotificationBody, { event: note, detail, label: 'Log' })
         + renderHtml(mod, mod.NotificationTable, { items: [note], monitorNames: {}, channelNames: {}, onOpen: () => {} });
     assert.equal(html.includes('<script>') || html.includes('<b>x'), false, html);

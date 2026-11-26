@@ -83,7 +83,7 @@ function Row({ label, children }) {
 }
 
 /** The condition, count, window, per-node counts and matched lines of a Log alert. */
-export function MatchesPanel({ details }) {
+export function MatchesPanel({ details, notification }) {
     const d = details || {};
     const perNode = d.perNode && typeof d.perNode === 'object' && !Array.isArray(d.perNode)
         ? Object.entries(d.perNode) : [];
@@ -107,7 +107,9 @@ export function MatchesPanel({ details }) {
                     {d.lastBreach ? (
                         <Row label="Condition last true">
                             {fmtTime(d.lastBreach)}
-                            <span className="text-text-dim"> (a problem that clears after a set time counts from here)</span>
+                            {notification ? null : (
+                                <span className="text-text-dim"> (a problem that clears after a set time counts from here)</span>
+                            )}
                         </Row>
                     ) : null}
                 </tbody>

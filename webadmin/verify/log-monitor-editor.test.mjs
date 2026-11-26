@@ -104,6 +104,38 @@ test('the Log fields shown follow the condition, the result and how a problem cl
         ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL', 'SEVERE'], 'an unknown stored level stays visible');
 });
 
+test('the hints say what the condition and result change for a Log monitor', () => {
+    const editorFor = (config) => {
+        const saved = { ...logMonitor, configJson: JSON.stringify(config) };
+        return expand(mount(mod, mod.MonitorEditor, { ...base, monitor: saved, monitors: [saved, otherLog] })());
+    };
+    const hint = (tree, label) => textOf(field(tree, label));
+
+    let tree = editorFor({ condition: 'EACH', outcome: 'NOTIFICATION' });
+    assert.match(hint(tree, 'Min consecutive breaches'), /Not used when each occurrence is a notification/);
+    assert.match(hint(tree, 'Suppressed by'), /held back and never sent to actions/);
+    assert.doesNotMatch(hint(tree, 'Suppressed by'), /become eligible/);
+    assert.match(textOf(tree), /counts problems only/, 'the history panel says notifications are not in it');
+
+    tree = editorFor({ condition: 'AT_LEAST', threshold: 2, windowSeconds: 300, outcome: 'NOTIFICATION' });
+    assert.match(hint(tree, 'Min consecutive breaches'), /before a notification is sent/);
+    assert.match(hint(tree, 'Suppressed by'), /held back and never sent to actions/);
+
+    tree = editorFor({ condition: 'AT_LEAST', threshold: 2, windowSeconds: 300, outcome: 'PROBLEM' });
+    assert.match(hint(tree, 'Min consecutive breaches'), /before a problem opens/);
+    assert.match(hint(tree, 'Suppressed by'), /become eligible when the dependency clears/);
+    assert.doesNotMatch(textOf(tree), /counts problems only/);
+
+    tree = expand(mount(mod, mod.MonitorEditor, { ...base, monitor: channelMonitor, monitors: [channelMonitor] })());
+    assert.match(hint(tree, 'Min consecutive breaches'), /before a problem opens/);
+    assert.match(hint(tree, 'Suppressed by'), /on the same channel/);
+
+    const eachProblem = deep(mod.LogMonitorFields({
+        cfg: { ...mod.seedConfigs(null).LOG_EVENTS, condition: 'EACH', outcome: 'PROBLEM' }, setCfg: () => {},
+    }));
+    assert.match(textOf(field(eachProblem, 'When')), /A problem opens when at least one matching line is within the window/);
+});
+
 test('a Log config round-trips and writes only the fields that apply', () => {
     const seeded = mod.seedConfigs(null).LOG_EVENTS;
     assert.deepEqual(mod.buildConfig('LOG_EVENTS', seeded), { minLevel: 'ERROR', condition: 'AT_LEAST', threshold: 1,

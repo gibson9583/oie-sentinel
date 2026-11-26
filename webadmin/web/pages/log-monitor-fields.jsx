@@ -172,7 +172,9 @@ export function LogMonitorFields({ cfg, setCfg }) {
                 hint={eachNotification
                     ? 'Each matching line sends its own notification, up to 100 per node per collector '
                         + 'run. The rest are counted in one summary notification.'
-                    : WHEN_HINTS[c.condition]} />
+                    : c.condition === 'EACH' && c.outcome === 'PROBLEM'
+                        ? 'A problem opens when at least one matching line is within the window.'
+                        : WHEN_HINTS[c.condition]} />
             {shown.threshold ? (
                 <Num label="Number of lines" value={cfg.threshold} min={c.condition === 'AT_MOST' ? 0 : 1}
                     onChange={(v) => setCfg({ threshold: v })} />

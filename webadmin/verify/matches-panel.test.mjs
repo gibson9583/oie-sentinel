@@ -66,6 +66,15 @@ test('the Matches panel never says the option is off when it cannot know', () =>
     assert.doesNotMatch(text, /does not include/);
 });
 
+test('the clear-after note on the last breach shows on problems only', () => {
+    const onProblem = textOf(problems.MatchesPanel({ details }));
+    assert.match(onProblem, /Condition last true/);
+    assert.match(onProblem, /counts from here/);
+    const onNotification = textOf(problems.MatchesPanel({ details, notification: true }));
+    assert.match(onNotification, /Condition last true/);
+    assert.doesNotMatch(onNotification, /counts from here/);
+});
+
 test('a Log problem shows "Log" in the Problems grid and detail and on the Dashboard, never "Server"', () => {
     const namesRef = { current: { channels: { c1: 'ADT' }, monitors: { 7: 'Script errors' }, userNameOf: () => 'admin' } };
     const channel = problems.buildColumns(namesRef).find((c) => c.key === 'channel');
