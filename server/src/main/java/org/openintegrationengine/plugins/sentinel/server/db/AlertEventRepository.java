@@ -594,9 +594,8 @@ public final class AlertEventRepository {
         Integer monitorId = toInteger(row.get("monitor_id"));
         event.setMonitorId(monitorId != null ? monitorId : 0);
 
-        event.setSubjectType(toSubjectType(row.get("subject_type")));
-        Object kind = row.get("event_kind");
-        event.setKind(kind != null ? AlertKind.valueOf(kind.toString()) : null);
+        event.setSubjectType(SubjectType.fromStored(row.get("subject_type")));
+        event.setKind(AlertKind.fromStored(row.get("event_kind")));
         event.setChannelId((String) row.get("channel_id"));
         event.setMetadataId(toInteger(row.get("metadata_id")));
 
@@ -690,14 +689,6 @@ public final class AlertEventRepository {
             return n.doubleValue();
         }
         return Double.valueOf(value.toString().trim());
-    }
-
-    /**
-     * Reads {@code subject_type}; NULL reads as CHANNEL, as the v14 backfill
-     * set it. Shared with {@link TriggerStateRepository}.
-     */
-    static SubjectType toSubjectType(Object value) {
-        return SubjectType.orChannel(value == null ? null : SubjectType.valueOf(value.toString().trim()));
     }
 
     /** Converts an {@link Instant} to the {@link Timestamp} MyBatis/JDBC expects as a bound parameter. */

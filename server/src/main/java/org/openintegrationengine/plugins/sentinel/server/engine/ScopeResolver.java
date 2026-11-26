@@ -153,10 +153,9 @@ public final class ScopeResolver {
 
     /**
      * A server-wide monitor (LOG_EVENTS) resolves to no channel through
-     * either resolver. Its stored scope is ALL only so the ALL-scope
-     * visibility rule applies to it; read as a channel scope it would count
-     * every started channel as watched by a monitor that watches none of
-     * them.
+     * either resolver. Its stored scope is ALL, the one scope that names no
+     * channel; read as a channel scope it would count every started channel
+     * as watched by a monitor that watches none of them.
      */
     private static boolean watchesServer(Monitor monitor) {
         return ProblemSubject.forMonitor(monitor, null).isServer();

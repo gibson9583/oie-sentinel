@@ -36,7 +36,6 @@ import org.openintegrationengine.plugins.sentinel.server.log.LogNotifications;
 import org.openintegrationengine.plugins.sentinel.shared.model.Action;
 import org.openintegrationengine.plugins.sentinel.shared.model.ActionDispatchLog;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertEvent;
-import org.openintegrationengine.plugins.sentinel.shared.model.AlertKind;
 import org.openintegrationengine.plugins.sentinel.shared.model.AlertStatus;
 import org.openintegrationengine.plugins.sentinel.shared.model.Monitor;
 import org.openintegrationengine.plugins.sentinel.shared.model.MonitorType;

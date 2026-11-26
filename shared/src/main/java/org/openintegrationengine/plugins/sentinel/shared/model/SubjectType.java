@@ -29,4 +29,12 @@ public enum SubjectType {
     public static SubjectType orChannel(SubjectType value) {
         return value == null ? CHANNEL : value;
     }
+
+    /**
+     * @param stored a {@code subject_type} column value, possibly {@code null}
+     * @return the type it names, or {@link #CHANNEL} when it is {@code null}
+     */
+    public static SubjectType fromStored(Object stored) {
+        return orChannel(stored == null ? null : valueOf(stored.toString().trim()));
+    }
 }

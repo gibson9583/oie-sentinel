@@ -106,7 +106,13 @@ import org.slf4j.LoggerFactory;
  *       channel. SQL Server cannot relax a column that a constraint or index
  *       uses, so there the trigger-state unique constraint (system-named since
  *       v1) is recreated as {@code uq_sentinel_trigger_state}, the name Oracle
- *       already uses, and the alert-event channel index is recreated.</li>
+ *       already uses, and the alert-event channel index is recreated. The
+ *       NULL-only backfills run again on every start, for rows an older
+ *       Sentinel writes after a downgrade.</li>
+ *   <li><b>15</b>: Per-second match counts. Adds {@code second_counts} to
+ *       {@code sentinel_match_sample}, so a Log window counts lines to the
+ *       second of their own time; rows written before it keep only their
+ *       total.</li>
  * </ul>
  * <p>Versions 7 to 12 shipped together in 1.1.1, after released schema v6, and
  * 13 shipped in 1.2.0.

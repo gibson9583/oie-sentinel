@@ -17,8 +17,9 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ScopeType;
  *
  * <ul>
  *   <li><b>Scope.</b> A Log monitor watches no channel; its scope is stored
- *       as ALL so the ALL-scope visibility rules treat it as the widest
- *       definition there is.</li>
+ *       as ALL, the one scope without a scope id. Visibility doesn't rest on
+ *       it: {@code MonitorVisibility} hides Log monitors from every user with
+ *       channel restrictions.</li>
  *   <li><b>No change of kind.</b> Trigger states and problems are keyed by
  *       kind, so switching would strand open problems under a subject the
  *       monitor no longer evaluates. This also keeps every suppression

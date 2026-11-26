@@ -106,6 +106,13 @@ public final class TriggerStateRepository {
      * @param triggerState the state to persist; its {@code id} field is
      *                     ignored (the database assigns it)
      * @return the same instance with {@code id} populated from the generated key
+     * <p>A server subject's row has a NULL {@code channel_id} and
+     * {@code metadata_id}. SQL Server and Oracle compare those NULLs as equal
+     * in the unique key, so they allow one such row per monitor; Derby, MySQL
+     * and PostgreSQL treat each NULL as distinct and would allow several. The
+     * leader inserts a server state only after reading none, under its fence,
+     * so there is one on every database.</p>
+     *
      * @throws RepositoryException on persistence failure, including a
      *                             unique-constraint violation on
      *                             {@code (monitor_id, channel_id, metadata_id)}
@@ -208,7 +215,7 @@ public final class TriggerStateRepository {
         TriggerState triggerState = new TriggerState();
         triggerState.setId(toInteger(row.get("id")));
         triggerState.setMonitorId(toInteger(row.get("monitor_id")));
-        triggerState.setSubjectType(AlertEventRepository.toSubjectType(row.get("subject_type")));
+        triggerState.setSubjectType(SubjectType.fromStored(row.get("subject_type")));
         triggerState.setChannelId((String) row.get("channel_id"));
         triggerState.setMetadataId(toInteger(row.get("metadata_id")));
 

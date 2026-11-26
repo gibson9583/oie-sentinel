@@ -21,4 +21,12 @@ public enum AlertKind {
     public static AlertKind orProblem(AlertKind value) {
         return value == null ? PROBLEM : value;
     }
+
+    /**
+     * @param stored an {@code event_kind} column value, possibly {@code null}
+     * @return the kind it names, or {@link #PROBLEM} when it is {@code null}
+     */
+    public static AlertKind fromStored(Object stored) {
+        return orProblem(stored == null ? null : valueOf(stored.toString().trim()));
+    }
 }

@@ -65,6 +65,12 @@ public final class MatchSampleRepository {
      * their matched lines: what the evaluator needs to count a window to the
      * second and to see which nodes covered it.
      *
+     * <p>Each evaluation reads every row in the window again. At the default
+     * 30-second collector interval that is 2,880 rows per node for a 24-hour
+     * window and about 20,000 for the longest window the default 7-day
+     * retention allows. Kept simple on purpose; if that read shows up, keep a
+     * running total per node instead.</p>
+     *
      * @return rows ordered by node id, then sample time, with {@code id} and
      *         {@code samplesJson} left {@code null}; never {@code null}
      * @throws RepositoryException on persistence failure
@@ -78,7 +84,7 @@ public final class MatchSampleRepository {
                 Object sampleTime = row.get("sample_time");
                 samples.add(new MatchSample(null, (String) row.get("node_id"), monitorId, null,
                         sampleTime != null ? ((Timestamp) sampleTime).toInstant() : null,
-                        toLong(row.get("match_count")), null, isTrue(row.get("complete")),
+                        toLong(row.get("match_count")), null, toBoolean(row.get("complete")),
                         (String) row.get("second_counts")));
             }
             return samples;
@@ -145,6 +151,7 @@ public final class MatchSampleRepository {
         return params;
     }
 
+    /** A row read for its matched lines; the per-second counts are not selected, so they are {@code null}. */
     private static MatchSample toSample(Map<String, Object> row) {
         // Derby and Oracle return identity and NUMBER columns as BigDecimal.
         Object id = row.get("id");
@@ -152,11 +159,11 @@ public final class MatchSampleRepository {
         return new MatchSample(id != null ? ((Number) id).longValue() : null, (String) row.get("node_id"),
                 ((Number) row.get("monitor_id")).intValue(), (String) row.get("channel_id"),
                 sampleTime != null ? ((Timestamp) sampleTime).toInstant() : null, toLong(row.get("match_count")),
-                (String) row.get("samples_json"), isTrue(row.get("complete")), (String) row.get("second_counts"));
+                (String) row.get("samples_json"), toBoolean(row.get("complete")), null);
     }
 
     /** Oracle's NUMBER(1) and SQL Server's BIT come back as numbers, the others as Boolean. */
-    private static boolean isTrue(Object value) {
+    private static boolean toBoolean(Object value) {
         return value instanceof Boolean flag ? flag : value instanceof Number number && number.intValue() != 0;
     }
 
