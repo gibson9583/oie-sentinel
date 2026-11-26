@@ -10,6 +10,7 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -145,6 +146,8 @@ public class SentinelMigrator extends Migrator {
      */
     public static final String VERSION_PROPERTY = "schema_version";
     private static final Logger log = LoggerFactory.getLogger(SentinelMigrator.class);
+
+    private final ColumnNullability nullability = new ColumnNullability(this);
 
     /**
      * {@inheritDoc}
@@ -480,7 +483,7 @@ public class SentinelMigrator extends Migrator {
         addColumnIfAbsent("sentinel_alert_event", "event_kind", varchar);
         // The existing rows get their subject and kind from
         // backfillSubjectsAndKinds, which runs after this step on every start.
-        makeSubjectChannelNullable();
+        nullability.makeSubjectChannelNullable(SUBJECT_TABLES);
         createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_kind", "event_kind, opened_time");
     }
 
@@ -526,126 +529,6 @@ public class SentinelMigrator extends Migrator {
         }
     }
 
-    /**
-     * A log problem has no channel. The base DDL stays v1-shaped (NOT NULL),
-     * so fresh installs and upgrades both relax the column here.
-     */
-    private void makeSubjectChannelNullable() throws MigrationException {
-        try {
-            if ("sqlserver".equalsIgnoreCase(getDatabaseType())) {
-                makeSqlServerChannelNullable();
-                return;
-            }
-            for (String table : SUBJECT_TABLES) {
-                makeNullable(table, "channel_id", "CHAR(36)");
-            }
-        } catch (MigrationException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new MigrationException("Failed to make Sentinel channel_id nullable", e);
-        }
-    }
-
-    /**
-     * SQL Server refuses ALTER COLUMN on a column that a constraint or index
-     * uses, so each dependent object is dropped, the column relaxed, and the
-     * object recreated. A failure can stop between any two of those
-     * statements; the recreate steps therefore run whenever the object is
-     * missing, not only right after a drop. v1 declared the trigger-state
-     * unique constraint inline, so SQL Server named it itself (UQ__...); it is
-     * found through the catalog and comes back named.
-     */
-    private void makeSqlServerChannelNullable() throws Exception {
-        if (!isNullable("sentinel_trigger_state", "channel_id")) {
-            for (Map.Entry<String, List<String>> constraint : sqlServerUniqueConstraints().entrySet()) {
-                if (constraint.getValue().contains("channel_id")) {
-                    executeStatement("ALTER TABLE sentinel_trigger_state DROP CONSTRAINT ["
-                            + constraint.getKey().replace("]", "]]") + "]");
-                }
-            }
-            makeNullable("sentinel_trigger_state", "channel_id", "CHAR(36)");
-        }
-        if (!sqlServerUniqueConstraints().containsValue(List.of("monitor_id", "channel_id", "metadata_id"))) {
-            executeStatement("ALTER TABLE sentinel_trigger_state ADD CONSTRAINT uq_sentinel_trigger_state "
-                    + "UNIQUE (monitor_id, channel_id, metadata_id)");
-        }
-
-        if (!isNullable("sentinel_alert_event", "channel_id")) {
-            if (indexExists("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel")) {
-                executeStatement("DROP INDEX idx_sentinel_alert_event_monitor_channel ON sentinel_alert_event");
-            }
-            makeNullable("sentinel_alert_event", "channel_id", "CHAR(36)");
-        }
-        createIndexIfAbsent("sentinel_alert_event", "idx_sentinel_alert_event_monitor_channel",
-                "monitor_id, channel_id");
-    }
-
-    /**
-     * @return every unique constraint on {@code sentinel_trigger_state}, by
-     *         name, with its key columns lower-cased in key order
-     */
-    private Map<String, List<String>> sqlServerUniqueConstraints() throws Exception {
-        Map<String, List<String>> constraints = new HashMap<>();
-        try (PreparedStatement statement = getConnection().prepareStatement(
-                "SELECT kc.name, c.name FROM sys.key_constraints kc "
-                        + "JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id "
-                        + "AND ic.index_id = kc.unique_index_id "
-                        + "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
-                        + "WHERE kc.parent_object_id = OBJECT_ID(N'sentinel_trigger_state') AND kc.type = 'UQ' "
-                        + "ORDER BY kc.name, ic.key_ordinal");
-                ResultSet rows = statement.executeQuery()) {
-            while (rows.next()) {
-                constraints.computeIfAbsent(rows.getString(1), (ignored) -> new ArrayList<>())
-                        .add(rows.getString(2).toLowerCase(Locale.ROOT));
-            }
-        }
-        return constraints;
-    }
-
-    /**
-     * Drops a column's NOT NULL once. MySQL and SQL Server can only do that by
-     * restating the column, so they need its type.
-     */
-    private void makeNullable(String table, String column, String type) throws Exception {
-        if (isNullable(table, column)) {
-            return;
-        }
-        String change = switch (getDatabaseType().toLowerCase(Locale.ROOT)) {
-            case "derby" -> "ALTER COLUMN " + column + " NULL";
-            case "postgres" -> "ALTER COLUMN " + column + " DROP NOT NULL";
-            case "mysql" -> "MODIFY " + column + " " + type + " NULL";
-            case "sqlserver" -> "ALTER COLUMN " + column + " " + type + " NULL";
-            case "oracle" -> "MODIFY (" + column + " NULL)";
-            default -> throw new MigrationException("Unsupported Sentinel database " + getDatabaseType());
-        };
-        executeStatement("ALTER TABLE " + table + " " + change);
-    }
-
-    /**
-     * Reads a column's declared nullability, trying the identifier cases the
-     * drivers fold to.
-     *
-     * @return {@code true} when the column accepts NULL
-     * @throws MigrationException when the column is missing or the driver
-     *                            cannot say
-     */
-    private boolean isNullable(String table, String column) throws Exception {
-        for (String tableName : namingCandidates(table)) {
-            for (String columnName : namingCandidates(column)) {
-                try (ResultSet columns = getConnection().getMetaData().getColumns(
-                        getConnection().getCatalog(), null, tableName, columnName)) {
-                    if (columns.next()) {
-                        int nullable = columns.getInt("NULLABLE");
-                        if (nullable == DatabaseMetaData.columnNullable) return true;
-                        if (nullable == DatabaseMetaData.columnNoNulls) return false;
-                        throw new MigrationException("Unknown nullability for Sentinel column " + table + "." + column);
-                    }
-                }
-            }
-        }
-        throw new MigrationException("Missing Sentinel column " + table + "." + column);
-    }
-
     private void addColumnIfAbsent(String table, String column, String sqlType) throws MigrationException {
         try {
             if (columnExists(table, column)) {
@@ -663,7 +546,7 @@ public class SentinelMigrator extends Migrator {
         }
     }
 
-    private void createIndexIfAbsent(String table, String index, String column) throws MigrationException {
+    void createIndexIfAbsent(String table, String index, String column) throws MigrationException {
         try {
             if (indexExists(table, index, column)) {
                 return;
@@ -714,7 +597,7 @@ public class SentinelMigrator extends Migrator {
 
     private void makeWindowBoundNullable(String column) throws MigrationException {
         try {
-            makeNullable("sentinel_maintenance_window", column, "DATETIME");
+            nullability.makeNullable("sentinel_maintenance_window", column, "DATETIME");
         } catch (MigrationException e) {
             throw e;
         } catch (Exception e) {
@@ -818,7 +701,7 @@ public class SentinelMigrator extends Migrator {
      * analyze, which on a large sample table would be an expensive way to
      * answer a yes/no question at startup.</p>
      */
-    private boolean indexExists(String tableName, String indexName) throws Exception {
+    boolean indexExists(String tableName, String indexName) throws Exception {
         return indexExists(tableName, indexName, null);
     }
 
@@ -877,12 +760,17 @@ public class SentinelMigrator extends Migrator {
         return true;
     }
 
-    private static List<String> namingCandidates(String name) {
+    static List<String> namingCandidates(String name) {
         List<String> out = new ArrayList<>(3);
         out.add(name);
         out.add(name.toUpperCase(Locale.ROOT));
         out.add(name.toLowerCase(Locale.ROOT));
         return out;
+    }
+
+    /** {@link #executeStatement} for {@link ColumnNullability}, which isn't a subclass of the engine's Migrator. */
+    int execute(String statement) throws SQLException {
+        return executeStatement(statement);
     }
 
     // ========== Engine contract ==========
